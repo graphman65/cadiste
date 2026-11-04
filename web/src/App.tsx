@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { type Built, type BuildMode, fetchAssembly, fetchFile, fetchProject, fetchTrace, TraceFailure } from "./api";
+import {
+  type Built,
+  type BuildMode,
+  createReference,
+  fetchAssembly,
+  fetchFile,
+  fetchProject,
+  fetchTrace,
+  TraceFailure,
+} from "./api";
 import { AssemblyPane } from "./components/AssemblyPane";
 import { CadView, type CadViewHandle } from "./components/CadView";
 import { Details, HidePanelButton } from "./components/Details";
@@ -93,6 +102,27 @@ function keyOf(target: Target): string {
 function failed(error: unknown): { status: "error"; error: string; log?: string } {
   const failure = error instanceof TraceFailure ? error : new TraceFailure(String(error));
   return { status: "error", error: failure.message, log: failure.log };
+}
+
+/**
+ * The clipboard API needs a secure context (localhost is one) and may still refuse (a page without focus, a browser's
+ * permission policy): then the old select-and-copy way.
+ */
+async function copyText(text: string): Promise<void> {
+  if (window.isSecureContext && navigator.clipboard !== undefined) {
+    try {
+      return await navigator.clipboard.writeText(text);
+    } catch {
+      // refused: try the other way
+    }
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  if (!copied) throw new Error("the browser refused to copy");
 }
 
 /** A load's outcome: the scene to render, or why there is none. */
@@ -483,6 +513,71 @@ export function App() {
   };
   const hub = useHub(tabState, handleHub);
 
+  // ---- references: what the pointer is on (else the selection), copied for a coding agent ----
+
+  const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
+  useEffect(() => {
+    if (notice === null) return;
+    const timer = window.setTimeout(() => setNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  /** The element under the pointer, for the shortcut: what it points at is what it refers to. */
+  const pointed = useRef<Element | null>(null);
+  useEffect(() => {
+    const onOver = (event: PointerEvent) => {
+      pointed.current = event.target instanceof Element ? event.target : null;
+    };
+    document.addEventListener("pointerover", onOver);
+    return () => document.removeEventListener("pointerover", onOver);
+  }, []);
+
+  /** The state a reference is made of: a hovered feature row, face, edge, vertex, object or instance, else the tab's. */
+  const referred = (): TabState => {
+    const under = pointed.current;
+    const only = { selected: null, picks: [], instance: null };
+    const row = under?.closest<HTMLElement>(".sidebar .tree [data-id]");
+    if (target?.kind === "part" && row?.dataset.id !== undefined) return { ...tabState, ...only, selected: row.dataset.id };
+    const path = under?.closest(".cad-view") ? view.current?.hovered() : null;
+    if (path) {
+      if (/\/(faces|edges|vertices)\/\1_\d+$/.test(path)) return { ...tabState, ...only, picks: [path] };
+      if (target?.kind === "part" && trace !== null) return { ...tabState, ...only, selected: nodeForPick(trace, path) };
+      if (assemblyData !== null) {
+        return { ...tabState, ...only, instance: leafOfPick(assemblyData.scene.data.shapes, path) };
+      }
+    }
+    if (hover !== null && target?.kind !== "part") return { ...tabState, ...only, instance: hover };
+    return tabState;
+  };
+
+  const copyReference = async (state: TabState) => {
+    try {
+      const { ref, label } = await createReference(hub.tab, state);
+      const text = `${ref} (${label})`;
+      await copyText(text);
+      setNotice({ text: `Copied ${text}`, failed: false });
+    } catch (error) {
+      setNotice({ text: `Could not copy a reference: ${error instanceof Error ? error.message : String(error)}`, failed: true });
+    }
+  };
+  // The key handler reads this render's state through a ref: it is attached once.
+  const copyPointed = useRef(() => {});
+  copyPointed.current = () => {
+    if (target !== null && state?.status !== "loading") void copyReference(referred());
+  };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "c" || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
+      const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable]");
+      if (typing) return;
+      event.preventDefault();
+      copyPointed.current();
+    };
+    // Captured: three-cad-viewer handles keys in its view.
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, []);
+
   if (projectError !== null) {
     return <div className="fatal">Cannot reach the cadiste server: {projectError}</div>;
   }
@@ -520,6 +615,14 @@ export function App() {
           </>
         )}
         <LinkedSessions sessions={hub.sessions} tab={hub.tab} onUnlink={hub.unlink} />
+        <button
+          className="icon-button"
+          disabled={target === null || state?.status === "loading"}
+          onClick={() => void copyReference(tabState)}
+          title="Copy a reference to the selection for a coding agent (cadiste mcp); C copies what the pointer is on"
+        >
+          <Icon name="links" />
+        </button>
         <ExportMenu target={target} title={title} shown={exportShown} />
         <button
           className="primary"
@@ -704,6 +807,7 @@ export function App() {
         partView && <footer className="timeline" />
       )}
       <LinkRequests sessions={hub.sessions} onLink={hub.link} onDecline={hub.decline} />
+      {notice && <div className={notice.failed ? "notice failed" : "notice"}>{notice.text}</div>}
     </div>
   );
 }

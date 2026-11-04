@@ -11,7 +11,7 @@ A build also writes its scene's shapes next to its JSON; the response names that
 Agents: ``POST /api/agent/sessions`` opens a session, ``POST /api/agent/<session>/call/<tool>`` runs a tool
 (``cadiste.agent``). Tabs: ``GET /api/events?tab=`` streams their events, ``POST /api/tabs/<tab>/state`` and
 ``.../reply`` answer, ``POST /api/sessions/<session>/link|decline|unlink`` are the user's link decisions
-(``cadiste.hub``).
+(``cadiste.hub``), ``POST /api/references`` keeps a reference to what the user points at (``cadiste.references``).
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from .agent import Agent, ToolError
 from .cache import SHAPES_SUFFIX, TraceCache
 from .hub import Hub
 from .project import FolderStep
+from .references import References
 
 if TYPE_CHECKING:
     from .measure import Shapes
@@ -391,6 +392,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({}, HTTPStatus.OK if found else HTTPStatus.NOT_FOUND)
             case ["sessions", session, ("link" | "decline" | "unlink") as action]:
                 self._session_action(session, action, request)
+            case ["references"] if isinstance(request, dict) and isinstance(request.get("state"), dict):
+                tab = request.get("tab")
+                try:
+                    made = self.agent.reference(tab if isinstance(tab, str) else None, request["state"])
+                except (ToolError, LookupError) as error:
+                    self._json({"error": str(error).strip("'\"")}, HTTPStatus.UNPROCESSABLE_ENTITY)
+                else:
+                    self._json(made)
             case ["agent", "sessions"]:
                 client = request.get("client") if isinstance(request, dict) else None
                 session = self.hub.open_session(str(client or "agent"))
@@ -506,7 +515,7 @@ def serve(
             "builds": builds,
             "measurer": measurer,
             "hub": hub,
-            "agent": Agent(hub, builds, measurer, project, Path.cwd()),
+            "agent": Agent(hub, builds, measurer, project, Path.cwd(), References(entries.directory / "references")),
         }
         handler = type("Handler", (_Handler,), attributes)
         # Measuring needs OCP: import it now rather than on the first measurement.

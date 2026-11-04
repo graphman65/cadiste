@@ -35,11 +35,13 @@ _TIMEOUT = 900
 
 INSTRUCTIONS = """\
 cadiste shows a build123d model in the user's browser as a CAD feature tree: operations in order, their arguments,
-the call site in the source, and which operation made each face. These tools read what the user selected in their
-cadiste tab (get_selection) and drive that tab (show, select, highlight, set_view, screenshot). You edit the model's
+the call site in the source, and which operation made each face. The user points you at something in the model by
+pasting a reference copied from the viewer, `cadiste:ref/<id>` (a feature, faces, edges, vertices, an assembly
+instance, or a whole part): call get_reference with it for everything cadiste knows about it. You edit the model's
 Python source yourself, then call show(part=...) to rebuild it: the answer compares it with the build before and
-includes a screenshot. The first call that needs the viewer asks the user to link a tab (a dialog with a code in
-every cadiste tab). Read the skill skill://cadiste/SKILL.md for the full workflow."""
+includes a screenshot. Tools that drive the viewer (show, select, highlight, set_view, screenshot) use the session's
+linked tab: the one the first reference came from, or one the user links when asked. Read the skill
+skill://cadiste/SKILL.md for the workflow."""
 
 Direction = Literal["iso", "front", "rear", "left", "right", "top", "bottom"]
 Content = list[TextContent | ImageContent]
@@ -204,11 +206,15 @@ def server(bridge: Bridge) -> MCPServer:
         return call(ctx, "list_parts")
 
     @mcp.tool()
-    def get_selection(ctx: Context) -> Content:
-        """What the user selected in the linked tab: a feature of the tree with its arguments and source, faces,
-        edges and vertices picked with the measure tool with their exact geometry and the features that made them,
-        or an assembly instance. Asks the user to link a tab if none is linked."""
-        return call(ctx, "get_selection")
+    def get_reference(
+        ctx: Context,
+        reference: Annotated[str, Field(description="The reference the user pasted: cadiste:ref/<id>, or the id")],
+    ) -> Content:
+        """Everything cadiste knows about what a reference the user copied in the viewer points at: a feature of the
+        tree with its arguments, call stack and source; faces, edges and vertices with their exact geometry and the
+        features that made them; an assembly instance and the part it is of; or a whole part. Call it whenever the
+        user's message holds a cadiste:ref/<id>."""
+        return call(ctx, "get_reference", reference=reference)
 
     @mcp.tool()
     def feature_tree(ctx: Context, part: PartName = None) -> Content:
@@ -267,7 +273,7 @@ def server(bridge: Bridge) -> MCPServer:
             list[str] | None, Field(description="Viewer paths of faces, edges, vertices to pick to measure ([] clears)")
         ] = None,
     ) -> Content:
-        """Change the selection in the linked tab, then answer what is selected (as get_selection)."""
+        """Change the selection in the linked tab, then answer what is selected (as get_reference does)."""
         return call(ctx, "select", node=node, instance=instance, picks=picks)
 
     @mcp.tool()

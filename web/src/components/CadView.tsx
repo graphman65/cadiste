@@ -40,6 +40,8 @@ export interface CadViewHandle {
   view: (params: HubCalls["view"]["params"]) => void;
   /** PNGs of the scene (base64), along each direction (none: as it is), the camera put back after. */
   screenshot: (views: ViewDirection[], width?: number) => Promise<HubCalls["screenshot"]["result"]["images"]>;
+  /** The viewer path of the face, edge, vertex or object under the pointer (null: none). */
+  hovered: () => string | null;
 }
 
 function viewerOptions(settings: ViewSettings): ViewerOptions {
@@ -133,6 +135,8 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const [hovered, setHovered] = useState<SceneHover | null>(null);
+  /** `hovered`'s path, for the handle: read when a key is pressed, not rendered. */
+  const hoveredPath = useRef<string | null>(null);
   const card = useRef<HTMLDivElement>(null);
   /** The pointer, relative to the view. */
   const pointer = useRef({ x: 0, y: 0 });
@@ -175,6 +179,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     // set as the hovered component changes; the hover card shows it instead.
     display.setStatusLine = (readout: string) => {
       const picked = viewer.lastObject;
+      hoveredPath.current = readout === "" ? null : (picked?.backendId ?? null);
       setHovered(readout === "" ? null : { path: picked?.backendId ?? null, topo: picked?.topo ?? null, readout });
     };
     const stopExplodeSync = viewer.state.subscribe("animationMode", (change) => setExploded(change.new === "explode"));
@@ -287,6 +292,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       };
       const registry = () => readyViewer()?.rendered.nestedGroup.registry.entries() ?? [];
       return {
+        hovered: () => hoveredPath.current,
         rendered: (scene) =>
           new Promise((resolve) => {
             if (shown.current === scene) resolve();

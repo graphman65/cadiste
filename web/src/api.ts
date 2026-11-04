@@ -1,4 +1,4 @@
-import type { AssemblyData, Measurement, Project, TraceData, TraceError } from "./types";
+import type { AssemblyData, Measurement, Project, TabState, TraceData, TraceError } from "./types";
 
 export class TraceFailure extends Error {
   readonly log: string | undefined;
@@ -109,4 +109,17 @@ export async function fetchExport(
   if (!response.ok) await checked<never>(response);
   const name = attachmentName(response.headers.get("Content-Disposition")) ?? `model.${format}`;
   return { file: await response.blob(), name };
+}
+
+/**
+ * A reference (`cadiste:ref/<id>`) to what `state` selects, kept by the server for a coding agent to look up, and its
+ * label ("Steering Module: #7 CrossPrism, face f12"); `tab` is where it was made, which an agent then drives.
+ */
+export async function createReference(tab: string | null, state: TabState): Promise<{ ref: string; label: string }> {
+  const response = await fetch("/api/references", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tab, state }),
+  });
+  return checked<{ ref: string; label: string }>(response);
 }

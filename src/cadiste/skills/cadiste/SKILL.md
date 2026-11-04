@@ -1,30 +1,41 @@
 ---
 name: cadiste
-description: Change a build123d model from what the user selects in the cadiste viewer, and check each change in the viewer. Use when the user points at a part, a feature, a face, an edge or an assembly instance in cadiste ("make this thinner", "move this hole", "why is this face here").
+description: Change a build123d model from what the user points at in the cadiste viewer, and check each change in the viewer. Use when the user's message holds a cadiste reference (cadiste:ref/<id>) or points at a part, a feature, a face, an edge or an assembly instance in cadiste ("make this thinner", "move this hole", "why is this face here").
 ---
 
 # Editing a build123d model with the cadiste viewer
 
 cadiste shows a build123d model the way a parametric CAD timeline would: every feature (operation) in order, the
-sketches it used, the arguments it was called with, and which feature made each face. The `cadiste` MCP tools read
-what the user has selected in their viewer tab and drive that tab. You edit the model's Python source yourself,
-with your own file tools; cadiste never writes source.
+sketches it used, the arguments it was called with, and which feature made each face. The user points you at
+something in the model with a reference copied from their viewer tab; the `cadiste` MCP tools resolve it and drive
+that tab. You edit the model's Python source yourself, with your own file tools; cadiste never writes source.
+
+## References
+
+The user copies a reference in the viewer (the C key copies what the pointer is on: a feature row, a face, an edge,
+a vertex, an instance; the link button in the top bar copies the selection) and pastes it in their message:
+`cadiste:ref/1a2b3c4d (Steering Module: #7 CrossPrism)`. Call `get_reference` with it. A reference keeps what was
+pointed at as the user saw it then; when the part was built again since, the answer says so, and `feature_tree` or
+`describe` give the current ids.
 
 ## Linking
 
-The first tool that needs the viewer asks the user to link a tab: every open cadiste tab shows a request with a
-code (`amber-fox`). If a tool answers that it is waiting for a link, tell the user the code and ask them to click
-**Link this tab** in the tab to use, then call the tool again. `status` says whether you are linked.
+The tools that drive the viewer (`show`, `select`, `highlight`, `set_view`, `set_visibility`, `screenshot`) use the
+session's tab: the one the first reference came from. Without one, a tool asks the user to link a tab: every open
+cadiste tab shows a request with a code (`amber-fox`). If a tool answers that it is waiting for a link, tell the
+user the code and ask them to click **Link this tab** in the tab to use, then call the tool again. `status` says
+whether you are linked.
 
 ## The loop
 
-1. **Read the selection.** `get_selection` says what the linked tab shows and what the user selected:
+1. **Resolve the reference.** `get_reference` answers with:
    - a feature from the tree (`[o7]` an operation, `[b2]` a builder or sketch, `[g3]` a function call grouping
      operations), with its arguments (parameter = expression written → value), the call stack and the source
      around the call;
-   - faces, edges and vertices the user picked with the measure tool, with their exact geometry (diameter, length,
-     centre...) and the feature that made each face, or the faces an edge bounds and the features that made them;
-   - in the assembly, the instance and the group path it sits in.
+   - faces, edges and vertices with their exact geometry (diameter, length, centre...) and the feature that made
+     each face, or the faces an edge bounds and the features that made them;
+   - in the assembly, the instance, the group path it sits in and the part it is an instance of;
+   - or the whole part, when nothing in particular was pointed at.
    Files are relative to the project root given at the end of the answer.
 2. **Find the code.** The call site (`features.py:47`) is where the feature is made; its arguments name the
    expressions to change. A value shared by several parts (a parameter dataclass field) changes them all: say so
@@ -45,7 +56,7 @@ code (`amber-fox`). If a tool answers that it is waiting for a link, tell the us
 |---|---|
 | `status` | Link state, what the tab shows |
 | `list_parts` | The project's parts, folders, whether it has an assembly |
-| `get_selection` | What the user selected in the linked tab, resolved to source |
+| `get_reference(reference)` | What a reference the user pasted points at, resolved to source |
 | `feature_tree(part?)` | Every feature of a part with its id, call site and code |
 | `describe(node, part?)` | One feature in detail: arguments, call stack, source, faces it made |
 | `measure(paths, part?)` | Exact geometry of viewer paths (faces, edges, vertices) and distances or angles between them |

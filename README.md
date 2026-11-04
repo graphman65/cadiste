@@ -151,8 +151,8 @@ shape (the STEP product), `--each` builds one shape per argument and groups them
 
 ## Edit with a coding agent
 
-`cadiste mcp` is an MCP server on stdio that lets a coding agent (Claude Code, omp, Cursor, ...) read what the user
-selected in a viewer tab and drive that tab; the agent edits the model's source with its own tools. One `cadiste
+`cadiste mcp` is an MCP server on stdio that lets a coding agent (Claude Code, omp, Cursor, ...) look up what the
+user points at in the viewer and drive a viewer tab; the agent edits the model's source with its own tools. One `cadiste
 mcp` runs per agent session and forwards every call to the `cadiste serve` of the directory it runs in (found by
 the `serve.json` the server writes in its `--cache-dir`, from the working directory up; `--url` otherwise). It
 needs the `mcp` extra:
@@ -162,22 +162,29 @@ cd ../pipecrawler
 claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
 ```
 
-- **Linking.** The first call that needs the viewer shows a request in every open tab, with the agent's name and a
-  code (`swift-orca`) the agent also reports; **Link this tab** picks the tab, **Dismiss** fails the call. The
-  link is kept by tab id, which survives a reload (a duplicated browser tab takes a new one); the top bar shows the
-  agents linked to the tab, each with an unlink button. A call waits up to 60 s for the link.
-- **Selection.** `get_selection` answers with the feature selected in the tree (arguments, the expression written
-  for each, call stack, source around the call, faces it made) and the faces, edges and vertices picked with the
-  measure tool: their exact geometry, the operation that made each face, the faces an edge or vertex bounds and
-  their operations. In an assembly, the instance and its group path. `show(view='assembly')` opens the first
+- **References.** The user points the agent at something by pasting a reference copied in the viewer:
+  `cadiste:ref/1a2b3c4d (Steering Module: #7 CrossPrism)`. **C** copies one to what the pointer is on (a feature
+  row, a face, edge or vertex, an object, an instance), else to the selection; the link button in the top bar
+  copies the selection (the tree's node, the measure tool's picks, an instance; nothing selected: the whole part
+  or assembly). The server resolves it when it is made, from the build the tab shows, and keeps it in
+  `<cache-dir>/references` (the last 500). `get_reference` answers with the feature (arguments, the expression
+  written for each, call stack, source around the call, faces it made), the faces, edges and vertices (exact
+  geometry, the operation that made each face, the faces an edge or vertex bounds and their operations), or the
+  instance (group path, the part it is of), as it was then; it says when the part was built again since.
+- **Linking.** Resolving a reference links a session without a tab to the tab it came from. Otherwise the first
+  call that needs the viewer shows a request in every open tab, with the agent's name and a code (`swift-orca`)
+  the agent also reports; **Link this tab** picks the tab, **Dismiss** fails the call. The link is kept by tab id,
+  which survives a reload (a duplicated browser tab takes a new one); the top bar shows the agents linked to the
+  tab, each with an unlink button. A call waits up to 60 s for the link. `show(view='assembly')` opens the first
   assembly, `view='assembly:NAME'` another.
 - **Feedback.** `show(part=...)` builds the part again from the current source, opens it in the tab and answers with
   how it differs from the build before (volume, bounding box, faces, operations added, removed or called with other
   arguments: operations are matched by kind, mode and calling function, as line numbers move with edits) and
   screenshots of the tab's 3D view (`iso` by default, any preset direction or `current`). A failed build answers
   with its traceback.
-- **Driving the tab.** `select` (a feature, an instance, or faces/edges/vertices to measure), `highlight`,
-  `set_view`, `set_visibility`, `screenshot`. Also `status`, `list_parts`, `feature_tree`, `describe`, `measure`.
+- **Driving the tab.** `select` (a feature, an instance, or faces/edges/vertices to measure; it answers with the new
+  selection, as `get_reference` would), `highlight`, `set_view`, `set_visibility`, `screenshot`. Also `status`,
+  `list_parts`, `feature_tree`, `describe`, `measure`.
 
 The workflow is the `cadiste` skill (`src/cadiste/skills/cadiste/SKILL.md`), served as `skill://cadiste/SKILL.md`
 with the MCP Skills extension and summed up in the server's instructions; a harness that loads skills from disk can
@@ -245,7 +252,8 @@ for record in trace.builders:
 | `measure.py` | Those faces, edges and vertices written next to a build's JSON and read back; exact measurements of the ones the viewer picked, and the faces an edge or vertex bounds. |
 | `server.py` | `cadiste serve`: the built frontend, the part list, one `cadiste export` subprocess per trace, one `cadiste mesh` per assembly view, through the cache; one `cadiste save` per CAD export; measurements on the last few builds' shapes, kept loaded; the hub's endpoints. |
 | `hub.py` | Agent sessions and viewer tabs: link requests, each tab's event stream (Server-Sent Events) and state, requests to a tab and their replies. |
-| `agent.py` | What `cadiste mcp`'s tools do, run in the server: from the cached builds and the linked tab's state. |
+| `agent.py` | What `cadiste mcp`'s tools do, run in the server: from the cached builds and the linked tab's state; references made and resolved. |
+| `references.py` | References to what the user pointed at, resolved when made and kept on disk. |
 | `context.py` | The builds' JSON as text for an agent: feature tree, one feature in detail, the selection resolved to source, the comparison of two builds. |
 | `bridge.py` | `cadiste mcp`: the MCP server on stdio forwarding each tool to the server, and the skill. |
 | `cache.py` | Traces and scenes on disk, by part, for one fingerprint of the model's source. |

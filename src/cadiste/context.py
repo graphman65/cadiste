@@ -289,9 +289,9 @@ def part_selection(
         lines = [line for path in picks for line in _pick_lines(trace, path, measured, adjacent)]
         if results:
             lines.append(results_text(results))
-        sections.append(f"Picked in measure mode ({len(picks)}):\n" + indent("\n".join(lines)))
+        sections.append(f"Faces, edges and vertices ({len(picks)}):\n" + indent("\n".join(lines)))
     if not sections:
-        return "Nothing is selected: the user has not clicked a feature, nor picked faces, edges or vertices."
+        return "No feature, face, edge or vertex is selected: the whole part."
     return "\n\n".join(sections)
 
 
@@ -314,7 +314,8 @@ def _leaves(node: Json) -> list[Json]:
     return [node] if "parts" not in node else [leaf for child in node["parts"] for leaf in _leaves(child)]
 
 
-def _instance_lines(root: Json, node_id: str, parts: set[str]) -> list[str]:
+def _instance_lines(built: Json, node_id: str, parts: set[str]) -> list[str]:
+    root = built["scene"]["data"]["shapes"]
     chain = _shape_chain(root, node_id)
     if chain is None:
         return [f"{node_id}: not in this build"]
@@ -322,9 +323,11 @@ def _instance_lines(root: Json, node_id: str, parts: set[str]) -> list[str]:
     names = " / ".join(item["name"] for item in chain)
     kind = "instance" if "parts" not in node else f"group of {len(_leaves(node))} instances"
     lines = [f"{kind} {names}", f"  id {node_id}"]
-    known = [item["name"] for item in chain if item["name"] in parts]
+    # The server matched the assembly's instances to the parts; a file's parts are named after theirs.
+    part = built["scene"].get("part_of", {}).get(node_id)
+    known = [part] if part else [item["name"] for item in chain if item["name"] in parts]
     if known:
-        lines.append(f"  part {known[-1]!r}: show(part={known[-1]!r}) opens its feature tree")
+        lines.append(f"  an instance of part {known[-1]!r}: show(part={known[-1]!r}) opens its feature tree")
     return lines
 
 
@@ -338,10 +341,9 @@ def composite_selection(
     parts: set[str],
 ) -> str:
     """What is selected in the assembly, or in a file's parts viewed together (untraced: instances only)."""
-    root = built["scene"]["data"]["shapes"]
     sections = []
     if instance is not None:
-        sections.append("Selected:\n" + indent("\n".join(_instance_lines(root, instance, parts))))
+        sections.append("Selected:\n" + indent("\n".join(_instance_lines(built, instance, parts))))
     if picks:
         lines = []
         for path in picks:
@@ -351,20 +353,49 @@ def composite_selection(
                 continue
             topo, index = match["topo"], match["index"]
             lines.append(f"{_TOPO[topo]} {_LETTER[topo]}{index}: {entity_text(measured.get(path))}")
-            lines += [f"  {line}" for line in _instance_lines(root, match["leaf"], parts)]
+            lines += [f"  {line}" for line in _instance_lines(built, match["leaf"], parts)]
         if results:
             lines.append(results_text(results))
-        sections.append(f"Picked in measure mode ({len(picks)}):\n" + indent("\n".join(lines)))
+        sections.append(f"Faces, edges and vertices ({len(picks)}):\n" + indent("\n".join(lines)))
     if hidden:
         sections.append(f"Hidden instances: {len(hidden)}")
     if not sections:
-        return "Nothing is selected: the user has not clicked an instance, nor picked faces, edges or vertices."
+        return "No instance, face, edge or vertex is selected: all of it."
     return "\n\n".join(sections)
 
 
 def composite_summary(built: Json) -> str:
     leaves = _leaves(built["scene"]["data"]["shapes"])
     return f"{len(leaves)} instances, built in {built['build_seconds']:.2f} s"
+
+
+def _picks_label(picks: list[str]) -> list[str]:
+    labels = []
+    for path in picks:
+        match = _PICK.fullmatch(path)
+        labels.append(f"{_TOPO[match['topo']]} {_LETTER[match['topo']]}{match['index']}" if match else path)
+    return labels
+
+
+def part_label(trace: Json, selected: str | None, picks: list[str]) -> str:
+    """A short name for what is selected in a part: "#7 CrossPrism, face f12"."""
+    items = []
+    node = find_node(trace, selected) if selected is not None else None
+    match node:
+        case {"type": "op", "op": op}:
+            items.append(f"#{op} {trace['ops'][op]['kind']}")
+        case {"type": "builder", "builder": builder}:
+            items.append(_builder_title(trace["builders"][builder]))
+        case {"label": label}:
+            items.append(f"{label}()")
+    return ", ".join([*items, *_picks_label(picks)]) or "the whole part"
+
+
+def composite_label(built: Json, instance: str | None, picks: list[str]) -> str:
+    """A short name for what is selected in an assembly or a file's parts: the instance, the picks."""
+    chain = _shape_chain(built["scene"]["data"]["shapes"], instance) if instance is not None else None
+    items = [chain[-1]["name"]] if chain else []
+    return ", ".join([*items, *_picks_label(picks)]) or "all of it"
 
 
 def instance_tree(built: Json, depth: int = 3) -> str:

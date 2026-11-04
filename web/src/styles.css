@@ -1699,6 +1699,30 @@ body[data-theme] .cad-view {
   height: 13px;
 }
 
+/* What the reference shortcut copied (or why it could not): a card at the bottom of the window, for a few seconds. */
+.notice {
+  position: fixed;
+  bottom: 56px;
+  left: 50%;
+  z-index: 20;
+  max-width: min(720px, 90vw);
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: rgb(34 37 42 / 0.97);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.5);
+  transform: translateX(-50%);
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.notice.failed {
+  color: var(--subtract);
+  border-color: var(--subtract);
+}
+
 /* ---- export ---- */
 
 .export {
