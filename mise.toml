@@ -1,0 +1,32 @@
+[tools]
+# build123d's OCP kernel (cadquery-ocp) ships wheels for CPython 3.13 and 3.14 only.
+python = "3.14"
+uv = "latest"
+node = "26"
+
+[env]
+# uv must use the mise interpreter, never download its own.
+UV_PYTHON_PREFERENCE = "only-system"
+_.python.venv = { path = ".venv", create = false }
+
+[tasks.sync]
+description = "Install/refresh the locked Python and web environments"
+run = ["uv sync --all-extras", "npm --prefix web ci"]
+
+[tasks.web-build]
+description = "Build the viewer frontend into src/cadiste/static (served by `cadiste serve`)"
+run = "npm --prefix web run build"
+
+[tasks.web-dev]
+description = "Vite dev server with hot reload, proxying /api to `cadiste serve` on port 8123"
+run = "npm --prefix web run dev"
+
+[tasks.check]
+description = "Lint, type-check and test"
+run = [
+    "uv run ruff check",
+    "uv run ruff format --check",
+    "uv run pyright",
+    "uv run pytest -q",
+    "npm --prefix web run typecheck",
+]

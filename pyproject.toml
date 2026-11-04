@@ -1,0 +1,48 @@
+[project]
+name = "cadiste"
+version = "0.1.0"
+description = "Feature tree and face provenance for build123d models, traced while they build"
+readme = "README.md"
+authors = [{ name = "Sebastien Lacoste", email = "seb@graphman.fr" }]
+requires-python = ">=3.13,<3.15"
+dependencies = [
+    # The tracer hooks build123d's Builder internals and its ShapeHistory records: pin the minor version.
+    "build123d>=0.13.0,<0.14",
+    "ocp-tessellate>=3.6.3,<3.7",
+]
+
+[project.scripts]
+cadiste = "cadiste.cli:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1.400"]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF"]
+# RUF012: build123d objects declare `_applies_to` as a plain class list.
+# SIM117: nested builder contexts read as the modelling structure.
+ignore = ["RUF012", "SIM117"]
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+reportWildcardImportFromLibrary = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
