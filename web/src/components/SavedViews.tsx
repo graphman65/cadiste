@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { QuaternionTuple, Vector3Tuple, VisibilityState } from "three-cad-viewer";
 
+import type { Target } from "../App";
 import type { SelectionItem } from "../types";
 import type { Section } from "./Section";
 import type { ViewSettings } from "./ViewToolbar";
@@ -16,6 +17,7 @@ export interface SceneViewState {
 }
 
 export interface SavedViewState {
+  target: Target;
   scene: SceneViewState;
   camera: { position: Vector3Tuple; quaternion: QuaternionTuple; target: Vector3Tuple; zoom: number };
   settings: ViewSettings;
@@ -37,7 +39,11 @@ const tuple = (value: unknown, size: number) => Array.isArray(value) && value.le
 
 function validState(value: unknown): value is SavedViewState {
   if (!record(value)) return false;
-  const { scene, camera, settings, states, section, explode, measuring } = value;
+  const { target, scene, camera, settings, states, section, explode, measuring } = value;
+  if (!record(target) || !(
+    ((target.kind === "part" || target.kind === "assembly") && typeof target.name === "string" && target.name.length > 0) ||
+    (target.kind === "file" && typeof target.path === "string" && target.path.length > 0)
+  )) return false;
   if (!record(scene) || !Array.isArray(scene.hidden) || !scene.hidden.every((item) => typeof item === "string") ||
       ![scene.selected, scene.focusPart, scene.instance, scene.litPart].every((item) => item === null || typeof item === "string") || !Array.isArray(scene.selection)) return false;
   if (!scene.selection.every((item: unknown) => record(item) && (
@@ -56,25 +62,68 @@ function validState(value: unknown): value is SavedViewState {
   return (explode === null || (finite(explode) && explode >= 0 && explode <= 1)) && typeof measuring === "boolean";
 }
 
-function readViews(key: string): SavedView[] {
+function readViews(scope: string): SavedView[] {
+  const views: SavedView[] = [];
+  const legacyKeys: string[] = [];
   try {
-    const stored: unknown = JSON.parse(window.localStorage.getItem(key) ?? "null");
-    if (!record(stored) || stored.version !== 1 || !Array.isArray(stored.views)) return [];
-    return stored.views.filter((view): view is SavedView => record(view) && typeof view.id === "string" &&
-      typeof view.name === "string" && view.name.trim().length > 0 && validState(view.state));
+    const stored: unknown = JSON.parse(window.localStorage.getItem(`cadiste.saved-views.v2:${scope}`) ?? "null");
+    if (record(stored) && stored.version === 2 && Array.isArray(stored.views)) {
+      views.push(...stored.views.filter((view): view is SavedView => record(view) && typeof view.id === "string" &&
+        typeof view.name === "string" && view.name.trim().length > 0 && validState(view.state)));
+    }
   } catch {
-    return [];
+    // A corrupt record must not prevent the viewer or migration of older views from opening.
   }
+  try {
+    // One-time cutover: merge every target's old list, then remove it only after the global list is stored.
+    const project: unknown = JSON.parse(scope);
+    for (const key of Object.keys(window.localStorage)) {
+      if (!key.startsWith("cadiste.saved-views.v1:")) continue;
+      try {
+        const oldScope: unknown = JSON.parse(key.slice("cadiste.saved-views.v1:".length));
+        if (!Array.isArray(project) || !Array.isArray(oldScope) || oldScope.length !== 3 ||
+            oldScope[0] !== project[0] || oldScope[1] !== project[1] || typeof oldScope[2] !== "string") continue;
+        const name = oldScope[2];
+        const target: Target = name.startsWith("#assembly:") ? { kind: "assembly", name: name.slice(10) }
+          : name.startsWith("#file:") ? { kind: "file", path: name.slice(6) } : { kind: "part", name };
+        const old: unknown = JSON.parse(window.localStorage.getItem(key) ?? "null");
+        if (!record(old) || old.version !== 1 || !Array.isArray(old.views)) continue;
+        for (const view of old.views) {
+          if (!record(view) || typeof view.id !== "string" || typeof view.name !== "string" || !view.name.trim() || !record(view.state)) continue;
+          const state = { ...view.state, target };
+          if (!validState(state) || views.some((existing) => existing.id === view.id)) continue;
+          let migratedName = view.name;
+          const label = target.kind === "file" ? target.path : target.name;
+          let suffix = 1;
+          while (views.some((existing) => existing.name.toLocaleLowerCase() === migratedName.toLocaleLowerCase())) {
+            migratedName = `${view.name} (${label}${suffix > 1 ? ` ${suffix}` : ""})`;
+            suffix += 1;
+          }
+          views.push({ id: view.id, name: migratedName, state });
+        }
+        legacyKeys.push(key);
+      } catch {
+        // One damaged target's list must not hide the others.
+      }
+    }
+    if (legacyKeys.length > 0) {
+      window.localStorage.setItem(`cadiste.saved-views.v2:${scope}`, JSON.stringify({ version: 2, views }));
+      legacyKeys.forEach((key) => window.localStorage.removeItem(key));
+    }
+  } catch {
+    // Storage may be read-only or full. Old records remain available for a later migration.
+  }
+  return views;
 }
 
-/** Remounted by scope: views never leak between projects or part/assembly/folder targets. */
+/** Remounted by project: the same list is available from every part, assembly and folder. */
 export function SavedViews({ scope, capture, restore }: {
   scope: string;
   capture: () => SavedViewState | null;
   restore: (state: SavedViewState) => void;
 }) {
-  const storageKey = `cadiste.saved-views.v1:${scope}`;
-  const [views, setViews] = useState(() => readViews(storageKey));
+  const storageKey = `cadiste.saved-views.v2:${scope}`;
+  const [views, setViews] = useState(() => readViews(scope));
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
@@ -106,7 +155,7 @@ export function SavedViews({ scope, capture, restore }: {
 
   const persist = (next: SavedView[]) => {
     try {
-      window.localStorage.setItem(storageKey, JSON.stringify({ version: 1, views: next }));
+      window.localStorage.setItem(storageKey, JSON.stringify({ version: 2, views: next }));
       setViews(next);
       setError(null);
       return true;
@@ -149,7 +198,7 @@ export function SavedViews({ scope, capture, restore }: {
       {open && (
         <div className="saved-views-menu" role="dialog" aria-label="Saved views">
           <strong>Saved views</strong>
-          <p>Camera, visibility, selection, display, explode and section. Kept in this browser for this model.</p>
+          <p>Project-wide views. Restoring a view opens its saved part, assembly or folder, with its camera, visibility and display settings.</p>
           <div className="saved-views-list">
             {views.length === 0 && <p>No saved views yet.</p>}
             {views.map((view) => (
@@ -158,7 +207,12 @@ export function SavedViews({ scope, capture, restore }: {
                   restore(structuredClone(view.state));
                   setOpen(false);
                   trigger.current?.focus();
-                }}>{view.name}</button>
+                }}>
+                  {view.name}
+                  <span className="saved-view-target">
+                    {view.state.target.kind === "file" ? `Folder · ${view.state.target.path}` : `${view.state.target.kind === "part" ? "Part" : "Assembly"} · ${view.state.target.name}`}
+                  </span>
+                </button>
                 <button title={`Replace ${view.name} with the current view`} aria-label={`Update ${view.name}`} onClick={() => {
                   const state = captureCurrent();
                   if (state !== null) persist(views.map((item) => item.id === view.id ? { ...item, state } : item));

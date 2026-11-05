@@ -517,7 +517,8 @@ body[data-theme] .cad-view {
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 5;
+  /* Project-wide saved views stay reachable above loading and failed-build overlays. */
+  z-index: 11;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -641,6 +642,13 @@ body[data-theme] .cad-view {
   text-align: left;
   overflow-wrap: anywhere;
   color: var(--accent);
+}
+
+.saved-view-target {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .saved-views-menu form {
@@ -991,6 +999,8 @@ body[data-theme] .cad-view {
 .cad-view {
   position: absolute;
   inset: 0;
+  /* Contain the native viewer's high-z-index navigation beneath app controls and build overlays. */
+  z-index: 0;
 }
 
 .view-overlay {

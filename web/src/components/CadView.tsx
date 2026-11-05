@@ -9,6 +9,7 @@ import {
 } from "three-cad-viewer";
 import "three-cad-viewer/css";
 
+import type { Target } from "../App";
 import type { Focus } from "../model";
 import { selectionMode, type SelectionMode } from "../selection";
 import type { HubCalls, SceneData } from "../types";
@@ -31,7 +32,7 @@ const RENDER_OPTIONS: RenderOptions = {
 const TREE_WIDTH = 240;
 const SCREENSHOT_WIDTH = 1024;
 
-/** The scene's operations a harness session drives, through the hub. */
+/** The scene's operations driven by the app and by a harness session through the hub. */
 export interface CadViewHandle {
   /** Resolves once this scene is rendered and focused: at once if it is the one shown. */
   rendered: (data: SceneData) => Promise<void>;
@@ -44,6 +45,8 @@ export interface CadViewHandle {
   screenshot: (views: ViewDirection[], width?: number) => Promise<HubCalls["screenshot"]["result"]["images"]>;
   /** The viewer path of the face, edge, vertex or object under the pointer (null: none). */
   hovered: () => string | null;
+  /** Restore viewer-owned state after the app has opened the saved target and restored its selection. */
+  restore: (state: SavedViewState) => void;
 }
 
 function viewerOptions(settings: ViewSettings): ViewerOptions {
@@ -75,10 +78,11 @@ interface Props {
   onDropPick: (path: string) => void;
   onClearPicks: () => void;
   onClearSelection: () => void;
-  /** Project + target identity, for browser-local saved views. */
+  /** Project identity, for browser-local saved views shared across targets. */
   viewScope: string | null;
+  viewTarget: Target | null;
   sceneState: SceneViewState;
-  onRestoreScene: (state: SceneViewState) => void;
+  onRestoreView: (state: SavedViewState) => void;
   ref?: Ref<CadViewHandle>;
 }
 
@@ -134,7 +138,7 @@ function displayOptions(width: number, height: number, settings: ViewSettings) {
  * Section-plane picking consumes a click first. Measurement mode keeps its additive picks in the same canonical
  * selection as tree/scene items, so copying never omits measurements or resets unrelated selected items.
  */
-export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, sceneState, onRestoreScene, ref }: Props) {
+export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, viewTarget, sceneState, onRestoreView, ref }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const instance = useRef<Instance | null>(null);
   const [rendered, setRendered] = useState(0);
@@ -319,6 +323,18 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       const registry = () => readyViewer()?.rendered.nestedGroup.registry.entries() ?? [];
       return {
         hovered: () => hoveredPath.current,
+        restore: (saved) => {
+          pendingView.current = saved;
+          setExtra([]);
+          changeSettings(saved.settings);
+          section.restore(saved.section.active, saved.section.section);
+          setMeasuring(saved.measuring);
+          const viewer = readyViewer();
+          if (viewer !== null) {
+            viewer.setExplode(saved.explode !== null);
+            if (saved.explode !== null) viewer.setRelativeTime(saved.explode);
+          }
+        },
         rendered: (scene) =>
           new Promise((resolve) => {
             if (shown.current === scene) resolve();
@@ -371,7 +387,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
         },
       };
     },
-    [changeSettings],
+    [changeSettings, section.restore],
   );
 
   useEffect(() => {
@@ -441,10 +457,11 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
 
   const captureView = (): SavedViewState | null => {
     const viewer = instance.current?.viewer;
-    if (viewer === undefined || !viewer.ready || shown.current !== data) return null;
+    if (viewer === undefined || !viewer.ready || data === null || shown.current !== data || viewTarget === null) return null;
     const [x, y, z] = viewer.getCameraPosition();
     const states = viewer.getStates();
     return structuredClone({
+      target: viewTarget,
       scene: { ...sceneState, hidden: Object.entries(states).filter(([, state]) => state[0] === 0 && state[1] === 0).map(([path]) => path) },
       camera: {
         position: [x, y, z],
@@ -460,18 +477,6 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     });
   };
 
-  const restoreView = (saved: SavedViewState) => {
-    pendingView.current = saved;
-    setExtra([]);
-    onRestoreScene(saved.scene);
-    changeSettings(saved.settings);
-    section.restore(saved.section.active, saved.section.section);
-    setMeasuring(saved.measuring);
-    withViewer((viewer) => {
-      viewer.setExplode(saved.explode !== null);
-      if (saved.explode !== null) viewer.setRelativeTime(saved.explode);
-    });
-  };
   return (
     <div className="cad">
       <div className="cad-view" ref={host} />
@@ -494,7 +499,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
         </>
       )}
       {section.active && data !== null && <SectionPanel tool={section} viewer={viewerOf} />}
-      {data !== null && (
+      {(data !== null || viewScope !== null) && (
         <ViewToolbar
           settings={settings}
           onChange={changeSettings}
@@ -507,7 +512,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           sectioning={section.active}
           onSection={section.open}
         >
-          {viewScope !== null && <SavedViews key={viewScope} scope={viewScope} capture={captureView} restore={restoreView} />}
+          {viewScope !== null && <SavedViews key={viewScope} scope={viewScope} capture={captureView} restore={onRestoreView} />}
         </ViewToolbar>
       )}
     </div>

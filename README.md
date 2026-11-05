@@ -62,11 +62,13 @@ builds again. One entry is kept per part.
   then the face, edge or vertex with three-cad-viewer's mesh measurements (area, length, radius, centre, ends).
   Radius readouts also show the corresponding diameter, with the same approximation marker and millimetre units.
 - **Saved views** (in the view toolbar): arrange an overall or detailed view, enter a name, then **Save current
-  view**. Click a saved name to restore its camera orientation, pan and zoom, hidden parts/instances, feature or
-  entity selection, display toggles, explode position, and section plane/offset/side. **Update** replaces a saved
-  view with the current arrangement; **Rename** and **Delete** manage the list. Views survive reloads in this
-  browser's local storage, separately for each project and part, assembly, or folder target. They are not shared
-  between browsers; visibility and selections use model paths, so changed topology may require updating a view.
+  view**. Views are project-wide: the same list is available from every part, assembly and folder. Click a saved
+  name to open its saved target and restore camera orientation, pan and zoom, hidden parts/instances, feature or
+  entity selection, display toggles, explode position, and section plane/offset/side. The list labels each view's
+  target. **Update** replaces a view with the current target and arrangement; **Rename** and **Delete** manage the
+  list. Existing per-target views migrate automatically; duplicate names gain a target-name suffix. Views survive
+  reloads in this browser's local storage, separately for each project, and are not shared between browsers.
+  Visibility and selections use model paths, so changed topology may require updating a view.
 - **Measure** (the ruler in the toolbar): shows exact measurements for the selected faces, edges and vertices.
   Click replaces, Ctrl/Cmd-click toggles, and Shift-click adds a pick. The panel's Clear drops entity picks;
   Escape clears the entire selection. Measurements use the B-rep the mesh was made from (millimetres, degrees):

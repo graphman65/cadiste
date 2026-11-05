@@ -22,6 +22,7 @@ import { LinkRequests, LinkedSessions } from "./components/Link";
 import { PartList } from "./components/PartList";
 import { Splitter } from "./components/Splitter";
 import { Timeline } from "./components/Timeline";
+import type { SavedViewState } from "./components/SavedViews";
 import { ViewBar } from "./components/ViewBar";
 import { useHub } from "./hub";
 import {
@@ -187,6 +188,7 @@ export function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [target, setTarget] = useState<Target | null>(targetFromHash);
+  const [savedView, setSavedView] = useState<SavedViewState | null>(null);
   const [traces, setTraces] = useState<Record<string, Load<TraceData>>>({});
   const [assemblies, setAssemblies] = useState<Record<string, Load<AssemblyData>>>({});
   const [files, setFiles] = useState<Record<string, Load<AssemblyData>>>({});
@@ -352,6 +354,27 @@ export function App() {
     });
     return { ...base, lit: [...new Set(lit)] };
   }, [target, trace, index, selection, assemblyData, traces, hiddenInstances]);
+
+  // The target effect resets its selection, and a cold target may still be building. Restore only once its
+  // scene is available; viewer-owned state then lands after the restored feature focus in the next commit.
+  useEffect(() => {
+    if (savedView === null) return;
+    if (target === null || keyOf(target) !== keyOf(savedView.target) || state?.status === "error") {
+      setSavedView(null);
+      return;
+    }
+    if (state?.status !== "ok") return;
+    const saved = savedView.scene;
+    setHiddenInstances(new Set(saved.hidden));
+    setSelection(saved.selection);
+    setSelected(saved.selected);
+    setFocusPart(saved.focusPart);
+    setInstance(saved.instance);
+    setLitPart(saved.litPart);
+    setHover(null);
+    view.current?.restore(savedView);
+    setSavedView(null);
+  }, [savedView, target, state]);
 
   /** Select a feature of a part (in a file's view, any of its parts), opening the folds above it. */
   const selectIn = useCallback(
@@ -911,16 +934,12 @@ export function App() {
             onDropPick={(path) => setSelection((current) => current.filter((item) => item.kind !== "entity" || item.path !== path))}
             onClearPicks={() => setSelection((current) => current.filter((item) => item.kind !== "entity"))}
             onClearSelection={clearSelection}
-            viewScope={project === null || target === null ? null : JSON.stringify([project.root, project.target, keyOf(target)])}
+            viewScope={project === null ? null : JSON.stringify([project.root, project.target])}
+            viewTarget={target}
             sceneState={{ hidden: [...hiddenInstances], selection, selected, focusPart, instance, litPart }}
-            onRestoreScene={(saved) => {
-              setHiddenInstances(new Set(saved.hidden));
-              setSelection(saved.selection);
-              setSelected(saved.selected);
-              setFocusPart(saved.focusPart);
-              setInstance(saved.instance);
-              setLitPart(saved.litPart);
-              setHover(null);
+            onRestoreView={(saved) => {
+              setSavedView(saved);
+              setTarget((current) => current !== null && keyOf(current) === keyOf(saved.target) ? current : saved.target);
             }}
           />
           {state?.status === "loading" && (
