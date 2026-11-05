@@ -22,7 +22,7 @@ from mcp.server.extension import Extension, MethodBinding, ResourceBinding
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.resources import TextResource
-from mcp_types import ImageContent, PaginatedRequestParams, RequestParams, TextContent
+from mcp_types import CallToolResult, ImageContent, PaginatedRequestParams, RequestParams, TextContent
 from pydantic import Field
 
 from .references import SelectionItem
@@ -102,7 +102,7 @@ class Bridge:
                 self._session, self._code = str(opened["id"]), str(opened["code"])
             return self._session
 
-    def call(self, client: str, tool: str, arguments: dict[str, Any]) -> Content:
+    def call(self, client: str, tool: str, arguments: dict[str, Any]) -> Content | CallToolResult:
         given = {key: value for key, value in arguments.items() if value is not None}
         for _ in range(2):
             session = self._open(client)
@@ -119,6 +119,8 @@ class Bridge:
         for image in answer.get("images", []):
             content.append(TextContent(type="text", text=f"view: {image.get('view', '?')}"))
             content.append(ImageContent(type="image", data=image["data"], mime_type="image/png"))
+        if "data" in answer:
+            return CallToolResult(content=list(content), structured_content=answer["data"])
         return content
 
     def close(self) -> None:
@@ -194,7 +196,7 @@ def server(bridge: Bridge) -> MCPServer:
         extensions=[Skills(SKILL, SKILL_URI)],
     )
 
-    def call(ctx: Context, tool: str, **arguments: Any) -> Content:
+    def call(ctx: Context, tool: str, **arguments: Any) -> Any:
         return bridge.call(_client(ctx), tool, arguments)
 
     @mcp.tool()
@@ -211,6 +213,61 @@ def server(bridge: Bridge) -> MCPServer:
     def feature_tree(ctx: Context, part: PartName = None) -> Content:
         """Every feature (operation, builder, function-call group) of a part, with its id, call site and code."""
         return call(ctx, "feature_tree", part=part)
+
+    @mcp.tool()
+    def walk_components(
+        ctx: Context,
+        part: Annotated[str | None, Field(description="Explicit part; no viewer needed")] = None,
+        component: Annotated[
+            str | None, Field(description="Code/component reference or captured o/b/g alias; default: part roots")
+        ] = None,
+        direction: Literal["children", "parents"] = "children",
+        depth: Annotated[int, Field(description="Maximum edge depth, 0-8; shallow by default", ge=0, le=8)] = 1,
+        revision: Annotated[str | None, Field(description="Require this captured source_revision")] = None,
+    ) -> CallToolResult:
+        """Walk code-linked construction calls, builders and operations, with source identities distinct from
+        runtime aliases. With no part/component, list project parts, folders and assembly entry targets without
+        building. Explicit parts work headless; repeated definitions and cycles stop expansion."""
+        return call(
+            ctx, "walk_components", part=part, component=component, direction=direction, depth=depth, revision=revision
+        )
+
+    @mcp.tool()
+    def inspect_component(
+        ctx: Context,
+        part: str,
+        component: str,
+        revision: str | None = None,
+    ) -> CallToolResult:
+        """Inspect a captured code definition and its construction occurrences: original call expressions,
+        observed operation arguments, code ancestry, parents/children, inputs and consumers. Accepts canonical
+        code/component refs and current o/b/g aliases. Does not require a viewer or read live model source."""
+        return call(ctx, "inspect_component", part=part, component=component, revision=revision)
+
+    @mcp.tool()
+    def follow_parameter(
+        ctx: Context,
+        part: str,
+        component: str,
+        expression: str,
+        revision: str | None = None,
+    ) -> CallToolResult:
+        """Follow a parameter expression through captured declarations, aliases, derived dimensions and
+        consumers, reporting static evidence and unresolved boundaries. Actual captured operation values remain
+        separate from declared defaults; no model code is evaluated. Explicit part works headless."""
+        return call(ctx, "follow_parameter", part=part, component=component, expression=expression, revision=revision)
+
+    @mcp.tool()
+    def find_related_components(
+        ctx: Context,
+        part: str,
+        component: str,
+        revision: str | None = None,
+    ) -> CallToolResult:
+        """Find code-evidenced callers, callees, shared helpers and shared parameter dependencies, including
+        unbuilt siblings in captured source. No proximity/name guesses or inferred mating relationships.
+        Explicit part works headless."""
+        return call(ctx, "find_related_components", part=part, component=component, revision=revision)
 
     @mcp.tool()
     def describe(

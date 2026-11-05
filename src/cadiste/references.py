@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from . import context
 
 if TYPE_CHECKING:
+    from .components import CodeModel
     from .server import Build, Builds, Measurer, Project
 
 
@@ -168,9 +169,13 @@ class Snapshot:
         ]
         labels: list[str] = []
         rendered_owners: set[str] = set()
+        code_models: dict[str, CodeModel] = {}
         if not items:
             if target["kind"] == "part":
-                lines += [f"Part: {target['name']}", "Captured feature tree:", context.feature_tree(built)]
+                lines += [f"Part: {target['name']}"]
+                for root in built["roots"]:
+                    lines += self._code_lines(built, target["name"], root["id"], code_models)
+                lines += ["Captured feature tree:", context.feature_tree(built)]
             else:
                 lines += self._members(built)
         for index, item in enumerate(items, 1):
@@ -186,7 +191,7 @@ class Snapshot:
                 lines += [
                     f"Canonical part path: {trace['scene']['part']}",
                     "Owning part geometry/context: " + context.trace_summary(trace),
-                    self._describe(trace, node),
+                    self._describe(trace, node, part, code_models),
                 ]
             elif item["kind"] == "instance":
                 path = item["path"]
@@ -231,7 +236,10 @@ class Snapshot:
                                 context.feature_tree(owner_trace),
                                 "Captured source entry point(s):",
                             ]
-                            lines.extend(self._describe(owner_trace, root["id"]) for root in owner_trace["roots"])
+                            lines.extend(
+                                self._describe(owner_trace, root["id"], owner, code_models)
+                                for root in owner_trace["roots"]
+                            )
                             if not owner_trace["roots"]:
                                 lines += ["Source entry point unavailable: this part has no traced feature roots."]
             else:
@@ -242,8 +250,8 @@ class Snapshot:
                 geometry = (
                     context.entity_text(entity) if entity else f"unavailable ({errors.get(path, 'not measured')})"
                 )
+                lines += self._entity_context(target, built, build, path, traces, code_models)
                 lines += ["Geometry: " + geometry]
-                lines += self._entity_context(target, built, build, path, traces)
         if paths:
             lines += [
                 "",
@@ -292,11 +300,33 @@ class Snapshot:
         return entities, relationships, errors
 
     @staticmethod
-    def _describe(trace: dict[str, Any], node: str) -> str:
+    def _code_lines(trace: dict[str, Any], part: str, node: str, models: dict[str, CodeModel]) -> list[str]:
+        from .components import CodeModel
+
         try:
-            return context.describe(trace, node)
+            if part not in models:
+                models[part] = CodeModel(trace, part)
+            selected = models[part].reference(node)
+        except (LookupError, ValueError) as error:
+            return [f"Code component context unavailable: {str(error).strip(chr(39))}"]
+        lines = [
+            "Primary code reference: " + str(selected["definition"] or "(unavailable in captured source)"),
+            "Construction occurrence: " + str(selected["reference"]),
+            "Captured source revision: " + str(selected["source_revision"]),
+            "Code component ancestry (outermost first):",
+        ]
+        for depth, component in enumerate(selected["ancestry"]):
+            label = component.get("label", component.get("kind", "component"))
+            lines.append(f"{'  ' * depth}- {label} [{component['reference']}]")
+        return lines
+
+    def _describe(self, trace: dict[str, Any], node: str, part: str, models: dict[str, CodeModel]) -> str:
+        lines = self._code_lines(trace, part, node, models)
+        try:
+            lines.append(context.describe(trace, node))
         except LookupError as error:
-            return f"Feature detail unavailable: {str(error).strip(chr(39))}"
+            lines.append(f"Feature detail unavailable: {str(error).strip(chr(39))}")
+        return "\n".join(lines)
 
     def _members(self, built: dict[str, Any], path: str | None = None) -> list[str]:
         root = built["scene"]["data"]["shapes"]
@@ -319,6 +349,7 @@ class Snapshot:
         build: Build,
         path: str,
         traces: dict[str, tuple[dict[str, Any], Build]],
+        code_models: dict[str, CodeModel],
     ) -> list[str]:
         picked = context.pick_path(path)
         if picked is None:
@@ -392,6 +423,7 @@ class Snapshot:
                 if maker["index"] not in makers:
                     makers.append(maker["index"])
         for maker in makers:
+            lines += self._code_lines(trace, part, f"o{maker}", code_models)
             lines += [
                 "",
                 "Creating feature detail (captured source and arguments):",

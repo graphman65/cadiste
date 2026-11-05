@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import context
+from .components import CodeModel
 from .hub import Hub, HubError
 from .references import SelectionItem, Snapshot, SnapshotError, selection_items
 
@@ -37,9 +38,14 @@ class Answer:
     text: str
     images: list[dict[str, str]] = field(default_factory=list)
     """``{"data": <base64 PNG>, "view": <direction>}``."""
+    data: dict[str, Any] | None = None
+    """Structured code-navigation result, also rendered in ``text``."""
 
     def json(self) -> dict[str, Any]:
-        return {"text": self.text, "images": self.images}
+        result: dict[str, Any] = {"text": self.text, "images": self.images}
+        if self.data is not None:
+            result["data"] = self.data
+        return result
 
 
 def _target(part: str | None, view: str | None) -> dict[str, Any] | None:
@@ -87,6 +93,10 @@ class Agent:
             "list_parts": self.list_parts,
             "feature_tree": self.feature_tree,
             "describe": self.describe,
+            "walk_components": self.walk_components,
+            "inspect_component": self.inspect_component,
+            "follow_parameter": self.follow_parameter,
+            "find_related_components": self.find_related_components,
             "measure": self.measure,
             "show": self.show,
             "select": self.select,
@@ -104,7 +114,7 @@ class Agent:
             return function(session, **arguments)
         except TypeError as error:
             raise ToolError(f"{tool}: {error}") from error
-        except (HubError, LookupError, SnapshotError) as error:
+        except (HubError, LookupError, ValueError, SnapshotError) as error:
             raise ToolError(str(error).strip("'\"")) from error
 
     # ---- helpers ----
@@ -183,6 +193,100 @@ class Agent:
         name = self._part(session, part)
         trace, _ = self._built({"kind": "part", "name": name})
         return Answer(self._paths(context.describe(trace, node), trace))
+
+    def _code_model(self, part: str, revision: str | None) -> CodeModel:
+        if part not in self.project.names:
+            raise ToolError(f"unknown part {part!r}; choose: {', '.join(self.project.names)}")
+        target = {"kind": "part", "name": part}
+        if revision is None:
+            build = self.builds.get(target, False)
+        else:
+            build = self.builds.latest(target)
+            if build is None:
+                raise ToolError(
+                    "no captured build for the requested source revision; omit revision to build current code"
+                )
+        if build.body is None:
+            raise ToolError(_failure(build))
+        model = CodeModel(json.loads(build.body), part)
+        if revision is not None and revision != model.revision:
+            raise ToolError(
+                f"source revision mismatch: requested {revision!r}, captured {model.revision!r}; "
+                "use the captured revision or explicitly rebuild with show(part=...)"
+            )
+        return model
+
+    @staticmethod
+    def _code_answer(data: dict[str, Any]) -> Answer:
+        return Answer(json.dumps(data, indent=2, ensure_ascii=False), data=data)
+
+    def walk_components(
+        self,
+        session: str,
+        part: str | None = None,
+        component: str | None = None,
+        direction: str = "children",
+        depth: int = 1,
+        revision: str | None = None,
+    ) -> Answer:
+        if direction not in ("children", "parents"):
+            raise ValueError("direction must be 'children' or 'parents'")
+        if isinstance(depth, bool) or not isinstance(depth, int) or not 0 <= depth <= 8:
+            raise ValueError("depth must be an integer from 0 to 8")
+        if part is None and component is None:
+            if revision is not None:
+                raise ValueError("a source revision belongs to a captured part; provide part=...")
+            folders = sorted(
+                {
+                    "/".join(str(step["name"]) for step in steps[:end])
+                    for steps in self.project.folders.values()
+                    for end in range(1, len(steps) + 1)
+                }
+            )
+            return self._code_answer(
+                {
+                    "kind": "project_catalog",
+                    "target": self.project.target,
+                    "parts": [
+                        {
+                            "part": name,
+                            "folders": self.project.folders.get(name, []),
+                            "entry_target": self.project.target,
+                            "arguments": [name] if self.project.parts is not None else list(self.project.args),
+                        }
+                        for name in self.project.names
+                    ],
+                    "folders": [{"path": path, "parts": self.project.folder_parts(path)} for path in folders],
+                    "assemblies": [
+                        {"name": name, "entry_target": target} for name, target in self.project.assemblies.items()
+                    ],
+                    "source_scope": "project catalog, no part was built",
+                }
+            )
+        name = self._part(session, part)
+        return self._code_answer(self._code_model(name, revision).walk(component, direction, depth))
+
+    def inspect_component(self, session: str, part: str, component: str, revision: str | None = None) -> Answer:
+        return self._code_answer(self._code_model(part, revision).inspect(component))
+
+    def follow_parameter(
+        self,
+        session: str,
+        part: str,
+        component: str,
+        expression: str,
+        revision: str | None = None,
+    ) -> Answer:
+        return self._code_answer(self._code_model(part, revision).follow_parameter(component, expression))
+
+    def find_related_components(
+        self,
+        session: str,
+        part: str,
+        component: str,
+        revision: str | None = None,
+    ) -> Answer:
+        return self._code_answer(self._code_model(part, revision).related(component))
 
     def measure(self, session: str, paths: list[str], part: str | None = None) -> Answer:
         if part:

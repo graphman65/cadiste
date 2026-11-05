@@ -11,6 +11,7 @@ from build123d.topology import Shape
 
 from .mesh import Leaf, SceneObject, tessellate
 from .provenance import OriginPath
+from .source import capture_sources, source_revision
 from .trace import BuilderRecord, CallSite, Op, Trace
 from .tree import BuilderNode, Group, Node, OpNode, feature_tree
 
@@ -79,6 +80,7 @@ class _Exporter:
         self.root = root.resolve()
         self.files: set[str] = set()
         self.groups = 0
+        self.invocations: dict[str, dict[str, Any]] = {}
 
     def path(self, file: str) -> str:
         """Model files relative to the project root when they are under it."""
@@ -88,8 +90,20 @@ class _Exporter:
         return shown
 
     def site(self, site: CallSite) -> dict[str, Any]:
+        file = self.path(site.file)
+        self.invocations.setdefault(
+            str(site.invocation),
+            {
+                "file": file,
+                "function": site.function,
+                "label": site.label,
+                "parameter_capture": "first traced event",
+                "parameters": list(site.parameters),
+            },
+        )
         return {
-            "file": self.path(site.file),
+            "invocation": site.invocation,
+            "file": file,
             "line": site.line,
             "function": site.function,
             "label": site.label,
@@ -112,6 +126,7 @@ class _Exporter:
                 return {
                     "id": f"g{self.groups}",
                     "type": "group",
+                    "invocation": site.invocation,
                     "label": site.label,
                     "function": site.function,
                     "defined_in": self.path(site.file),
@@ -197,7 +212,7 @@ def export_trace(
         "builders": [exporter.builder(record, consumed[record.index]) for record in trace.builders],
         "scene": scene,
     }
-    data["sources"] = {
-        exporter.path(file): Path(file).read_text() for file in sorted(exporter.files) if Path(file).is_file()
-    }
+    data["sources"] = capture_sources(exporter.files, root)
+    data["source_revision"] = source_revision(data["sources"])
+    data["invocations"] = exporter.invocations
     return data, leaves

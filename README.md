@@ -164,10 +164,32 @@ cd ../pipecrawler
 claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
 ```
 
+- **Code-first navigation.** `walk_components()` lists the project without opening the viewer. Give `part=`
+  to walk its construction hierarchy, then follow the returned component references through parents and children.
+  `inspect_component(part=..., component=...)` shows the Python definition, construction calls, captured
+  arguments, and dependencies. Edits are made to that Python source; rendering checks the result.
+- **Parameters and related components.** `follow_parameter(part=..., component=..., expression=...)` follows
+  a dimension through local aliases, definitions, derived properties, and parameter fields, and reports its
+  consumers. `find_related_components(part=..., component=...)` finds code-evidenced callers, callees, and
+  shared dependencies, including unbuilt sibling definitions. It does not guess mating relationships from names
+  or geometric proximity. Unresolved/dynamic bindings are explicit.
+- **Code identities and revisions.** Definitions have source-based identities such as
+  `code:src/pipecrawler/parts/chassis/steering_module.py::NoseChamfer.lid_end_x`; construction occurrences have
+  separate references so repeated calls do not collapse. Line numbers are locations, not identities. These
+  tools return structured data alongside readable text. Supply `revision=` from a snapshot to require that
+  captured source revision; a mismatch fails rather than silently substituting another version. Default code
+  queries use current source builds independently of what the viewer currently displays.
+- **Captured source context.** Traces include project-package Python, including parameter modules and sibling
+  components that did not execute under the geometry tracer. Static navigation never executes expressions.
+  Declared defaults are distinct from observed runtime values. Invocation parameters are observed at their
+  first traced event, not necessarily function entry; actual operation arguments are captured at the operation.
+  Observed values remain attached to individual invocations; matching names in helper scopes are not
+  treated as the same parameter.
 - **Standalone references.** The copy button writes a self-contained Markdown selection snapshot, headed
   `# Cadiste selection v1`, that can be pasted directly into a chat. Reading it needs no MCP call, reference
   lookup, running server, or cache entry. It captures the project root, units, target and build identities,
-  selected features and instances, exact geometry, and available feature arguments, call stacks and source.
+  selected features and instances, primary code references and component ancestry, available feature arguments,
+  call stacks and captured source, with exact geometry as supporting evidence.
   Folder picks include their owning part and available part provenance. Missing or unverifiable context is
   reported explicitly rather than guessed. A snapshot describes the captured build, not necessarily current source.
 - **Multiple selection.** Click replaces the selection; Ctrl/Cmd-click toggles an item, and Shift-click adds
@@ -196,6 +218,10 @@ The workflow is the `cadiste` skill (`src/cadiste/skills/cadiste/SKILL.md`), ser
 with the MCP Skills extension and summed up in the server's instructions; a harness that loads skills from disk can
 use the file as is. Answers are text, with ids the other tools take: `[o7]` an operation, `[b2]` a builder, `[g3]`
 a function-call group, and viewer paths (`/Group/<part>/faces/faces_12`, face `f12`).
+
+For example, follow the sleeve diameter from `SteeringModule.__init__` with `expression="tube_d"`, or inspect
+`NoseChamfer.lid_end_x` and find its consumers in both `SteeringModule` and `SteeringLid`. These are code-navigation
+tool calls, not temporary inspection scripts or viewer-only operations.
 
 ## Trace a model
 
@@ -264,6 +290,9 @@ for record in trace.builders:
 | `bridge.py` | `cadiste mcp`: the MCP server on stdio forwarding each tool to the server, and the skill. |
 | `cache.py` | Traces and scenes on disk, by part, for one fingerprint of the model's source. |
 | `project.py` | The project as the server sees it before building: part names, their folders, the source directories. |
+| `source.py` | Captured project Python, line-independent definition references, and source-revision digests. |
+| `code_index.py` | Static Python definition, import, alias, parameter, call and dependency analysis over captured source. |
+| `components.py` | Source-linked construction hierarchy and component/parameter/relationship navigation used by MCP and snapshots. |
 | `web/` | The React frontend (Vite, TypeScript, three-cad-viewer). |
 
 - **Builder entry is hooked through `_build_scope_context`, not `Builder.__enter__`.** `__enter__` makes the

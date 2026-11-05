@@ -96,6 +96,8 @@ class CallSite:
     """What to call the invocation: the class name for a shape's ``__init__``, else the function name."""
     code: str
     """Source of the expression being executed at ``line``."""
+    parameters: tuple[dict[str, Any], ...] = field(default=(), compare=False, hash=False)
+    """Function parameter values observed at its first traced event, not necessarily at function entry."""
 
     @property
     def location(self) -> str:
@@ -285,6 +287,27 @@ def _describe(value: Any, depth: int = 0) -> str:
     return text if len(text) <= 160 else text[:159] + "…"
 
 
+def _frame_parameters(frame: FrameType) -> tuple[dict[str, Any], ...]:
+    info = inspect.getargvalues(frame)
+    names = [*info.args, *([info.varargs] if info.varargs else []), *([info.keywords] if info.keywords else [])]
+    parameters: list[dict[str, Any]] = []
+    for name in names:
+        if name in ("self", "cls") or name not in info.locals:
+            continue
+        value = info.locals[name]
+        parameter: dict[str, Any] = {
+            "name": name,
+            "value": _describe(value),
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        }
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            parameter["fields"] = {
+                item.name: _describe(getattr(value, item.name)) for item in dataclasses.fields(value)
+            }
+        parameters.append(parameter)
+    return tuple(parameters)
+
+
 # Not Builder.__enter__: it compares its caller's frame with the active builder's to decide parenthood, so a
 # wrapper frame would orphan every nested builder. It activates its scope through this module global.
 _ORIGINAL_SCOPE_CONTEXT = build_common._build_scope_context
@@ -299,6 +322,7 @@ class _Recorder:
         self.records: dict[int, BuilderRecord] = {}
         # Frames stay referenced for the whole trace so that id(frame) identifies one invocation.
         self.frames: dict[int, tuple[FrameType, int]] = {}
+        self.parameters: dict[int, tuple[dict[str, Any], ...]] = {}
 
     # ---- stacks ----
 
@@ -315,13 +339,17 @@ class _Recorder:
         owner = frame.f_locals.get("self") if code.co_name == "__init__" else None
         if isinstance(owner, Shape):
             label = type(owner).__name__
+        invocation = self._invocation(frame)
+        if invocation not in self.parameters:
+            self.parameters[invocation] = _frame_parameters(frame)
         return CallSite(
-            invocation=self._invocation(frame),
+            invocation=invocation,
             file=code.co_filename,
             line=frame.f_lineno,
             function=code.co_qualname,
             label=label,
             code=_expression_source(frame),
+            parameters=self.parameters[invocation],
         )
 
     def _user_frames(self, frame: FrameType | None) -> list[FrameType]:
