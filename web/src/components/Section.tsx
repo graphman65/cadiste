@@ -154,6 +154,8 @@ export interface SectionTool {
   chooseAxis: (name: string, normal: Vec3) => void;
   setOffset: (offset: number) => void;
   flip: () => void;
+  /** Replace the cut when switching to a saved view; picking is transient, never restored. */
+  restore: (active: boolean, section: Section | null) => void;
 }
 
 /**
@@ -233,6 +235,12 @@ export function useSection(viewer: () => Viewer | null, rendered: number): Secti
     },
     setOffset: (offset) => setSection((current) => current && { ...current, offset }),
     flip: () => setSection((current) => current && { ...current, flipped: !current.flipped }),
+    restore: (on, cut) => {
+      setActive(on);
+      setSection(cut);
+      setPicking(false);
+      setNote(null);
+    },
   };
 }
 

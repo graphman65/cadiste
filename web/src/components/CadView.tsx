@@ -15,6 +15,7 @@ import type { HubCalls, SceneData } from "../types";
 import { type SceneHover, Readout } from "./HoverCard";
 import { MeasureMarks, MeasurePanel, type Picked, measurementOf, useMeasurement } from "./Measure";
 import { SectionPanel, useSection } from "./Section";
+import { SavedViews, type SavedViewState, type SceneViewState } from "./SavedViews";
 import { type ViewDirection, type ViewSettings, ViewToolbar, useViewSettings } from "./ViewToolbar";
 
 // OCP CAD Viewer's defaults, so models look the way they do there.
@@ -74,6 +75,10 @@ interface Props {
   onDropPick: (path: string) => void;
   onClearPicks: () => void;
   onClearSelection: () => void;
+  /** Project + target identity, for browser-local saved views. */
+  viewScope: string | null;
+  sceneState: SceneViewState;
+  onRestoreScene: (state: SceneViewState) => void;
   ref?: Ref<CadViewHandle>;
 }
 
@@ -129,7 +134,7 @@ function displayOptions(width: number, height: number, settings: ViewSettings) {
  * Section-plane picking consumes a click first. Measurement mode keeps its additive picks in the same canonical
  * selection as tree/scene items, so copying never omits measurements or resets unrelated selected items.
  */
-export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, ref }: Props) {
+export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, sceneState, onRestoreScene, ref }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const instance = useRef<Instance | null>(null);
   const [rendered, setRendered] = useState(0);
@@ -156,6 +161,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   const waiting = useRef<{ data: SceneData; resolve: () => void }[]>([]);
   const section = useSection(viewerOf, rendered);
   const { picking: sectionPicking, pickFace: pickSectionFace } = section;
+  const pendingView = useRef<SavedViewState | null>(null);
 
   /** The hover card beside the pointer, flipped to its other side near the view's right and bottom edges. */
   const placeCard = () => {
@@ -267,7 +273,22 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     if (focus.view !== null && focus.view !== lastView.current) viewer.presetCamera(focus.view);
     lastView.current = focus.view;
     viewer.update(true, false);
-  }, [focus, settings.transparent, rendered, measuring, picked, extra]);
+  }, [focus, settings.transparent, rendered, extra]);
+
+  // Restore after focus has applied its visibility and optional sketch camera. Otherwise focus would undo it.
+  useEffect(() => {
+    const saved = pendingView.current;
+    const viewer = instance.current?.viewer;
+    if (saved === null || viewer === undefined || !viewer.ready) return;
+    pendingView.current = null;
+    const known = viewer.getStates();
+    viewer.setStates(Object.fromEntries(Object.entries(saved.states).filter(([path]) => path in known)));
+    // Perspective zoom is already encoded by position. Reapplying it dollies around the renderer's original
+    // centre, not a panned orbit target. Orbit's public quaternion setter also recomputes a look-at rotation.
+    viewer.setCameraLocationSettings(saved.camera.position, null, saved.camera.target, saved.settings.ortho ? saved.camera.zoom : null, false);
+    viewer.rendered.camera.setQuaternion(saved.camera.quaternion);
+    viewer.update(true, false);
+  }, [focus, settings, rendered]);
 
   // After the focus effect: a scene waited for is focused too once this runs.
   useEffect(() => {
@@ -417,6 +438,40 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       if (on) viewer.setRelativeTime(1);
     });
 
+
+  const captureView = (): SavedViewState | null => {
+    const viewer = instance.current?.viewer;
+    if (viewer === undefined || !viewer.ready || shown.current !== data) return null;
+    const [x, y, z] = viewer.getCameraPosition();
+    const states = viewer.getStates();
+    return structuredClone({
+      scene: { ...sceneState, hidden: Object.entries(states).filter(([, state]) => state[0] === 0 && state[1] === 0).map(([path]) => path) },
+      camera: {
+        position: [x, y, z],
+        quaternion: viewer.getCameraQuaternion(),
+        target: viewer.getCameraTarget(),
+        zoom: viewer.getCameraZoom(),
+      },
+      settings,
+      states,
+      section: { active: section.active, section: section.section },
+      explode: exploded ? viewer.getRelativeTime() : null,
+      measuring,
+    });
+  };
+
+  const restoreView = (saved: SavedViewState) => {
+    pendingView.current = saved;
+    setExtra([]);
+    onRestoreScene(saved.scene);
+    changeSettings(saved.settings);
+    section.restore(saved.section.active, saved.section.section);
+    setMeasuring(saved.measuring);
+    withViewer((viewer) => {
+      viewer.setExplode(saved.explode !== null);
+      if (saved.explode !== null) viewer.setRelativeTime(saved.explode);
+    });
+  };
   return (
     <div className="cad">
       <div className="cad-view" ref={host} />
@@ -451,7 +506,9 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           onExplode={explode}
           sectioning={section.active}
           onSection={section.open}
-        />
+        >
+          {viewScope !== null && <SavedViews key={viewScope} scope={viewScope} capture={captureView} restore={restoreView} />}
+        </ViewToolbar>
       )}
     </div>
   );

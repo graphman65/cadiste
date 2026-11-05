@@ -695,7 +695,7 @@ export function App() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.repeat) return;
-      const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable]");
+      const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable], [role=dialog], .saved-views");
       if (typing) return;
       if (event.key === "Escape") {
         event.preventDefault();
@@ -911,6 +911,17 @@ export function App() {
             onDropPick={(path) => setSelection((current) => current.filter((item) => item.kind !== "entity" || item.path !== path))}
             onClearPicks={() => setSelection((current) => current.filter((item) => item.kind !== "entity"))}
             onClearSelection={clearSelection}
+            viewScope={project === null || target === null ? null : JSON.stringify([project.root, project.target, keyOf(target)])}
+            sceneState={{ hidden: [...hiddenInstances], selection, selected, focusPart, instance, litPart }}
+            onRestoreScene={(saved) => {
+              setHiddenInstances(new Set(saved.hidden));
+              setSelection(saved.selection);
+              setSelected(saved.selected);
+              setFocusPart(saved.focusPart);
+              setInstance(saved.instance);
+              setLitPart(saved.litPart);
+              setHover(null);
+            }}
           />
           {state?.status === "loading" && (
             <div className="view-overlay">

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { type ReactNode, useCallback, useState } from "react";
 
 import { Icon, type IconName } from "./Icon";
 
@@ -67,6 +67,7 @@ interface Props {
   /** Whether the section tool is open: the scene cut along a plane. */
   sectioning: boolean;
   onSection: (sectioning: boolean) => void;
+  children?: ReactNode;
 }
 
 export function ViewToolbar({
@@ -80,9 +81,12 @@ export function ViewToolbar({
   onExplode,
   sectioning,
   onSection,
+  children,
 }: Props) {
   return (
     <div className="view-toolbar" role="toolbar" aria-label="View">
+      {children}
+      <span className="divider" />
       <div className="segment">
         {VIEWS.map(({ direction, label }) => (
           <button key={direction} onClick={() => onView(direction)} title={`${label} view`}>

@@ -521,6 +521,10 @@ body[data-theme] .cad-view {
   display: flex;
   align-items: center;
   gap: 2px;
+  flex-wrap: wrap;
+  justify-content: center;
+  width: max-content;
+  max-width: calc(100% - 24px);
   padding: 4px;
   background: rgb(34 37 42 / 0.92);
   border: 1px solid var(--border);
@@ -531,6 +535,7 @@ body[data-theme] .cad-view {
 
 .view-toolbar .segment {
   display: flex;
+  flex-wrap: wrap;
   margin-right: 2px;
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -582,6 +587,83 @@ body[data-theme] .cad-view {
   align-self: stretch;
   margin: 2px 4px;
   background: var(--border);
+}
+
+.saved-views {
+  position: static;
+}
+
+.saved-views > button {
+  white-space: nowrap;
+}
+
+.saved-views-menu {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 0;
+  width: min(460px, 100%);
+  padding: 12px;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.5);
+  text-align: left;
+}
+
+.saved-views-menu p {
+  margin: 6px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.saved-views-list {
+  max-height: min(320px, 40vh);
+  overflow-y: auto;
+  margin: 10px 0;
+}
+
+.saved-view-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.saved-view-row > button {
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.saved-view-row .saved-view-restore {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+  color: var(--accent);
+}
+
+.saved-views-menu form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.saved-views-menu input {
+  flex: 1;
+  min-width: 150px;
+  padding: 5px 6px;
+  color: var(--fg);
+  font: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.saved-views-error {
+  margin-top: 8px;
+  color: var(--subtract);
+  font-size: 12px;
 }
 
 /* ---- measure ---- */
