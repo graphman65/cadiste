@@ -25,6 +25,8 @@ from mcp.server.mcpserver.resources import TextResource
 from mcp_types import ImageContent, PaginatedRequestParams, RequestParams, TextContent
 from pydantic import Field
 
+from .references import SelectionItem
+
 SKILL = Path(__file__).resolve().parent / "skills" / "cadiste" / "SKILL.md"
 SKILL_URI = "skill://cadiste/SKILL.md"
 LOCKFILE = Path(".cache/cadiste/serve.json")
@@ -35,13 +37,13 @@ _TIMEOUT = 900
 
 INSTRUCTIONS = """\
 cadiste shows a build123d model in the user's browser as a CAD feature tree: operations in order, their arguments,
-the call site in the source, and which operation made each face. The user points you at something in the model by
-pasting a reference copied from the viewer, `cadiste:ref/<id>` (a feature, faces, edges, vertices, an assembly
-instance, or a whole part): call get_reference with it for everything cadiste knows about it. You edit the model's
-Python source yourself, then call show(part=...) to rebuild it: the answer compares it with the build before and
-includes a screenshot. Tools that drive the viewer (show, select, highlight, set_view, screenshot) use the session's
-linked tab: the one the first reference came from, or one the user links when asked. Read the skill
-skill://cadiste/SKILL.md for the workflow."""
+the call site in the source, and which operation made each face. The user can paste a self-contained Markdown
+snapshot beginning '# Cadiste selection v1': read it directly, without a lookup. It captures all selected items,
+their geometry, build identities and source provenance at copy time, not live state. You edit the model's Python
+source yourself, then call show(part=...) to rebuild it: the answer compares it with the build before and includes
+a screenshot. Live viewer tools use a session-linked tab; the first live tool requests a user-approved link when
+needed. A snapshot's viewer tab identity is context, not an automatic link. Read skill://cadiste/SKILL.md for the
+workflow."""
 
 Direction = Literal["iso", "front", "rear", "left", "right", "top", "bottom"]
 Content = list[TextContent | ImageContent]
@@ -206,17 +208,6 @@ def server(bridge: Bridge) -> MCPServer:
         return call(ctx, "list_parts")
 
     @mcp.tool()
-    def get_reference(
-        ctx: Context,
-        reference: Annotated[str, Field(description="The reference the user pasted: cadiste:ref/<id>, or the id")],
-    ) -> Content:
-        """Everything cadiste knows about what a reference the user copied in the viewer points at: a feature of the
-        tree with its arguments, call stack and source; faces, edges and vertices with their exact geometry and the
-        features that made them; an assembly instance and the part it is of; or a whole part. Call it whenever the
-        user's message holds a cadiste:ref/<id>."""
-        return call(ctx, "get_reference", reference=reference)
-
-    @mcp.tool()
     def feature_tree(ctx: Context, part: PartName = None) -> Content:
         """Every feature (operation, builder, function-call group) of a part, with its id, call site and code."""
         return call(ctx, "feature_tree", part=part)
@@ -267,14 +258,16 @@ def server(bridge: Bridge) -> MCPServer:
     @mcp.tool()
     def select(
         ctx: Context,
-        node: Annotated[str | None, Field(description="Feature id to select in a part ('' clears)")] = None,
-        instance: Annotated[str | None, Field(description="Instance or group id in the assembly ('' clears)")] = None,
-        picks: Annotated[
-            list[str] | None, Field(description="Viewer paths of faces, edges, vertices to pick to measure ([] clears)")
-        ] = None,
+        items: Annotated[
+            list[SelectionItem],
+            Field(
+                description="Ordered selection: {kind:'feature',part,node}, {kind:'instance',path}, or "
+                "{kind:'entity',path}. Multiple mixed items are allowed; [] clears the selection."
+            ),
+        ],
     ) -> Content:
-        """Change the selection in the linked tab, then answer what is selected (as get_reference does)."""
-        return call(ctx, "select", node=node, instance=instance, picks=picks)
+        """Replace the linked tab's selection and return its self-contained captured Markdown snapshot."""
+        return call(ctx, "select", items=items)
 
     @mcp.tool()
     def highlight(

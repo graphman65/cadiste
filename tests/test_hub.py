@@ -128,24 +128,3 @@ def test_a_reloaded_tab_replaces_its_old_stream_and_gets_the_requests():
     hub.reply("tab-a", new.wait_for("request")["id"], True, {})
     calling["thread"].join(2)
     assert calling["value"] == {}
-
-
-def test_a_reference_links_an_unlinked_session_to_its_open_tab_without_asking():
-    hub = Hub()
-    _Stream(hub, "tab-a")
-    session = hub.open_session("agent")
-
-    assert hub.adopt(session.id, "tab-a")
-    assert hub.linked_tab(session.id, timeout=0) == "tab-a"
-
-
-def test_a_reference_does_not_move_a_linked_session_nor_link_to_a_closed_tab():
-    hub = Hub()
-    _Stream(hub, "tab-a")
-    _Stream(hub, "tab-b")
-    linked, unlinked = hub.open_session("agent"), hub.open_session("agent")
-    hub.link(linked.id, "tab-a")
-
-    assert not hub.adopt(linked.id, "tab-b")
-    assert hub.linked_tab(linked.id, timeout=0) == "tab-a"
-    assert not hub.adopt(unlinked.id, "tab-gone")

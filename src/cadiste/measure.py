@@ -23,14 +23,18 @@ from typing import Any
 from OCP.BinTools import BinTools, BinTools_FormatVersion
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp
+from OCP.collections import List_TopoDS_Shape
 from OCP.GeomAbs import GeomAbs_CurveType, GeomAbs_SurfaceType
 from OCP.gp import gp_Ax1
 from OCP.GProp import GProp_GProps
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX
 from OCP.TopExp import TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
+from ocp_tessellate.ocp_utils import mul_locations, tq_to_loc
 
 from .mesh import Leaf
 
@@ -43,6 +47,8 @@ _PARALLEL = 1e-9
 """Angle (rad) under which two directions count as parallel."""
 _SAME = 1e-6
 """Distance (mm) under which a derived distance repeats the minimum distance."""
+_CORRESPONDENCE_TOLERANCE = 1e-6
+"""Linear OCC tolerance (mm) for cross-build entity correspondence, after recorded placement normalization."""
 
 Vec = tuple[float, float, float]
 
@@ -122,6 +128,88 @@ def load(file: Path) -> Shapes:
             for k, topo in enumerate(_TOPOS)
         }
     return Shapes(leaves)
+
+
+def _mass(shape: TopoDS_Shape, *, area: bool) -> float:
+    properties = GProp_GProps()
+    if area:
+        BRepGProp.SurfaceProperties_s(shape, properties)
+    else:
+        BRepGProp.LinearProperties_s(shape, properties)
+    return properties.Mass()
+
+
+def _same_region(first: TopoDS_Shape, second: TopoDS_Shape, topo: str) -> bool:
+    """Compare actual trimmed regions, not a sampled surface, bounding box or B-rep serialization."""
+    tolerance = _CORRESPONDENCE_TOLERANCE
+    distance = BRepExtrema_DistShapeShape(first, second)
+    if not distance.IsDone() or distance.Value() > tolerance:
+        return False
+    if topo == "vertex":
+        return True
+    common = BRepAlgoAPI_Common()
+    arguments, tools = List_TopoDS_Shape(), List_TopoDS_Shape()
+    arguments.Append(first)
+    tools.Append(second)
+    common.SetArguments(arguments)
+    common.SetTools(tools)
+    common.SetNonDestructive(True)
+    common.SetFuzzyValue(tolerance)
+    common.Build()
+    if not common.IsDone() or common.Shape().IsNull():
+        return False
+    area = topo == "face"
+    first_mass, second_mass = _mass(first, area=area), _mass(second, area=area)
+    overlap = _mass(common.Shape(), area=area)
+    # A linear tolerance becomes an area tolerance by the length of the trimmed boundary.
+    allowed = tolerance * max(_mass(first, area=False), _mass(second, area=False), tolerance) if area else tolerance
+    return (
+        overlap > 0
+        and abs(first_mass - second_mass) <= allowed
+        and abs(first_mass - overlap) <= allowed
+        and abs(second_mass - overlap) <= allowed
+    )
+
+
+def corresponding_entity(
+    shapes: Shapes,
+    path: str,
+    trace: Shapes,
+    trace_path: str,
+    locations: list[Any],
+    trace_locations: list[Any],
+) -> bool:
+    """Verify a same-index picked region and all face indices used for its maker context.
+
+    Only the selected region and its incident faces are compared, so a selection does not trigger Boolean
+    operations on every face/edge/vertex of a large part. Separate builds and B-rep archives need not share
+    topology identities or serialization. Recorded scene placements map viewer-world into trace-world coordinates.
+    """
+
+    def location(chain: list[Any]) -> TopLoc_Location:
+        result = None
+        for transform in chain:
+            result = mul_locations(result, tq_to_loc(*transform))
+        return result if result is not None else TopLoc_Location()
+
+    placement = location(trace_locations).Multiplied(location(locations).Inverted())
+    topo, entity = shapes.entity(path)
+    trace_topo, trace_entity = trace.entity(trace_path)
+    if topo != trace_topo or not _same_region(entity.Moved(placement), trace_entity, topo):
+        return False
+    if topo == "face":
+        return True
+    faces, trace_faces = adjacent_faces(shapes, path), adjacent_faces(trace, trace_path)
+    if faces is None or trace_faces is None or set(faces) != set(trace_faces):
+        return False
+    viewer_leaf, trace_leaf = _PATH.fullmatch(path), _PATH.fullmatch(trace_path)
+    assert viewer_leaf is not None and trace_leaf is not None
+    for face in faces:
+        _, viewer_face = shapes.entity(f"{viewer_leaf['leaf']}/faces/faces_{face}")
+        _, trace_face = trace.entity(f"{trace_leaf['leaf']}/faces/faces_{face}")
+        if not _same_region(viewer_face.Moved(placement), trace_face, "face"):
+            return False
+    return True
 
 
 def _downcast(shape: TopoDS_Shape) -> TopoDS_Shape:

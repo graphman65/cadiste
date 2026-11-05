@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
 import { ancestors, builderIcon, builderTitle, countOps, location, opIcon, type TreeIndex } from "../model";
+import { selectionMode, type SelectionMode } from "../selection";
 import type { TraceData, TreeNode } from "../types";
 import { Icon, type IconName } from "./Icon";
 
@@ -8,14 +9,15 @@ interface Props {
   trace: TraceData;
   index: TreeIndex;
   selected: string | null;
-  onSelect: (id: string) => void;
+  selectedNodes: ReadonlySet<string>;
+  onSelect: (id: string, mode?: SelectionMode) => void;
 }
 
 /** The outermost builder's features left to right, like a CAD timeline; the chip holding the selection is lit. */
-export function Timeline({ trace, index, selected, onSelect }: Props) {
+export function Timeline({ trace, index, selected, selectedNodes, onSelect }: Props) {
   const track = useRef<HTMLDivElement>(null);
   const root = trace.roots[0];
-  const lit = new Set(selected === null ? [] : [selected, ...ancestors(index, selected)]);
+  const lit = new Set([...selectedNodes].flatMap((node) => [node, ...ancestors(index, node)]));
 
   useEffect(() => {
     track.current?.querySelector(".chip.lit")?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -24,7 +26,7 @@ export function Timeline({ trace, index, selected, onSelect }: Props) {
   if (root === undefined || root.type !== "builder") return <footer className="timeline" />;
   return (
     <footer className="timeline">
-      <button className="timeline-root" onClick={() => onSelect(root.id)} title="The outermost builder">
+      <button className="timeline-root" aria-pressed={selectedNodes.has(root.id)} onClick={(event) => onSelect(root.id, selectionMode(event))} title="The outermost builder">
         <Icon name="part" />
         {builderTitle(trace, root.builder)}
       </button>
@@ -64,13 +66,14 @@ function chipFace(node: TreeNode, trace: TraceData): { icon: IconName; label: st
   }
 }
 
-function Chip(props: { node: TreeNode; step: number; trace: TraceData; lit: boolean; onSelect: (id: string) => void }) {
+function Chip(props: { node: TreeNode; step: number; trace: TraceData; lit: boolean; onSelect: (id: string, mode?: SelectionMode) => void }) {
   const { node, step, trace, lit, onSelect } = props;
   const face = chipFace(node, trace);
   return (
     <button
       className={`chip chip-${face.mode}${lit ? " lit" : ""}`}
-      onClick={() => onSelect(node.id)}
+      aria-pressed={lit}
+      onClick={(event) => onSelect(node.id, selectionMode(event))}
       title={`${step}. ${face.label} — ${face.tip}`}
     >
       <Icon name={face.icon} />

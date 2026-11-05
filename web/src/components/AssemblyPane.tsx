@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { shapeLeaves } from "../model";
 import { usePersistentChoice } from "../persist";
+import { selectionMode, type SelectionMode, type SelectionModifiers } from "../selection";
 import type { AssemblyData } from "../types";
 import { AssemblyTree } from "./AssemblyTree";
 import { Icon } from "./Icon";
@@ -15,11 +16,11 @@ interface Props {
   /** The selected instance-tree node; the part whose instances are all lit; the part shown selected: the lit one, or
    * the selected instance's. */
   instance: string | null;
-  litPart: string | null;
   marked: string | null;
+  selectedPaths: ReadonlySet<string>;
   onVisibility: (leaves: string[], visible: boolean) => void;
-  onSelectInstance: (id: string) => void;
-  onSelectPart: (part: string | null) => void;
+  onSelectInstance: (id: string, mode?: SelectionMode, range?: string[]) => void;
+  onSelectPart: (part: string, mode?: SelectionMode, range?: string[]) => void;
   onHover: (id: string | null) => void;
   onOpen: (part: string) => void;
 }
@@ -28,7 +29,7 @@ const TABS = ["parts", "instances"] as const;
 
 /** An assembly's sidebar: its parts (every instance of each at once) or its instances as built. */
 export function AssemblyPane(props: Props) {
-  const { name, data, parts, hidden, instance, litPart, marked, onVisibility, onSelectInstance, onSelectPart } = props;
+  const { name, data, parts, hidden, instance, marked, selectedPaths, onVisibility, onSelectInstance, onSelectPart } = props;
   const { onHover, onOpen } = props;
   const [tab, setTab] = usePersistentChoice("cadiste.assembly-tab", TABS);
   const root = data.scene.data.shapes;
@@ -67,7 +68,7 @@ export function AssemblyPane(props: Props) {
           data={data}
           parts={parts}
           hidden={hidden}
-          lit={litPart}
+          selectedPaths={selectedPaths}
           marked={marked}
           onVisibility={onVisibility}
           onSelect={onSelectPart}
@@ -78,6 +79,7 @@ export function AssemblyPane(props: Props) {
           root={root}
           hidden={hidden}
           selected={instance}
+          selectedPaths={selectedPaths}
           onVisibility={onVisibility}
           onSelect={onSelectInstance}
           onHover={onHover}
@@ -93,17 +95,18 @@ interface PartsProps {
   data: AssemblyData;
   parts: string[];
   hidden: ReadonlySet<string>;
-  lit: string | null;
+  selectedPaths: ReadonlySet<string>;
   onVisibility: (leaves: string[], visible: boolean) => void;
   marked: string | null;
-  onSelect: (part: string | null) => void;
+  onSelect: (part: string, mode?: SelectionMode, range?: string[]) => void;
   onOpen: (part: string) => void;
 }
 
 /** The assembly's parts, each with its instances: hide or show them all, light them all, open the part. */
-function AssemblyParts({ data, parts, hidden, lit, marked, onVisibility, onSelect, onOpen }: PartsProps) {
+function AssemblyParts({ data, parts, hidden, selectedPaths, marked, onVisibility, onSelect, onOpen }: PartsProps) {
   const [filter, setFilter] = useState("");
   const list = useRef<HTMLUListElement>(null);
+  const anchor = useRef<string | null>(null);
   useEffect(() => {
     if (marked !== null) {
       list.current?.querySelector(`[data-part="${CSS.escape(marked)}"]`)?.scrollIntoView({ block: "nearest" });
@@ -125,6 +128,14 @@ function AssemblyParts({ data, parts, hidden, lit, marked, onVisibility, onSelec
   }
   const needle = filter.trim().toLowerCase();
   const shown = instances.filter(({ part }) => part.toLowerCase().includes(needle));
+  const choose = (part: string, event: SelectionModifiers) => {
+    const from = shown.findIndex((row) => row.part === anchor.current);
+    const to = shown.findIndex((row) => row.part === part);
+    const range = event.shiftKey && from >= 0 && to >= 0
+      ? shown.slice(Math.min(from, to), Math.max(from, to) + 1).map((row) => row.part) : undefined;
+    onSelect(part, selectionMode(event), range);
+    if (!event.shiftKey) anchor.current = part;
+  };
   return (
     <div className="assembly-parts">
       <input
@@ -133,16 +144,32 @@ function AssemblyParts({ data, parts, hidden, lit, marked, onVisibility, onSelec
         value={filter}
         onChange={(event) => setFilter(event.target.value)}
       />
-      <ul ref={list}>
+      <ul ref={list} role="listbox" aria-label="Assembly parts" aria-multiselectable="true" tabIndex={0}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          const at = shown.findIndex((row) => row.part === marked);
+          let next: string | undefined;
+          if (event.key === "ArrowDown") next = shown[Math.min(at + 1, shown.length - 1)]?.part;
+          else if (event.key === "ArrowUp") next = shown[Math.max(at - 1, 0)]?.part;
+          else if (event.key === "Home") next = shown[0]?.part;
+          else if (event.key === "End") next = shown.at(-1)?.part;
+          else if (event.key === " " || event.key === "Enter") next = shown[at]?.part;
+          else return;
+          event.preventDefault();
+          if (next !== undefined) choose(next, event);
+        }}>
         {shown.map(({ part, leaves }) => {
           const showing = leaves.filter((leaf) => !hidden.has(leaf)).length;
           const visible = showing > 0;
+          const selected = leaves.length > 0 && leaves.every((leaf) => selectedPaths.has(leaf));
           return (
-            <li key={part}>
+            <li key={part} role="presentation">
               <div
-                className={marked === part ? "row assembly-part selected" : "row assembly-part"}
+                className={selected ? "row assembly-part selected" : "row assembly-part"}
+                role="option"
+                aria-selected={selected}
                 data-part={part}
-                onClick={() => onSelect(lit === part ? null : part)}
+                onClick={(event) => { list.current?.focus(); choose(part, event); }}
                 onDoubleClick={() => onOpen(part)}
               >
                 <button

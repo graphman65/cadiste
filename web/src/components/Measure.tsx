@@ -132,14 +132,14 @@ export function MeasurePanel({ picked, state, available, onDrop, onClear }: Pane
         Measure
         <span className="spacer" />
         {picked.length > 0 && (
-          <button className="measure-clear" onClick={onClear} title="Drop every pick (Esc)">
+          <button className="measure-clear" onClick={onClear} title="Drop every entity pick (Escape clears the entire selection)">
             Clear
           </button>
         )}
       </div>
       {!available && <p className="muted">This build has no shapes to measure on: rebuild it.</p>}
       {available && picked.length === 0 && (
-        <p className="muted">Click faces, edges or vertices to measure them; click one again to drop it.</p>
+        <p className="muted">Click replaces the selection; Ctrl/Cmd-click toggles a face, edge or vertex; Shift-click adds it.</p>
       )}
       {picked.length > 0 && (
         <ul className="measure-picks">

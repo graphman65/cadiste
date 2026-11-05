@@ -118,6 +118,10 @@ pre {
 
 .project {
   color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .stats {
@@ -126,6 +130,17 @@ pre {
 
 .spacer {
   flex: 1;
+}
+
+.selection-count,
+.clear-selection {
+  flex: none;
+  white-space: nowrap;
+}
+
+.selection-count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .sidebar {

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 Json = dict[str, Any]
@@ -19,8 +19,6 @@ _EXCERPT = 3
 _CODE = 100
 """Width a call's code is cut to in one-line listings."""
 _PICK = re.compile(r"(?P<leaf>.+)/(?P<topo>faces|edges|vertices)/(?P=topo)_(?P<index>\d+)")
-_TOPO = {"faces": "face", "edges": "edge", "vertices": "vertex"}
-_LETTER = {"faces": "f", "edges": "e", "vertices": "v"}
 
 
 def _flat(code: str, width: int = _CODE) -> str:
@@ -133,7 +131,7 @@ def _excerpt(trace: Json, site: Json) -> list[str]:
     """The source around a call, numbered, the call's lines marked."""
     source = trace["sources"].get(site["file"])
     if source is None:
-        return []
+        return [f"Source unavailable: {site['file']} was not captured in this build."]
     lines = source.splitlines()
     first = site["line"]
     last = first + max(1, len(site["code"].splitlines())) - 1
@@ -162,7 +160,7 @@ def describe(trace: Json, node_id: str) -> str:
     lines: list[str] = []
     match node["type"]:
         case "op":
-            lines += _describe_op(trace, trace["ops"][node["op"]])
+            lines += operation_lines(trace, trace["ops"][node["op"]])
         case "builder":
             builder = trace["builders"][node["builder"]]
             lines.append(_builder_line(trace, builder))
@@ -175,6 +173,8 @@ def describe(trace: Json, node_id: str) -> str:
                 lines.append(f"  call stack: {_stack(builder['site'])}")
                 lines.append("  source:")
                 lines += [f"    {line}" for line in _excerpt(trace, builder["site"][-1])]
+            else:
+                lines.append("  source unavailable: no builder call site was captured.")
             if node["children"]:
                 lines.append("  contents:")
                 lines += [f"    {line}" for child in node["children"] for line in _tree_lines(trace, child)]
@@ -187,14 +187,17 @@ def describe(trace: Json, node_id: str) -> str:
     return "\n".join(lines)
 
 
-def _describe_op(trace: Json, op: Json) -> list[str]:
+def operation_lines(trace: Json, op: Json) -> list[str]:
+    """Full captured operation detail, including hand-overs represented as builders in the tree."""
     builder = trace["builders"][op["builder"]]
     lines = [op_line(trace, op), f"  in {_builder_line(trace, builder)}"]
     if op["arguments"]:
         lines.append("  arguments (parameter = expression written → value):")
         for argument in op["arguments"]:
-            written = f"{_flat(argument['source'], 80)} → " if argument["source"] else "(default) "
-            lines.append(f"    {argument['name']} = {written}{_flat(argument['value'], 120)}")
+            written = f"{argument['source']} → " if argument["source"] else "(default) "
+            lines.append(f"    {argument['name']} = {written}{argument['value']}")
+    else:
+        lines.append("  arguments: none captured.")
     if op["inputs"]:
         lines.append("  consumed: " + ", ".join(_builder_line(trace, trace["builders"][b]) for b in op["inputs"]))
     if builder["kind"] == "BuildPart":
@@ -205,10 +208,12 @@ def _describe_op(trace: Json, op: Json) -> list[str]:
         lines.append(f"  call stack: {_stack(op['site'])}")
         lines.append("  source:")
         lines += [f"    {line}" for line in _excerpt(trace, op["site"][-1])]
+    else:
+        lines.append("  source unavailable: no operation call site was captured.")
     return lines
 
 
-def _op_of_face(trace: Json, face: int) -> Json | None:
+def face_maker(trace: Json, face: int) -> Json | None:
     return next((op for op in trace["ops"] if face in op["faces"]), None)
 
 
@@ -236,166 +241,50 @@ def results_text(results: list[Json]) -> str:
     return "between them: " + "; ".join(_quantity(q) for q in results)
 
 
-def _scene_owner(trace: Json, leaf: str) -> str:
-    """What a leaf of a part's scene is: the part, a sketch, a sketch element."""
-    scene = trace["scene"]
-    if leaf == scene["part"]:
-        return "the part"
-    for builder, sketch in scene["sketches"].items():
-        if sketch["path"] == leaf:
-            return f"sketch {_builder_line(trace, trace['builders'][int(builder)])}"
-    for op, element in scene["elements"].items():
-        if element == leaf:
-            return f"sketch element {op_line(trace, trace['ops'][int(op)])}"
-    return leaf
-
-
 Measured = dict[str, Json]
 """Viewer path -> its measured entity (``measure.measure``'s ``entities``)."""
-Adjacent = Callable[[str], list[int] | None]
-"""The faces an edge or vertex bounds (``measure.adjacent_faces``)."""
-
-
-def _pick_lines(trace: Json, path: str, measured: Measured, adjacent: Adjacent) -> list[str]:
-    match = _PICK.fullmatch(path)
-    if match is None:
-        return [f"{path}: not a face, an edge or a vertex"]
-    leaf, topo, index = match["leaf"], match["topo"], int(match["index"])
-    geometry = entity_text(measured.get(path))
-    lines = [f"{_TOPO[topo]} {_LETTER[topo]}{index} of {_scene_owner(trace, leaf)}: {geometry}", f"  path {path}"]
-    if leaf != trace["scene"]["part"] or not trace["scene"]["face_ids"]:
-        return lines
-    if topo == "faces":
-        op = _op_of_face(trace, index)
-        lines.append(f"  made by {op_line(trace, op)}" if op else "  made by no traced operation")
-    else:
-        faces = adjacent(path)
-        if faces is not None:
-            lines.append(f"  bounds {len(faces)} face(s):")
-            for face in faces:
-                op = _op_of_face(trace, face)
-                lines.append(f"    f{face} ← {op_line(trace, op) if op else 'no traced operation'}")
-    return lines
-
-
-def part_selection(
-    trace: Json, selected: str | None, picks: list[str], measured: Measured, results: list[Json], adjacent: Adjacent
-) -> str:
-    """What is selected in a part: the feature tree's node, and the faces, edges and vertices picked to measure."""
-    sections = []
-    if selected is not None:
-        sections.append("Selected feature:\n" + indent(describe(trace, selected)))
-    if picks:
-        lines = [line for path in picks for line in _pick_lines(trace, path, measured, adjacent)]
-        if results:
-            lines.append(results_text(results))
-        sections.append(f"Faces, edges and vertices ({len(picks)}):\n" + indent("\n".join(lines)))
-    if not sections:
-        return "No feature, face, edge or vertex is selected: the whole part."
-    return "\n\n".join(sections)
 
 
 def indent(text: str) -> str:
     return "\n".join(f"  {line}" if line else line for line in text.splitlines())
 
 
-def _shape_chain(root: Json, node_id: str) -> list[Json] | None:
+def shape_chain(root: Json, node_id: str) -> list[Json] | None:
     """The shape tree's nodes from the root down to ``node_id``."""
     if root["id"] == node_id:
         return [root]
     for child in root.get("parts", []):
-        chain = _shape_chain(child, node_id)
+        chain = shape_chain(child, node_id)
         if chain is not None:
             return [root, *chain]
     return None
 
 
-def _leaves(node: Json) -> list[Json]:
-    return [node] if "parts" not in node else [leaf for child in node["parts"] for leaf in _leaves(child)]
+def leaves(node: Json) -> list[Json]:
+    return [node] if "parts" not in node else [leaf for child in node["parts"] for leaf in leaves(child)]
 
 
-def _instance_lines(built: Json, node_id: str, parts: set[str]) -> list[str]:
-    root = built["scene"]["data"]["shapes"]
-    chain = _shape_chain(root, node_id)
+def owning_part(built: Json, path: str, parts: set[str]) -> str | None:
+    """Resolve only explicit instance ownership or a unique known part in its ancestor chain."""
+    chain = shape_chain(built["scene"]["data"]["shapes"], path)
     if chain is None:
-        return [f"{node_id}: not in this build"]
-    node = chain[-1]
-    names = " / ".join(item["name"] for item in chain)
-    kind = "instance" if "parts" not in node else f"group of {len(_leaves(node))} instances"
-    lines = [f"{kind} {names}", f"  id {node_id}"]
-    # The server matched the assembly's instances to the parts; a file's parts are named after theirs.
-    part = built["scene"].get("part_of", {}).get(node_id)
-    known = [part] if part else [item["name"] for item in chain if item["name"] in parts]
-    if known:
-        lines.append(f"  an instance of part {known[-1]!r}: show(part={known[-1]!r}) opens its feature tree")
-    return lines
+        return None
+    explicit = built["scene"].get("part_of", {}).get(path)
+    if explicit:
+        return explicit
+    known = {node["name"] for node in chain if node["name"] in parts}
+    return next(iter(known)) if len(known) == 1 else None
 
 
-def composite_selection(
-    built: Json,
-    instance: str | None,
-    picks: list[str],
-    hidden: list[str],
-    measured: Measured,
-    results: list[Json],
-    parts: set[str],
-) -> str:
-    """What is selected in the assembly, or in a file's parts viewed together (untraced: instances only)."""
-    sections = []
-    if instance is not None:
-        sections.append("Selected:\n" + indent("\n".join(_instance_lines(built, instance, parts))))
-    if picks:
-        lines = []
-        for path in picks:
-            match = _PICK.fullmatch(path)
-            if match is None:
-                lines.append(f"{path}: not a face, an edge or a vertex")
-                continue
-            topo, index = match["topo"], match["index"]
-            lines.append(f"{_TOPO[topo]} {_LETTER[topo]}{index}: {entity_text(measured.get(path))}")
-            lines += [f"  {line}" for line in _instance_lines(built, match["leaf"], parts)]
-        if results:
-            lines.append(results_text(results))
-        sections.append(f"Faces, edges and vertices ({len(picks)}):\n" + indent("\n".join(lines)))
-    if hidden:
-        sections.append(f"Hidden instances: {len(hidden)}")
-    if not sections:
-        return "No instance, face, edge or vertex is selected: all of it."
-    return "\n\n".join(sections)
+def pick_path(path: str) -> tuple[str, str, int] | None:
+    """The viewer leaf, topology list and index of an entity path."""
+    match = _PICK.fullmatch(path)
+    return (match["leaf"], match["topo"], int(match["index"])) if match else None
 
 
 def composite_summary(built: Json) -> str:
-    leaves = _leaves(built["scene"]["data"]["shapes"])
-    return f"{len(leaves)} instances, built in {built['build_seconds']:.2f} s"
-
-
-def _picks_label(picks: list[str]) -> list[str]:
-    labels = []
-    for path in picks:
-        match = _PICK.fullmatch(path)
-        labels.append(f"{_TOPO[match['topo']]} {_LETTER[match['topo']]}{match['index']}" if match else path)
-    return labels
-
-
-def part_label(trace: Json, selected: str | None, picks: list[str]) -> str:
-    """A short name for what is selected in a part: "#7 CrossPrism, face f12"."""
-    items = []
-    node = find_node(trace, selected) if selected is not None else None
-    match node:
-        case {"type": "op", "op": op}:
-            items.append(f"#{op} {trace['ops'][op]['kind']}")
-        case {"type": "builder", "builder": builder}:
-            items.append(_builder_title(trace["builders"][builder]))
-        case {"label": label}:
-            items.append(f"{label}()")
-    return ", ".join([*items, *_picks_label(picks)]) or "the whole part"
-
-
-def composite_label(built: Json, instance: str | None, picks: list[str]) -> str:
-    """A short name for what is selected in an assembly or a file's parts: the instance, the picks."""
-    chain = _shape_chain(built["scene"]["data"]["shapes"], instance) if instance is not None else None
-    items = [chain[-1]["name"]] if chain else []
-    return ", ".join([*items, *_picks_label(picks)]) or "all of it"
+    members = leaves(built["scene"]["data"]["shapes"])
+    return f"{len(members)} instances, built in {built['build_seconds']:.2f} s"
 
 
 def instance_tree(built: Json, depth: int = 3) -> str:
@@ -404,7 +293,7 @@ def instance_tree(built: Json, depth: int = 3) -> str:
 
     def walk(node: Json, level: int) -> None:
         children = node.get("parts")
-        count = f" ({len(_leaves(node))} instances)" if children is not None else ""
+        count = f" ({len(leaves(node))} instances)" if children is not None else ""
         lines.append(f"{'  ' * level}{node['name']}{count}  [{node['id']}]")
         if children is not None and level < depth:
             for child in children:

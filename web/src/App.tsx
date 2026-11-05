@@ -41,7 +41,8 @@ import {
   type TreeIndex,
 } from "./model";
 import { usePersistentFlag, usePersistentNumber } from "./persist";
-import type { AssemblyData, HubCalls, HubRequest, Project, SceneData, ShapeNode, TabState, TraceData } from "./types";
+import { updateSelection, type SelectionMode } from "./selection";
+import type { AssemblyData, HubCalls, HubRequest, Project, SceneData, SelectionItem, ShapeNode, TabState, TraceData } from "./types";
 
 const NO_NODES: ReadonlySet<string> = new Set();
 
@@ -161,6 +162,26 @@ function relatedTo(trace: TraceData, index: TreeIndex, selected: string | null):
 function countLeaves(node: ShapeNode): number {
   return node.parts === undefined ? 1 : node.parts.reduce((sum, part) => sum + countLeaves(part), 0);
 }
+/** Owning parts of composite selections; file-scene leaf names identify their parts directly. */
+function assemblySelectionParts(data: AssemblyData, selection: SelectionItem[], fileNames = false): string[] {
+  const root = data.scene.data.shapes;
+  const partOf = { ...(data.scene.part_of ?? {}) };
+  if (fileNames) for (const leaf of shapeLeaves(root)) partOf[leaf.id] ??= leaf.name;
+  const leaves = selection.length === 0 ? shapeLeaves(root).map((leaf) => leaf.id) : selection.flatMap((item) => {
+    if (item.kind === "entity") {
+      const leaf = leafOfPick(root, item.path);
+      return leaf === null ? [] : [leaf];
+    }
+    if (item.kind !== "instance") return [];
+    const node = findShape(root, item.path);
+    return node === undefined ? [] : shapeLeaves(node).map((leaf) => leaf.id);
+  });
+  return [...new Set([
+    ...selection.flatMap((item) => item.kind === "feature" ? [item.part] : []),
+    ...leaves.flatMap((leaf) => partOf[leaf] === undefined ? [] : [partOf[leaf]]),
+  ])];
+}
+
 
 export function App() {
   const [project, setProject] = useState<Project | null>(null);
@@ -170,6 +191,7 @@ export function App() {
   const [assemblies, setAssemblies] = useState<Record<string, Load<AssemblyData>>>({});
   const [files, setFiles] = useState<Record<string, Load<AssemblyData>>>({});
   const [selected, setSelected] = useState<string | null>(null);
+  const [selection, setSelection] = useState<SelectionItem[]>([]);
   // Fold state of each part's feature tree (a file shows several), by part name.
   const [collapsedBy, setCollapsedBy] = useState<Record<string, ReadonlySet<string>>>({});
   // In a file's view, the part whose feature is selected.
@@ -204,6 +226,7 @@ export function App() {
 
   // Targets asked for once already: selecting one again shows what it has; Rebuild asks again.
   const requested = useRef(new Set<string>());
+  const traceLoads = useRef(new Map<string, Promise<Loaded>>());
   const load = useCallback((what: Target, mode: BuildMode = "cached"): Promise<Loaded> => {
     requested.current.add(keyOf(what));
     if (what.kind === "assembly") {
@@ -217,16 +240,30 @@ export function App() {
       return settle(fetchFile(path, mode), (load) => setFiles((all) => ({ ...all, [path]: load })));
     }
     const name = what.name;
+    const pending = traceLoads.current.get(name);
+    if (pending !== undefined && mode === "cached") return pending;
     setTraces((all) => ({ ...all, [name]: { status: "loading" } }));
-    return settle(fetchTrace(name, mode), (load) => setTraces((all) => ({ ...all, [name]: load })));
+    const loading = settle(fetchTrace(name, mode), (load) => setTraces((all) => ({ ...all, [name]: load })));
+    traceLoads.current.set(name, loading);
+    void loading.finally(() => {
+      if (traceLoads.current.get(name) === loading) traceLoads.current.delete(name);
+    });
+    return loading;
   }, []);
   const view = useRef<CadViewHandle>(null);
-  const [picks, setPicks] = useState<string[]>([]);
+  const clearSelection = useCallback(() => {
+    setSelection([]);
+    setSelected(null);
+    setFocusPart(null);
+    setInstance(null);
+    setLitPart(null);
+  }, []);
 
   useEffect(() => {
     if (target === null || (target.kind === "assembly" && target.name === "")) return;
     window.history.replaceState(null, "", hashOf(target));
     setSelected(null);
+    setSelection([]);
     setCollapsedBy({});
     setFocusPart(null);
     setHover(null);
@@ -256,6 +293,14 @@ export function App() {
   const assemblyData = compositeLoad?.status === "ok" ? compositeLoad.data : null;
   const cached = state?.status === "ok" && state.cached;
   const shapes = state?.status === "ok" ? state.shapes : null;
+  const assemblyParts = useMemo(
+    () => target?.kind === "assembly" && assemblyData !== null && selection.length > 0
+      ? assemblySelectionParts(assemblyData, selection) : [],
+    [target, assemblyData, selection],
+  );
+  useEffect(() => {
+    for (const name of assemblyParts) if (!requested.current.has(name)) void load({ kind: "part", name });
+  }, [assemblyParts, load]);
   const index = trace === null ? null : treeIndex(trace);
   const collapsed = (activePart !== null && collapsedBy[activePart]) || NO_NODES;
   const related = useMemo(
@@ -263,22 +308,58 @@ export function App() {
     [trace, index, selected],
   );
   const focus = useMemo(() => {
-    if (target?.kind === "part") return trace !== null && index !== null ? sceneFocus(trace, index, selected) : null;
+    if (target?.kind === "part" && trace !== null && index !== null) {
+      const features = selection.filter((item): item is Extract<SelectionItem, { kind: "feature" }> => item.kind === "feature" && item.part === target.name);
+      const base = sceneFocus(trace, index, null);
+      const focuses = features.map((item) => sceneFocus(trace, index, item.node));
+      if (selection.length === 1 && focuses.length === 1) return focuses[0];
+      const states = { ...base.states };
+      for (const own of focuses) {
+        for (const [path, state] of Object.entries(own.states)) {
+          const previous = states[path] ?? [0, 0];
+          states[path] = [previous[0] > state[0] ? previous[0] : state[0], previous[1] > state[1] ? previous[1] : state[1]];
+        }
+      }
+      const entities = selection.flatMap((item) => item.kind === "entity" ? [item.path] : []);
+      // Entity picks retain their exact path; maker focus is only for the Details panel.
+      for (const path of entities) {
+        const maker = nodeForPick(trace, path);
+        if (maker === null) continue;
+        const own = sceneFocus(trace, index, maker);
+        for (const [leaf, state] of Object.entries(own.states)) {
+          const previous = states[leaf] ?? [0, 0];
+          states[leaf] = [previous[0] > state[0] ? previous[0] : state[0], previous[1] > state[1] ? previous[1] : state[1]];
+        }
+      }
+      return {
+        states,
+        lit: [...new Set([...focuses.flatMap((own) => own.lit), ...entities])],
+        ghost: focuses.some((own) => own.ghost),
+        view: focuses.at(-1)?.view ?? null,
+      };
+    }
     if (assemblyData === null) return null;
     const root = assemblyData.scene.data.shapes;
-    if (target?.kind === "file") {
-      const inFile = focusPart === null ? null : partInFile(assemblyData.scene.data, traces, focusPart);
-      return fileFocus(root, hiddenInstances, inFile && selected !== null ? { ...inFile, selected } : null);
-    }
-    const partInstances = Object.entries(assemblyData.scene.part_of ?? {}).filter(([, part]) => part === litPart);
-    return assemblyFocus(root, hiddenInstances, instance, litPart === null ? [] : partInstances.map(([leaf]) => leaf));
-  }, [target, trace, index, selected, assemblyData, focusPart, traces, hiddenInstances, instance, litPart]);
+    const base = assemblyFocus(root, hiddenInstances, null);
+    const lit = selection.flatMap((item) => {
+      if (item.kind === "entity") return [item.path];
+      if (item.kind === "instance") {
+        const node = findShape(root, item.path);
+        return node === undefined ? [] : shapeLeaves(node).map((leaf) => leaf.id);
+      }
+      const inFile = target?.kind === "file" ? partInFile(assemblyData.scene.data, traces, item.part) : null;
+      return inFile === null ? [] : fileFocus(root, hiddenInstances, { ...inFile, selected: item.node }).lit;
+    });
+    return { ...base, lit: [...new Set(lit)] };
+  }, [target, trace, index, selection, assemblyData, traces, hiddenInstances]);
 
   /** Select a feature of a part (in a file's view, any of its parts), opening the folds above it. */
   const selectIn = useCallback(
-    (part: string | null, id: string | null) => {
+    (part: string | null, id: string | null, mode: SelectionMode = "replace", range?: string[]) => {
       setFocusPart(part);
       setSelected(id);
+      const items: SelectionItem[] = part === null || id === null ? [] : (range ?? [id]).map((node) => ({ kind: "feature", part, node }));
+      setSelection((current) => updateSelection(current, items, mode));
       const load = part === null ? undefined : traces[part];
       if (part === null || id === null || load?.status !== "ok") return;
       const hidden = ancestors(treeIndex(load.data), id);
@@ -292,7 +373,7 @@ export function App() {
     },
     [traces],
   );
-  const select = useCallback((id: string | null) => selectIn(activePart, id), [selectIn, activePart]);
+  const select = useCallback((id: string | null, mode?: SelectionMode, range?: string[]) => selectIn(activePart, id, mode, range), [selectIn, activePart]);
 
   /** In a file's view: the part a picked path is in, its trace, and the path as the part's own scene has it. */
   const pickInFile = useCallback(
@@ -308,19 +389,20 @@ export function App() {
   );
 
   const onPick = useCallback(
-    (path: string) => {
+    (path: string, mode: SelectionMode = "replace") => {
+      setSelection((current) => updateSelection(current, [{ kind: "entity", path }], mode));
       if (target?.kind === "part") {
-        if (trace !== null) select(nodeForPick(trace, path));
+        setFocusPart(target.name);
+        setSelected(trace === null ? null : nodeForPick(trace, path));
         return;
       }
       const inFile = pickInFile(path);
-      if (inFile !== null) selectIn(inFile.part, nodeForPick(inFile.trace, inFile.path));
-      else if (assemblyData !== null) {
-        setInstance(leafOfPick(assemblyData.scene.data.shapes, path));
-        setLitPart(null);
-      }
+      setFocusPart(inFile?.part ?? null);
+      setSelected(inFile === null ? null : nodeForPick(inFile.trace, inFile.path));
+      setInstance(assemblyData === null ? null : leafOfPick(assemblyData.scene.data.shapes, path));
+      setLitPart(null);
     },
-    [target, trace, assemblyData, select, selectIn, pickInFile],
+    [target, trace, assemblyData, pickInFile],
   );
 
   const describeHover = useCallback(
@@ -399,8 +481,8 @@ export function App() {
   );
 
   // The hub's calls read these: this render's, still current once a call has waited for a load or a render.
-  const live = useRef({ target, index, assemblyData, selectIn, project });
-  live.current = { target, index, assemblyData, selectIn, project };
+  const live = useRef({ target, index, assemblyData, selectIn, onPick, project, traces, selection });
+  live.current = { target, index, assemblyData, selectIn, onPick, project, traces, selection };
 
   const handleHub = useCallback(
     async (request: HubRequest): Promise<unknown> => {
@@ -409,25 +491,33 @@ export function App() {
         return view.current;
       };
       /** Sets the selection a `select` call (or `open`) asks for, once all of it is known to exist. */
-      const applySelect = ({ node, instance: chosen, picks: paths }: HubCalls["select"]["params"]) => {
-        const { target: current, index: tree, assemblyData: composite, selectIn: choose } = live.current;
-        if (node !== undefined && node !== null) {
-          if (current?.kind !== "part") throw new Error("Only a part's view has tree nodes to select");
-          if (!tree?.nodes.has(node)) throw new Error(`Unknown tree node: ${node}`);
+      const applySelect = ({ items }: HubCalls["select"]["params"]) => {
+        const { target: current, assemblyData: composite, traces: loadedTraces } = live.current;
+        if (!Array.isArray(items)) throw new Error("Selection items must be an array");
+        for (const item of items) {
+          if (item.kind === "feature") {
+            const allowed = current?.kind === "part" ? current.name === item.part
+              : current?.kind === "file" && folderParts(live.current.project, current.path).includes(item.part);
+            const load = loadedTraces[item.part];
+            if (!allowed || load?.status !== "ok" || !treeIndex(load.data).nodes.has(item.node)) {
+              throw new Error(`Unknown feature: ${item.part} / ${item.node}`);
+            }
+          } else if (item.kind === "instance") {
+            if (composite === null || findShape(composite.scene.data.shapes, item.path) === undefined) {
+              throw new Error(`Unknown instance: ${item.path}`);
+            }
+          } else if (item.kind === "entity") {
+            const unknown = viewer().unknownPaths([item.path]);
+            if (unknown.length > 0) throw new Error(`Unknown viewer paths: ${unknown.join(", ")}`);
+          } else throw new Error("Unknown selection kind");
         }
-        if (chosen !== undefined && chosen !== null) {
-          if (composite === null) throw new Error("Only the assembly's or a file's view has instances to select");
-          if (findShape(composite.scene.data.shapes, chosen) === undefined) throw new Error(`Unknown instance: ${chosen}`);
-        }
-        if (paths !== undefined) {
-          const unknown = viewer().setPicks(paths);
-          if (unknown.length > 0) throw new Error(`Unknown viewer paths: ${unknown.join(", ")}`);
-        }
-        if (node !== undefined && current?.kind === "part") choose(current.name, node);
-        if (chosen !== undefined) {
-          setInstance(chosen);
-          setLitPart(null);
-        }
+        const next = updateSelection([], items, "replace");
+        clearSelection();
+        const last = next.at(-1);
+        if (last?.kind === "feature") live.current.selectIn(last.part, last.node);
+        else if (last?.kind === "instance") setInstance(last.path);
+        else if (last?.kind === "entity") live.current.onPick(last.path);
+        setSelection(next);
       };
 
       switch (request.method) {
@@ -453,17 +543,26 @@ export function App() {
           }
           await viewer().rendered(loaded.scene);
           if (chosen !== undefined && chosen !== null) {
-            applySelect(next.kind === "part" ? { node: chosen } : { instance: chosen });
+            applySelect({ items: [next.kind === "part" ? { kind: "feature", part: next.name, node: chosen } : { kind: "instance", path: chosen }] });
           }
           await afterCommit();
           return { status: "ok" } satisfies HubCalls["open"]["result"];
         }
-        case "select":
+        case "select": {
           applySelect(request.params as HubCalls["select"]["params"]);
           await afterCommit();
-          // The view reports its picks from an effect of that commit: they reach this state one commit later.
-          await afterCommit();
-          return {};
+          const current = live.current;
+          if (current.target?.kind === "assembly" && current.assemblyData !== null) {
+            const parts = assemblySelectionParts(current.assemblyData, current.selection);
+            await Promise.all(parts.flatMap((part) => {
+              const pending = traceLoads.current.get(part);
+              if (pending !== undefined) return [pending];
+              return current.traces[part] === undefined ? [load({ kind: "part", name: part })] : [];
+            }));
+            await afterCommit();
+          }
+          return { selection: live.current.selection };
+        }
         case "highlight": {
           const { paths } = request.params as HubCalls["highlight"]["params"];
           const unknown = viewer().highlight(paths);
@@ -498,7 +597,7 @@ export function App() {
           throw new Error(`Unknown method: ${request.method}`);
       }
     },
-    [load, afterCommit, setVisibility],
+    [load, afterCommit, setVisibility, clearSelection],
   );
 
   const tabState: TabState = {
@@ -506,14 +605,14 @@ export function App() {
     status: state?.status ?? "none",
     error: state?.status === "error" ? state.error : null,
     shapes,
-    selected,
-    picks,
-    instance,
+    selection,
+    partShapes: Object.fromEntries(Object.entries(traces).flatMap(([part, load]) =>
+      load.status === "ok" && load.shapes !== null ? [[part, load.shapes]] : [])),
     hidden: [...hiddenInstances],
   };
   const hub = useHub(tabState, handleHub);
 
-  // ---- references: what the pointer is on (else the selection), copied for a coding agent ----
+  // ---- standalone snapshots: explicit selection first; pointed context only when it is empty ----
 
   const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
   useEffect(() => {
@@ -532,32 +631,60 @@ export function App() {
     return () => document.removeEventListener("pointerover", onOver);
   }, []);
 
-  /** The state a reference is made of: a hovered feature row, face, edge, vertex, object or instance, else the tab's. */
+  /** Pointed context is a convenience only when there is no explicit selection to export. */
   const referred = (): TabState => {
+    if (selection.length > 0) return tabState;
     const under = pointed.current;
-    const only = { selected: null, picks: [], instance: null };
     const row = under?.closest<HTMLElement>(".sidebar .tree [data-id]");
-    if (target?.kind === "part" && row?.dataset.id !== undefined) return { ...tabState, ...only, selected: row.dataset.id };
-    const path = under?.closest(".cad-view") ? view.current?.hovered() : null;
-    if (path) {
-      if (/\/(faces|edges|vertices)\/\1_\d+$/.test(path)) return { ...tabState, ...only, picks: [path] };
-      if (target?.kind === "part" && trace !== null) return { ...tabState, ...only, selected: nodeForPick(trace, path) };
-      if (assemblyData !== null) {
-        return { ...tabState, ...only, instance: leafOfPick(assemblyData.scene.data.shapes, path) };
-      }
+    const part = row?.closest<HTMLElement>("[data-part]")?.dataset.part;
+    if (part !== undefined && row?.dataset.id !== undefined) {
+      return { ...tabState, selection: [{ kind: "feature", part, node: row.dataset.id }] };
     }
-    if (hover !== null && target?.kind !== "part") return { ...tabState, ...only, instance: hover };
+    if (row?.dataset.id !== undefined && under?.closest(".assembly-tree")) {
+      return { ...tabState, selection: [{ kind: "instance", path: row.dataset.id }] };
+    }
+    const assemblyPart = under?.closest<HTMLElement>(".assembly-part[data-part]")?.dataset.part;
+    if (assemblyPart !== undefined && assemblyData !== null) {
+      return { ...tabState, selection: Object.entries(assemblyData.scene.part_of ?? {}).flatMap(([path, part]) =>
+        part === assemblyPart ? [{ kind: "instance" as const, path }] : []) };
+    }
+    const path = under?.closest(".cad-view") ? view.current?.hovered() : null;
+    if (path) return { ...tabState, selection: [{ kind: "entity", path }] };
+    if (hover !== null && target?.kind !== "part") return { ...tabState, selection: [{ kind: "instance", path: hover }] };
     return tabState;
   };
 
   const copyReference = async (state: TabState) => {
     try {
-      const { ref, label } = await createReference(hub.tab, state);
-      const text = `${ref} (${label})`;
+      if ((state.target?.kind === "assembly" || state.target?.kind === "file") && assemblyData !== null) {
+        const parts = assemblySelectionParts(assemblyData, state.selection, state.target.kind === "file");
+        const pending = parts.flatMap((part) => {
+          const loading = traceLoads.current.get(part);
+          if (loading !== undefined) return [loading];
+          return live.current.traces[part] === undefined ? [load({ kind: "part", name: part })] : [];
+        });
+        if (pending.length > 0 || parts.some((part) => live.current.traces[part]?.status === "loading")) {
+          setNotice({ text: "Loading selected parts’ feature context…", failed: false });
+          await Promise.all(pending);
+          await afterCommit();
+        }
+        const partShapes = { ...state.partShapes };
+        for (const part of parts) {
+          const loaded = live.current.traces[part];
+          if (loaded?.status !== "ok" || loaded.shapes === null) {
+            const reason = loaded?.status === "error" ? loaded.error : "trace build is unavailable";
+            throw new Error(`Feature context for ${part} could not be loaded: ${reason}`);
+          }
+          partShapes[part] = loaded.shapes;
+        }
+        state = { ...state, partShapes };
+      }
+      const { text } = await createReference(hub.tab, state);
       await copyText(text);
-      setNotice({ text: `Copied ${text}`, failed: false });
+      const label = state.selection.length === 0 ? "entire target" : `${state.selection.length} selected item(s)`;
+      setNotice({ text: `Copied snapshot: ${label}`, failed: false });
     } catch (error) {
-      setNotice({ text: `Could not copy a reference: ${error instanceof Error ? error.message : String(error)}`, failed: true });
+      setNotice({ text: `Could not copy snapshot: ${error instanceof Error ? error.message : String(error)}`, failed: true });
     }
   };
   // The key handler reads this render's state through a ref: it is attached once.
@@ -567,16 +694,22 @@ export function App() {
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "c" || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
+      if (event.repeat) return;
       const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable]");
       if (typing) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        clearSelection();
+        return;
+      }
+      if (event.key.toLowerCase() !== "c" || event.ctrlKey || event.metaKey || event.altKey) return;
       event.preventDefault();
       copyPointed.current();
     };
     // Captured: three-cad-viewer handles keys in its view.
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, []);
+  }, [clearSelection]);
 
   if (projectError !== null) {
     return <div className="fatal">Cannot reach the cadiste server: {projectError}</div>;
@@ -608,6 +741,12 @@ export function App() {
         <span className="brand">cadiste</span>
         {project && <span className="project">{project.root}</span>}
         <span className="spacer" />
+        <span className="selection-count" role="status" aria-live="polite" data-selection-count={selection.length}>
+          {selection.length === 0 ? "Entire target" : `${selection.length} selected`}
+        </span>
+        <button className="clear-selection" disabled={selection.length === 0} onClick={clearSelection} title="Clear selection (Escape)">
+          Clear selection
+        </button>
         {trace && (
           <>
             <button onClick={() => setCollapsed(new Set())}>Expand all</button>
@@ -617,9 +756,11 @@ export function App() {
         <LinkedSessions sessions={hub.sessions} tab={hub.tab} onUnlink={hub.unlink} />
         <button
           className="icon-button"
+          aria-label="Copy standalone selection snapshot"
+          data-action="copy-snapshot"
           disabled={target === null || state?.status === "loading"}
           onClick={() => void copyReference(tabState)}
-          title="Copy a reference to the selection for a coding agent (cadiste mcp); C copies what the pointer is on"
+          title="Copy a standalone snapshot of all selected items (no MCP lookup needed). C copies the selection; when empty, C uses pointed context. Ctrl/Cmd-click toggles; Shift-click adds; Escape clears."
         >
           <Icon name="links" />
         </button>
@@ -668,6 +809,8 @@ export function App() {
                   index={index}
                   collapsed={collapsed}
                   selected={selected}
+                  part={target.name}
+                  selectedNodes={new Set(selection.flatMap((item) => item.kind === "feature" && item.part === target.name ? [item.node] : []))}
                   related={related}
                   onSelect={select}
                   onToggle={toggle}
@@ -683,6 +826,7 @@ export function App() {
                   parts={fileParts}
                   traces={traces}
                   selected={focusPart !== null && selected !== null ? { part: focusPart, node: selected } : null}
+                  selection={selection}
                   related={related}
                   collapsed={collapsedBy}
                   visible={(part) => {
@@ -706,16 +850,26 @@ export function App() {
                   parts={project?.parts ?? []}
                   hidden={hiddenInstances}
                   instance={instance}
-                  litPart={litPart}
                   marked={markedPart}
+                  selectedPaths={new Set(selection.flatMap((item) => item.kind === "instance" ? [item.path] : []))}
                   onVisibility={setVisibility}
-                  onSelectInstance={(id) => {
+                  onSelectInstance={(id, mode = "replace", range) => {
                     setInstance(id);
                     setLitPart(null);
+                    setSelection((current) => updateSelection(current, (range ?? [id]).map((path) => ({ kind: "instance", path })), mode));
                   }}
-                  onSelectPart={(part) => {
+                  onSelectPart={(part, mode = "replace", range) => {
                     setLitPart(part);
                     setInstance(null);
+                    const parts = new Set(range ?? [part]);
+                    const items: SelectionItem[] = Object.entries(assemblyData.scene.part_of ?? {})
+                      .flatMap(([path, name]) => parts.has(name) ? [{ kind: "instance", path }] : []);
+                    // A part row is one group action: toggling a partially selected row selects all its instances.
+                    setSelection((current) => {
+                      const removing = mode === "toggle" && items.every((item) => current.some((chosen) => chosen.kind === "instance" && item.kind === "instance" && chosen.path === item.path));
+                      if (removing) return current.filter((chosen) => !items.some((item) => chosen.kind === "instance" && item.kind === "instance" && chosen.path === item.path));
+                      return updateSelection(current, items, mode === "toggle" ? "add" : mode);
+                    });
                   }}
                   onHover={setHover}
                   onOpen={(name) => setTarget({ kind: "part", name })}
@@ -753,7 +907,10 @@ export function App() {
             onPick={onPick}
             describe={describeHover}
             shapes={shapes}
-            onPicks={setPicks}
+            selectionPaths={selection.flatMap((item) => item.kind === "entity" ? [item.path] : [])}
+            onDropPick={(path) => setSelection((current) => current.filter((item) => item.kind !== "entity" || item.path !== path))}
+            onClearPicks={() => setSelection((current) => current.filter((item) => item.kind !== "entity"))}
+            onClearSelection={clearSelection}
           />
           {state?.status === "loading" && (
             <div className="view-overlay">
@@ -802,7 +959,9 @@ export function App() {
         </div>
       )}
       {partView && trace && index ? (
-        <Timeline trace={trace} index={index} selected={selected} onSelect={select} />
+        <Timeline trace={trace} index={index} selected={selected}
+          selectedNodes={new Set(selection.flatMap((item) => item.kind === "feature" && item.part === target.name ? [item.node] : []))}
+          onSelect={select} />
       ) : (
         partView && <footer className="timeline" />
       )}

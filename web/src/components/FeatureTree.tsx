@@ -10,6 +10,7 @@ import {
   type VisibleRow,
   visibleRows,
 } from "../model";
+import { selectionMode, type SelectionMode, type SelectionModifiers } from "../selection";
 import type { TraceData, TreeNode } from "../types";
 import { Icon } from "./Icon";
 import { ModeBadge } from "./ModeBadge";
@@ -19,14 +20,28 @@ interface Props {
   index: TreeIndex;
   collapsed: ReadonlySet<string>;
   selected: string | null;
+  selectedNodes: ReadonlySet<string>;
+  part: string;
   related: ReadonlySet<string>;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, mode?: SelectionMode, range?: string[]) => void;
   onToggle: (id: string, open?: boolean) => void;
 }
 
-export function FeatureTree({ trace, index, collapsed, selected, related, onSelect, onToggle }: Props) {
+export function FeatureTree({ trace, index, collapsed, selected, selectedNodes, part, related, onSelect, onToggle }: Props) {
   const rows = useMemo(() => visibleRows(trace.roots, collapsed), [trace, collapsed]);
   const container = useRef<HTMLDivElement>(null);
+  const anchor = useRef<string | null>(null);
+  const choose = (id: string, event: SelectionModifiers) => {
+    container.current?.focus();
+    const mode = selectionMode(event);
+    const from = rows.findIndex((row) => row.node.id === anchor.current);
+    const to = rows.findIndex((row) => row.node.id === id);
+    const range = event.shiftKey && from >= 0 && to >= 0
+      ? rows.slice(Math.min(from, to), Math.max(from, to) + 1).map((row) => row.node.id)
+      : undefined;
+    onSelect(id, mode, range);
+    if (!event.shiftKey) anchor.current = id;
+  };
 
   useEffect(() => {
     if (selected === null) return;
@@ -34,36 +49,40 @@ export function FeatureTree({ trace, index, collapsed, selected, related, onSele
   }, [selected, rows]);
 
   const onKeyDown = (event: KeyboardEvent) => {
+    if (rows.length === 0 || event.target !== event.currentTarget) return;
     const at = rows.findIndex((row) => row.node.id === selected);
     const node = at >= 0 ? rows[at].node : null;
     const open = node !== null && node.type !== "op" && !collapsed.has(node.id);
     let handled = true;
-    if (event.key === "ArrowDown") onSelect(rows[Math.min(at + 1, rows.length - 1)].node.id);
-    else if (event.key === "ArrowUp") onSelect(rows[Math.max(at - 1, 0)].node.id);
+    if (event.key === "ArrowDown") choose(rows[Math.min(at + 1, rows.length - 1)].node.id, event);
+    else if (event.key === "ArrowUp") choose(rows[Math.max(at - 1, 0)].node.id, event);
+    else if (event.key === "Home") choose(rows[0].node.id, event);
+    else if (event.key === "End") choose(rows.at(-1)!.node.id, event);
     else if (event.key === "ArrowRight" && node !== null && node.type !== "op") {
-      if (open) onSelect(node.children[0]?.id ?? node.id);
+      if (open) choose(node.children[0]?.id ?? node.id, event);
       else onToggle(node.id, true);
     } else if (event.key === "ArrowLeft" && node !== null) {
       if (open) onToggle(node.id, false);
       else {
         const parent = index.parent.get(node.id);
-        if (parent !== undefined) onSelect(parent);
+        if (parent !== undefined) choose(parent, event);
       }
-    } else handled = false;
+    } else if ((event.key === " " || event.key === "Enter") && node !== null) choose(node.id, event);
+    else handled = false;
     if (handled) event.preventDefault();
   };
 
   return (
-    <div className="tree" ref={container} tabIndex={0} onKeyDown={onKeyDown} role="tree">
+    <div className="tree" ref={container} data-part={part} tabIndex={0} onKeyDown={onKeyDown} role="tree" aria-label={`${part} features`} aria-multiselectable="true">
       {rows.map((row) => (
         <Row
           key={row.node.id}
           row={row}
           trace={trace}
           open={!collapsed.has(row.node.id)}
-          selected={row.node.id === selected}
+          selected={selectedNodes.has(row.node.id)}
           related={related.has(row.node.id)}
-          onSelect={onSelect}
+          onSelect={choose}
           onToggle={onToggle}
         />
       ))}
@@ -77,7 +96,7 @@ interface RowProps {
   open: boolean;
   selected: boolean;
   related: boolean;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, event: SelectionModifiers) => void;
   onToggle: (id: string, open?: boolean) => void;
 }
 
@@ -93,7 +112,7 @@ function Row({ row, trace, open, selected, related, onSelect, onToggle }: RowPro
       aria-selected={selected}
       aria-expanded={parent ? open : undefined}
       style={{ paddingLeft: 8 + depth * 16 }}
-      onClick={() => onSelect(node.id)}
+      onClick={(event) => onSelect(node.id, event)}
       onDoubleClick={() => parent && onToggle(node.id)}
     >
       <span

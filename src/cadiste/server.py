@@ -11,7 +11,7 @@ A build also writes its scene's shapes next to its JSON; the response names that
 Agents: ``POST /api/agent/sessions`` opens a session, ``POST /api/agent/<session>/call/<tool>`` runs a tool
 (``cadiste.agent``). Tabs: ``GET /api/events?tab=`` streams their events, ``POST /api/tabs/<tab>/state`` and
 ``.../reply`` answer, ``POST /api/sessions/<session>/link|decline|unlink`` are the user's link decisions
-(``cadiste.hub``), ``POST /api/references`` keeps a reference to what the user points at (``cadiste.references``).
+(``cadiste.hub``), ``POST /api/references`` captures standalone selection Markdown (``cadiste.references``).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from .agent import Agent, ToolError
 from .cache import SHAPES_SUFFIX, TraceCache
 from .hub import Hub
 from .project import FolderStep
-from .references import References
+from .references import SnapshotError
 
 if TYPE_CHECKING:
     from .measure import Shapes
@@ -70,7 +70,7 @@ class Measurer:
 
         file = self.directory / name
         if not re.fullmatch(rf"[\w.-]+{re.escape(SHAPES_SUFFIX)}", name) or not file.is_file():
-            raise _ShapesGoneError
+            raise _ShapesGoneError(f"Shapes {name!r} are unavailable or expired; reload/rebuild the viewer.")
         key = (name, file.stat().st_mtime_ns)
         with self._lock:
             shapes = self._loaded.get(key)
@@ -91,6 +91,24 @@ class Measurer:
         from .measure import adjacent_faces
 
         return self._use(name, lambda shapes: adjacent_faces(shapes, path))
+
+    def corresponds(
+        self,
+        name: str,
+        path: str,
+        trace_name: str,
+        trace_path: str,
+        locations: list[Any],
+        trace_locations: list[Any],
+    ) -> bool:
+        """Verify picked topology and incident faces in the recorded part coordinate frame."""
+        from .measure import corresponding_entity
+
+        source = self._use(name, lambda shapes: shapes)
+        return self._use(
+            trace_name,
+            lambda trace: corresponding_entity(source, path, trace, trace_path, locations, trace_locations),
+        )
 
 
 @dataclass(frozen=True)
@@ -395,8 +413,8 @@ class _Handler(BaseHTTPRequestHandler):
             case ["references"] if isinstance(request, dict) and isinstance(request.get("state"), dict):
                 tab = request.get("tab")
                 try:
-                    made = self.agent.reference(tab if isinstance(tab, str) else None, request["state"])
-                except (ToolError, LookupError) as error:
+                    made = self.agent.snapshot(tab if isinstance(tab, str) else None, request["state"])
+                except (ToolError, LookupError, SnapshotError) as error:
                     self._json({"error": str(error).strip("'\"")}, HTTPStatus.UNPROCESSABLE_ENTITY)
                 else:
                     self._json(made)
@@ -515,7 +533,7 @@ def serve(
             "builds": builds,
             "measurer": measurer,
             "hub": hub,
-            "agent": Agent(hub, builds, measurer, project, Path.cwd(), References(entries.directory / "references")),
+            "agent": Agent(hub, builds, measurer, project, Path.cwd()),
         }
         handler = type("Handler", (_Handler,), attributes)
         # Measuring needs OCP: import it now rather than on the first measurement.

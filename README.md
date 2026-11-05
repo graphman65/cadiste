@@ -56,12 +56,13 @@ builds again. One entry is kept per part.
   - a sketch element (`Polygon`, `Circle`, a `BuildLine`'s `Line`) shows on its sketch;
   - a function group or a nested part builder lights the faces of every operation in it.
 
-  Clicking a face selects the operation that made it; clicking a sketch or an element selects it. Hovering shows a
-  card by the pointer: the operation, sketch or assembly instance under it, then the face, edge or vertex with
-  three-cad-viewer's measurements of its mesh (area, length, radius, centre, ends).
-- **Measure** (the ruler in the toolbar): clicks pick faces, edges and vertices instead of selecting (a picked one
-  again drops it, a click on nothing or Esc drops them all), and a card above the toolbar shows what was measured,
-  exactly, on the B-rep the mesh was made from (millimetres, degrees):
+  Clicking a face, edge or vertex selects that exact entity and shows its creating feature in Details when
+  available; Ctrl/Cmd-click toggles it and Shift-click adds it to the selection. Clicking a sketch or an element
+  focuses its feature. Hovering shows a card by the pointer: the operation, sketch or assembly instance under it,
+  then the face, edge or vertex with three-cad-viewer's mesh measurements (area, length, radius, centre, ends).
+- **Measure** (the ruler in the toolbar): shows exact measurements for the selected faces, edges and vertices.
+  Click replaces, Ctrl/Cmd-click toggles, and Shift-click adds a pick. The panel's Clear drops entity picks;
+  Escape clears the entire selection. Measurements use the B-rep the mesh was made from (millimetres, degrees):
   - one: a face's area, a cylinder's or sphere's diameter and radius, a cone's half-angle, a torus' radii, a plane's
     normal, a cylinder's axis; an edge's length, a circle's or arc's diameter, radius, centre and arc angle, an
     ellipse's radii, a line's direction; a vertex's position;
@@ -151,8 +152,8 @@ shape (the STEP product), `--each` builds one shape per argument and groups them
 
 ## Edit with a coding agent
 
-`cadiste mcp` is an MCP server on stdio that lets a coding agent (Claude Code, omp, Cursor, ...) look up what the
-user points at in the viewer and drive a viewer tab; the agent edits the model's source with its own tools. One `cadiste
+`cadiste mcp` is an MCP server on stdio that lets a coding agent (Claude Code, omp, Cursor, ...) inspect models
+and drive a viewer tab; the agent edits the model's source with its own tools. One `cadiste
 mcp` runs per agent session and forwards every call to the `cadiste serve` of the directory it runs in (found by
 the `serve.json` the server writes in its `--cache-dir`, from the working directory up; `--url` otherwise). It
 needs the `mcp` extra:
@@ -162,17 +163,19 @@ cd ../pipecrawler
 claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
 ```
 
-- **References.** The user points the agent at something by pasting a reference copied in the viewer:
-  `cadiste:ref/1a2b3c4d (Steering Module: #7 CrossPrism)`. **C** copies one to what the pointer is on (a feature
-  row, a face, edge or vertex, an object, an instance), else to the selection; the link button in the top bar
-  copies the selection (the tree's node, the measure tool's picks, an instance; nothing selected: the whole part
-  or assembly). The server resolves it when it is made, from the build the tab shows, and keeps it in
-  `<cache-dir>/references` (the last 500). `get_reference` answers with the feature (arguments, the expression
-  written for each, call stack, source around the call, faces it made), the faces, edges and vertices (exact
-  geometry, the operation that made each face, the faces an edge or vertex bounds and their operations), or the
-  instance (group path, the part it is of), as it was then; it says when the part was built again since.
-- **Linking.** Resolving a reference links a session without a tab to the tab it came from. Otherwise the first
-  call that needs the viewer shows a request in every open tab, with the agent's name and a code (`swift-orca`)
+- **Standalone references.** The copy button writes a self-contained Markdown selection snapshot, headed
+  `# Cadiste selection v1`, that can be pasted directly into a chat. Reading it needs no MCP call, reference
+  lookup, running server, or cache entry. It captures the project root, units, target and build identities,
+  selected features and instances, exact geometry, and available feature arguments, call stacks and source.
+  Folder picks include their owning part and available part provenance. Missing or unverifiable context is
+  reported explicitly rather than guessed. A snapshot describes the captured build, not necessarily current source.
+- **Multiple selection.** Click replaces the selection; Ctrl/Cmd-click toggles an item, and Shift-click adds
+  items (a range in a feature tree). Features, assembly instances, and faces, edges and vertices can be selected
+  together, including across parts in a folder. The toolbar shows the selection count and a clear action;
+  Escape clears it. The copy button and **C** copy the entire selection. With nothing selected, **C** can copy
+  what the pointer is on; the copy button captures the whole target and lists its members.
+- **Linking.** Copying a snapshot does not require or create an agent connection. The first live tool call
+  that needs a viewer shows a request in every open tab, with the agent's name and a code (`swift-orca`)
   the agent also reports; **Link this tab** picks the tab, **Dismiss** fails the call. The link is kept by tab id,
   which survives a reload (a duplicated browser tab takes a new one); the top bar shows the agents linked to the
   tab, each with an unlink button. A call waits up to 60 s for the link. `show(view='assembly')` opens the first
@@ -182,9 +185,11 @@ claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
   arguments: operations are matched by kind, mode and calling function, as line numbers move with edits) and
   screenshots of the tab's 3D view (`iso` by default, any preset direction or `current`). A failed build answers
   with its traceback.
-- **Driving the tab.** `select` (a feature, an instance, or faces/edges/vertices to measure; it answers with the new
-  selection, as `get_reference` would), `highlight`, `set_view`, `set_visibility`, `screenshot`. Also `status`,
-  `list_parts`, `feature_tree`, `describe`, `measure`.
+- **Driving the tab.** `select(items=[...])` replaces the multi-selection (`[]` clears it) and answers with its
+  captured context. Each item is a feature (`{"kind":"feature","part":"...","node":"o7"}`), an instance
+  (`{"kind":"instance","path":"..."}`), or a face/edge/vertex (`{"kind":"entity","path":"..."}`).
+  Also `highlight`, `set_view`, `set_visibility`, `screenshot`, `status`, `list_parts`, `feature_tree`, `describe`,
+  and `measure`.
 
 The workflow is the `cadiste` skill (`src/cadiste/skills/cadiste/SKILL.md`), served as `skill://cadiste/SKILL.md`
 with the MCP Skills extension and summed up in the server's instructions; a harness that loads skills from disk can
@@ -252,8 +257,8 @@ for record in trace.builders:
 | `measure.py` | Those faces, edges and vertices written next to a build's JSON and read back; exact measurements of the ones the viewer picked, and the faces an edge or vertex bounds. |
 | `server.py` | `cadiste serve`: the built frontend, the part list, one `cadiste export` subprocess per trace, one `cadiste mesh` per assembly view, through the cache; one `cadiste save` per CAD export; measurements on the last few builds' shapes, kept loaded; the hub's endpoints. |
 | `hub.py` | Agent sessions and viewer tabs: link requests, each tab's event stream (Server-Sent Events) and state, requests to a tab and their replies. |
-| `agent.py` | What `cadiste mcp`'s tools do, run in the server: from the cached builds and the linked tab's state; references made and resolved. |
-| `references.py` | References to what the user pointed at, resolved when made and kept on disk. |
+| `agent.py` | What `cadiste mcp`'s tools do, run in the server: cached builds, linked-tab state, and self-contained selection snapshots. |
+| `references.py` | Self-contained Markdown selection snapshots, ordered multi-selection validation, build identity checks, and captured geometry/provenance; no lookup store. |
 | `context.py` | The builds' JSON as text for an agent: feature tree, one feature in detail, the selection resolved to source, the comparison of two builds. |
 | `bridge.py` | `cadiste mcp`: the MCP server on stdio forwarding each tool to the server, and the skill. |
 | `cache.py` | Traces and scenes on disk, by part, for one fingerprint of the model's source. |

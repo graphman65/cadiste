@@ -111,15 +111,12 @@ export async function fetchExport(
   return { file: await response.blob(), name };
 }
 
-/**
- * A reference (`cadiste:ref/<id>`) to what `state` selects, kept by the server for a coding agent to look up, and its
- * label ("Steering Module: #7 CrossPrism, face f12"); `tab` is where it was made, which an agent then drives.
- */
-export async function createReference(tab: string | null, state: TabState): Promise<{ ref: string; label: string }> {
+/** Capture a standalone Markdown snapshot, with no server-side reference store or lookup. */
+export async function createReference(tab: string | null, state: TabState): Promise<{ text: string; label: string }> {
   const response = await fetch("/api/references", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tab, state }),
   });
-  return checked<{ ref: string; label: string }>(response);
+  return checked<{ text: string; label: string }>(response);
 }

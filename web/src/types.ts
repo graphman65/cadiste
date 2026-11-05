@@ -166,6 +166,12 @@ export interface SessionInfo {
   requesting: boolean;
 }
 
+/** A captured selection retains exact entity paths and feature provenance across parts. */
+export type SelectionItem =
+  | { kind: "feature"; part: string; node: string }
+  | { kind: "instance"; path: string }
+  | { kind: "entity"; path: string };
+
 /** What a tab shows, pushed to the hub as it changes. */
 export interface TabState {
   target: Target | null;
@@ -173,12 +179,9 @@ export interface TabState {
   error: string | null;
   /** The build's shapes file (`Built.shapes`). */
   shapes: string | null;
-  /** The feature-tree node selected in a part ("o3", "b1", "g2"). */
-  selected: string | null;
-  /** Measure-mode picks: viewer paths of faces, edges, vertices. */
-  picks: string[];
-  /** The instance-tree node selected in the assembly's or a file's view. */
-  instance: string | null;
+  selection: SelectionItem[];
+  /** Loaded part traces, pinned to the build that supplied their feature/source context. */
+  partShapes: Record<string, string>;
   /** Hidden instance leaves. */
   hidden: string[];
 }
@@ -190,8 +193,8 @@ export interface HubCalls {
     params: { target: Target; select?: string | null };
     result: { status: "ok" } | { status: "error"; error: string; log?: string };
   };
-  /** `picks` turns measure mode on with exactly these viewer paths; [] drops them. */
-  select: { params: { node?: string | null; instance?: string | null; picks?: string[] }; result: object };
+  /** Replace the entire explicit selection; [] clears it. */
+  select: { params: { items: SelectionItem[] }; result: object };
   /** Light viewer paths (a component exactly, a leaf all its faces) until the next call or another target. */
   highlight: { params: { paths: string[] }; result: object };
   view: {

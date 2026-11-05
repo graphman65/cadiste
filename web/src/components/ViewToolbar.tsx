@@ -58,7 +58,7 @@ interface Props {
   onChange: (change: Partial<ViewSettings>) => void;
   onView: (direction: ViewDirection) => void;
   onFit: () => void;
-  /** Whether clicks in the view pick what to measure instead of selecting. */
+  /** Whether exact entity selections are also measured. */
   measuring: boolean;
   onMeasure: (measuring: boolean) => void;
   /** Whether the parts are drawn apart, away from the scene's centre. */
@@ -117,7 +117,7 @@ export function ViewToolbar({
         className={measuring ? "icon-button on" : "icon-button"}
         aria-pressed={measuring}
         onClick={() => onMeasure(!measuring)}
-        title="Measure: click faces, edges and vertices for exact distances, diameters, lengths, areas, angles"
+        title="Measure selected faces, edges and vertices. Click replaces; Ctrl/Cmd-click toggles; Shift-click adds. All picks are included in standalone snapshots (C)."
       >
         <Icon name="measure" />
       </button>

@@ -7,7 +7,6 @@ path) are what the other tools take.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import context
 from .hub import Hub, HubError
-from .references import PREFIX, References, parse
+from .references import SelectionItem, Snapshot, SnapshotError, selection_items
 
 if TYPE_CHECKING:
     from .server import Build, Builds, Measurer, Project
@@ -76,19 +75,16 @@ def _target_text(target: dict[str, Any] | None) -> str:
 
 
 class Agent:
-    def __init__(
-        self, hub: Hub, builds: Builds, measurer: Measurer, project: Project, root: Path, references: References
-    ):
+    def __init__(self, hub: Hub, builds: Builds, measurer: Measurer, project: Project, root: Path):
         self.hub = hub
         self.builds = builds
         self.measurer = measurer
         self.project = project
         self.root = root
-        self.references = references
+        self.snapshots = Snapshot(builds, measurer, project, root)
         self.tools: dict[str, Callable[..., Answer]] = {
             "status": self.status,
             "list_parts": self.list_parts,
-            "get_reference": self.get_reference,
             "feature_tree": self.feature_tree,
             "describe": self.describe,
             "measure": self.measure,
@@ -108,7 +104,7 @@ class Agent:
             return function(session, **arguments)
         except TypeError as error:
             raise ToolError(f"{tool}: {error}") from error
-        except (HubError, LookupError) as error:
+        except (HubError, LookupError, SnapshotError) as error:
             raise ToolError(str(error).strip("'\"")) from error
 
     # ---- helpers ----
@@ -164,76 +160,9 @@ class Agent:
             lines.append("folders (show(view=<folder>) views a folder's parts together): " + ", ".join(folders))
         return Answer("\n".join(lines))
 
-    def _selection(self, target: dict[str, Any], state: dict[str, Any]) -> tuple[str, str, str]:
-        """What ``state`` (a tab's, or a reference's) selects in the build of ``target`` the viewer shows: the text
-        for the agent, a short label for the user, and the digest of the build it was resolved on."""
-        build = self.builds.latest(target) or self.builds.get(target, False)
-        name = _target_text(target)
-        if build.body is None:
-            return f"{name}, whose build failed:\n{_failure(build)}", f"{name} (failed build)", ""
-        built = json.loads(build.body)
-        digest = hashlib.sha256(build.body).hexdigest()
-        picks: list[str] = state.get("picks") or []
-        measured, results = self._measured(build.shapes, picks)
-        if target["kind"] == "part":
-            selected = state.get("selected")
-            body = context.part_selection(
-                built, selected, picks, measured, results, lambda path: self._adjacent(build.shapes, path)
-            )
-            text = self._paths(f"{name}: {context.trace_summary(built)}\n\n{body}", built)
-            return text, f"{target['name']}: {context.part_label(built, selected, picks)}", digest
-        instance = state.get("instance")
-        body = context.composite_selection(
-            built, instance, picks, state.get("hidden") or [], measured, results, set(self.project.names)
-        )
-        label = f"{name}: {context.composite_label(built, instance, picks)}"
-        return f"{name}: {context.composite_summary(built)}\n\n{body}", label, digest
-
-    def reference(self, tab: str | None, state: dict[str, Any]) -> dict[str, str]:
-        """Keep what ``state`` selects as a reference the user copies: ``{"ref", "label"}``."""
-        target = state.get("target")
-        if not isinstance(target, dict):
-            raise ToolError("nothing is shown to refer to")
-        text, label, digest = self._selection(target, state)
-        record = {"tab": tab, "target": target, "state": state, "label": label, "text": text, "digest": digest}
-        return {"ref": f"{PREFIX}{self.references.create(record)}", "label": label}
-
-    def get_reference(self, session: str, reference: str) -> Answer:
-        found = parse(reference)
-        record = self.references.get(found) if found is not None else None
-        if record is None:
-            raise ToolError(f"no cadiste reference {reference!r}: the user copies one from the viewer ({PREFIX}<id>)")
-        lines = [f"{PREFIX}{record['id']}, copied {record['created']}: {record['text']}"]
-        latest = self.builds.latest(record["target"])
-        if (
-            latest is not None
-            and latest.body is not None
-            and hashlib.sha256(latest.body).hexdigest() != record["digest"]
-        ):
-            lines.append(
-                "It was built again since: the ids, face numbers and values above are those of the build the user "
-                "saw then. feature_tree and describe give the current ones."
-            )
-        if record["tab"] and self.hub.adopt(session, record["tab"]):
-            lines.append("This session is now linked to the viewer tab the reference was copied from.")
-        return Answer("\n\n".join(lines))
-
-    def _measured(self, shapes: Path | None, picks: list[str]) -> tuple[context.Measured, list[dict[str, Any]]]:
-        if shapes is None or not picks:
-            return {}, []
-        try:
-            measurement = self.measurer.measure(shapes.name, picks)
-        except Exception:  # a pick this build cannot measure: the selection is still worth answering
-            return {}, []
-        return {entity["path"]: entity for entity in measurement["entities"]}, measurement["results"]
-
-    def _adjacent(self, shapes: Path | None, path: str) -> list[int] | None:
-        if shapes is None:
-            return None
-        try:
-            return self.measurer.adjacent(shapes.name, path)
-        except Exception:
-            return None
+    def snapshot(self, tab: str | None, state: dict[str, Any]) -> dict[str, str]:
+        """Capture all selected items as standalone Markdown; never store an opaque reference."""
+        return self.snapshots.create(tab, state)
 
     def _part(self, session: str, part: str | None) -> str:
         """The part named, or the one the linked tab shows."""
@@ -327,22 +256,10 @@ class Agent:
             images += result.get("images", [])
         return images
 
-    def select(
-        self, session: str, node: str | None = None, instance: str | None = None, picks: list[str] | None = None
-    ) -> Answer:
+    def select(self, session: str, items: list[SelectionItem]) -> Answer:
         tab, _ = self._open(session)
-        params: dict[str, Any] = {}
-        if node is not None:
-            params["node"] = node or None
-        if instance is not None:
-            params["instance"] = instance or None
-        if picks is not None:
-            params["picks"] = picks
-        if not params:
-            raise ToolError("give node=, instance= or picks= (an empty string or list clears it)")
-        self.hub.call(tab, "select", params, _TAB_WAIT)
-        state = self.hub.tab_state(tab)
-        return Answer(self._selection(state["target"], state)[0])
+        self.hub.call(tab, "select", {"items": selection_items(items)}, _TAB_WAIT)
+        return Answer(self.snapshot(tab, self.hub.tab_state(tab))["text"])
 
     def highlight(self, session: str, paths: list[str]) -> Answer:
         tab, _ = self._open(session)

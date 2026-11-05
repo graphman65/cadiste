@@ -10,6 +10,7 @@ import {
 import "three-cad-viewer/css";
 
 import type { Focus } from "../model";
+import { selectionMode, type SelectionMode } from "../selection";
 import type { HubCalls, SceneData } from "../types";
 import { type SceneHover, Readout } from "./HoverCard";
 import { MeasureMarks, MeasurePanel, type Picked, measurementOf, useMeasurement } from "./Measure";
@@ -33,8 +34,8 @@ const SCREENSHOT_WIDTH = 1024;
 export interface CadViewHandle {
   /** Resolves once this scene is rendered and focused: at once if it is the one shown. */
   rendered: (data: SceneData) => Promise<void>;
-  /** Measure exactly these faces, edges, vertices (measure mode on); [] drops the picks. Returns the paths unknown. */
-  setPicks: (paths: string[]) => string[];
+  /** Validate entity paths without changing the selection or measurement mode. */
+  unknownPaths: (paths: string[]) => string[];
   /** Light these paths on top of the selection until the next call; returns the paths unknown. */
   highlight: (paths: string[]) => string[];
   view: (params: HubCalls["view"]["params"]) => void;
@@ -63,13 +64,16 @@ interface Props {
   /** A viewer path to hover-highlight (a leaf or a whole group), as when hovering a tree row. */
   hover?: string | null;
   /** A click (not a drag) on something in the scene, with its viewer path. */
-  onPick?: (path: string) => void;
+  onPick?: (path: string, mode: SelectionMode) => void;
   /** What a hovered component belongs to (the feature that made it, the instance), shown above its geometry. */
   describe?: (path: string) => ReactNode;
   /** The build's shapes file, to measure on (`Built.shapes`); null: this build cannot be measured. */
   shapes?: string | null;
-  /** The measure-mode picks, as they change: viewer paths. */
-  onPicks?: (paths: string[]) => void;
+  /** Canonical exact entity picks, shared by selection and the measurement tool. */
+  selectionPaths: string[];
+  onDropPick: (path: string) => void;
+  onClearPicks: () => void;
+  onClearSelection: () => void;
   ref?: Ref<CadViewHandle>;
 }
 
@@ -122,11 +126,10 @@ function displayOptions(width: number, height: number, settings: ViewSettings) {
 
 /**
  * three-cad-viewer (OCP CAD Viewer's renderer) in a div it owns, with the app's own toolbar over it; one viewer,
- * re-rendered as data changes. Its native toolbar and panels stay hidden unless the tools toggle asks for them.
- * In measure mode a click picks a face, edge or vertex to measure (again: drops it) instead of selecting; the section
- * tool's pick takes a click on a flat face before either.
+ * Section-plane picking consumes a click first. Measurement mode keeps its additive picks in the same canonical
+ * selection as tree/scene items, so copying never omits measurements or resets unrelated selected items.
  */
-export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, onPicks, ref }: Props) {
+export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, ref }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const instance = useRef<Instance | null>(null);
   const [rendered, setRendered] = useState(0);
@@ -221,7 +224,6 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     current.viewer.render(shapes, RENDER_OPTIONS, viewerOptions(settingsRef.current));
     current.fit();
     lastView.current = null;
-    setPicked([]); // a new build: its components are numbered anew
     shown.current = data;
     setRendered((count) => count + 1);
   }, [data]);
@@ -248,16 +250,10 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     const group = viewer.rendered.nestedGroup;
     const highlight = group.highlight;
     highlight?.clear();
-    if (highlight && measuring) {
-      // Measuring: what is picked lights up, not the selection's faces.
-      for (const pick of picked) highlight.setSelected(pick.id, true);
-    } else if (highlight && focus.lit.length > 0) {
-      // A lit path is a face (exact) or a whole leaf (its faces).
+    if (highlight) {
       const lit = new Set(focus.lit);
       for (const info of group.registry.entries()) {
-        if (info.topo !== "face") continue;
-        const leaf = info.path.slice(0, info.path.lastIndexOf("/faces/"));
-        if (lit.has(info.path) || lit.has(leaf)) highlight.setSelected(info.id, true);
+        if (lit.has(info.path) || (info.topo === "face" && lit.has(leafOf(info)))) highlight.setSelected(info.id, true);
       }
     }
     if (highlight && extra.length > 0) {
@@ -280,8 +276,17 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     ready.forEach((waiter) => waiter.resolve());
   }, [rendered]);
 
-  const pickedPaths = picked.map((pick) => pick.path).join("\n");
-  useEffect(() => onPicks?.(pickedPaths === "" ? [] : pickedPaths.split("\n")), [pickedPaths, onPicks]);
+  const selectedPathsKey = selectionPaths.join("\n");
+  useEffect(() => {
+    const viewer = instance.current?.viewer;
+    if (viewer === undefined || !viewer.ready) return;
+    const selected = new Set(selectedPathsKey === "" ? [] : selectedPathsKey.split("\n"));
+    const next: Picked[] = [];
+    for (const info of viewer.rendered.nestedGroup.registry.entries()) {
+      if (info.topo !== "solid" && selected.has(info.path)) next.push({ path: info.path, id: info.id, topo: info.topo });
+    }
+    setPicked(next);
+  }, [selectedPathsKey, rendered]);
 
   useImperativeHandle(
     ref,
@@ -298,16 +303,10 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
             if (shown.current === scene) resolve();
             else waiting.current.push({ data: scene, resolve });
           }),
-        setPicks: (paths) => {
-          const found = new Map<string, Picked>();
-          for (const info of registry()) {
-            if (info.topo !== "solid") found.set(info.path, { path: info.path, id: info.id, topo: info.topo });
-          }
-          const unknown = paths.filter((path) => !found.has(path));
-          if (unknown.length > 0) return unknown;
-          if (paths.length > 0) setMeasuring(true);
-          setPicked(paths.flatMap((path) => found.get(path) ?? []));
-          return [];
+        unknownPaths: (paths) => {
+          const known = new Set<string>();
+          for (const info of registry()) known.add(info.path).add(leafOf(info));
+          return paths.filter((path) => !known.has(path));
         },
         highlight: (paths) => {
           const known = new Set<string>();
@@ -379,14 +378,12 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       }
       const hit = viewer.ready ? viewer.idPicker?.pickAt(x, y) : null;
       if (!measuring) {
-        if (hit) onPick?.(hit.info.path);
+        if (hit) onPick?.(hit.info.path, selectionMode(event));
+        else if (!event.ctrlKey && !event.metaKey && !event.shiftKey) onClearSelection();
       } else if (!hit) {
-        setPicked([]); // a click on nothing drops every pick
+        if (!event.ctrlKey && !event.metaKey && !event.shiftKey) onClearPicks();
       } else if (hit.info.topo !== "solid") {
-        const pick = { path: hit.info.path, id: hit.id, topo: hit.info.topo };
-        setPicked((current) =>
-          current.some((p) => p.path === pick.path) ? current.filter((p) => p.path !== pick.path) : [...current, pick],
-        );
+        onPick?.(hit.info.path, selectionMode(event));
       }
     };
     canvas.addEventListener("pointerdown", onDown);
@@ -395,17 +392,8 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       canvas.removeEventListener("pointerdown", onDown);
       canvas.removeEventListener("pointerup", onUp);
     };
-  }, [onPick, measuring, rendered, sectionPicking, pickSectionFace]);
+  }, [onPick, onClearPicks, onClearSelection, measuring, rendered, sectionPicking, pickSectionFace]);
 
-  useEffect(() => {
-    if (!measuring) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPicked([]);
-    };
-    // Captured: three-cad-viewer stops the keys it has shortcuts for (Escape among them) inside its view.
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [measuring]);
 
   const withViewer = (act: (viewer: Viewer) => void) => {
     const viewer = instance.current?.viewer;
@@ -414,7 +402,6 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
 
   const measure = (on: boolean) => {
     setMeasuring(on);
-    if (!on) setPicked([]);
   };
 
   // Measuring and exploding exclude each other: the marks and measurements are where the parts are in the model.
@@ -446,8 +433,8 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
             picked={picked}
             state={measureState}
             available={shapes !== null}
-            onDrop={(path) => setPicked((current) => current.filter((p) => p.path !== path))}
-            onClear={() => setPicked([])}
+            onDrop={onDropPick}
+            onClear={onClearPicks}
           />
         </>
       )}

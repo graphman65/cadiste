@@ -1,7 +1,8 @@
 import type { Load } from "../App";
 import { usePersistentSet } from "../persist";
 import { treeIndex } from "../model";
-import type { TraceData } from "../types";
+import type { SelectionMode } from "../selection";
+import type { SelectionItem, TraceData } from "../types";
 import { FeatureTree } from "./FeatureTree";
 import { Icon } from "./Icon";
 
@@ -11,11 +12,12 @@ interface Props {
   traces: Record<string, Load<TraceData>>;
   /** The part whose feature is selected, and the feature. */
   selected: { part: string; node: string } | null;
+  selection: SelectionItem[];
   related: ReadonlySet<string>;
   collapsed: Record<string, ReadonlySet<string>>;
   /** Whether each part shows in the 3D view. */
   visible: (part: string) => boolean;
-  onSelect: (part: string, node: string) => void;
+  onSelect: (part: string, node: string, mode?: SelectionMode, range?: string[]) => void;
   onToggle: (part: string, node: string, open?: boolean) => void;
   onVisibility: (part: string, visible: boolean) => void;
   /** The part under the pointer, to highlight in the view (null: none). */
@@ -27,7 +29,7 @@ const NO_NODES: ReadonlySet<string> = new Set();
 
 /** Every part of a file with its features, a group per part: a feature selected here is lit among the others. */
 export function FileFeatures(props: Props) {
-  const { parts, traces, selected, related, collapsed, visible, onSelect, onToggle, onVisibility, onHover, onOpen } = props;
+  const { parts, traces, selected, selection, related, collapsed, visible, onSelect, onToggle, onVisibility, onHover, onOpen } = props;
   const [closed, toggleClosed] = usePersistentSet("cadiste.closed-file-parts");
   return (
     <div className="file-features">
@@ -68,8 +70,10 @@ export function FileFeatures(props: Props) {
                 index={treeIndex(trace)}
                 collapsed={collapsed[part] ?? NO_NODES}
                 selected={selected?.part === part ? selected.node : null}
+                part={part}
+                selectedNodes={new Set(selection.flatMap((item) => item.kind === "feature" && item.part === part ? [item.node] : []))}
                 related={selected?.part === part ? related : NO_NODES}
-                onSelect={(node) => onSelect(part, node)}
+                onSelect={(node, mode, range) => onSelect(part, node, mode, range)}
                 onToggle={(node, nodeOpen) => onToggle(part, node, nodeOpen)}
               />
             )}

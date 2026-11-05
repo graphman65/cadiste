@@ -110,7 +110,7 @@ export type CameraView = "front" | "top" | "right";
 export interface Focus {
   /** Visibility, `[faces, edges]`, of the scene's leaves (the ones not named keep theirs). */
   states: Record<string, VisibilityState>;
-  /** Viewer paths whose faces to highlight: `<part>/faces/faces_<i>` for one face, a leaf path for all of it. */
+  /** Exact component paths or whole leaves to highlight. */
   lit: string[];
   /** Draw everything see-through, so a sketch inside the part shows. */
   ghost: boolean;
@@ -186,7 +186,8 @@ export function sceneFocus(trace: TraceData, index: TreeIndex, selected: string 
   for (const path of [...Object.values(scene.sketches).map((s) => s.path), ...Object.values(scene.elements)]) {
     states[path] = shown.has(path) ? [1, 1] : [0, 0];
   }
-  const lit = scene.face_ids ? faces.map((face) => `${scene.part}/faces/faces_${face}`) : [];
+  const lit = [...(scene.face_ids ? faces.map((face) => `${scene.part}/faces/faces_${face}`) : []), ...shown];
+  if (node?.type === "builder" && trace.builders[node.builder].kind === "BuildPart" && trace.builders[node.builder].parent === null) lit.push(scene.part);
   return { states, lit, ghost: shown.size > 0 && !inspecting, view };
 }
 
@@ -264,7 +265,7 @@ export function fileFocus(
   if (feature === null) return base;
   const own = sceneFocus(feature.trace, treeIndex(feature.trace), feature.selected);
   const prefix = feature.trace.scene.part;
-  return { ...base, lit: own.lit.map((path) => feature.leaf + path.slice(prefix.length)) };
+  return { ...base, lit: own.lit.filter((path) => path === prefix || path.startsWith(`${prefix}/faces/`)).map((path) => feature.leaf + path.slice(prefix.length)) };
 }
 
 /** A path in a file's scene, under a part's leaf, as the same path in the part's own scene. */

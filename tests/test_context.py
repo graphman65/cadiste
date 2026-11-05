@@ -6,9 +6,9 @@ from typing import Any
 from build123d import Axis, Box, BuildPart, Cylinder, Mode, Part, fillet
 
 from cadiste import Provenance, tracing
-from cadiste.context import compare, part_selection
+from cadiste.context import compare
 from cadiste.export import export_trace
-from cadiste.measure import adjacent_faces, load, save
+from cadiste.measure import save
 
 
 def _block(hole: float, *, fillets: bool) -> Part:
@@ -50,25 +50,3 @@ def test_an_unchanged_rebuild_says_so():
     data = {"result": {"faces": 1, "attributed": 1}, "ops": [], "builders": []}
 
     assert "the same 0, called with the same arguments" in compare(data, data)
-
-
-def test_a_picked_edge_names_the_operations_of_the_faces_it_bounds(tmp_path: Path):
-    trace, file = _exported(tmp_path, 2, fillets=True)
-    shapes = load(file)
-    part = trace["scene"]["part"]
-    fillet_op = next(op for op in trace["ops"] if op["kind"] == "fillet")
-    box_op = next(op for op in trace["ops"] if op["kind"] == "Box")
-    # An edge where a fillet face meets a face of the box.
-    wanted = {fillet_op["index"], box_op["index"]}
-    edges = [f"{part}/edges/edges_{index}" for index in range(len(shapes.leaves[part]["edges"] or []))]
-    edge = next(path for path in edges if {_maker(trace, f) for f in adjacent_faces(shapes, path) or []} == wanted)
-
-    text = part_selection(trace, None, [edge], {}, [], lambda path: adjacent_faces(shapes, path))
-
-    assert "bounds 2 face(s)" in text
-    assert f"[o{fillet_op['index']}] #{fillet_op['index']} fillet replace" in text
-    assert f"[o{box_op['index']}] #{box_op['index']} Box add" in text
-
-
-def _maker(trace: dict[str, Any], face: int) -> int | None:
-    return next((op["index"] for op in trace["ops"] if face in op["faces"]), None)

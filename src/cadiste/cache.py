@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import threading
 from collections.abc import Callable, Iterable
 from importlib.metadata import version
@@ -72,14 +73,13 @@ class TraceCache:
 
     def _path(self, kind: str, name: str, stamp: str) -> Path:
         key = hashlib.sha256(f"{kind}\0{name}".encode()).hexdigest()[:8]
-        return self.directory / f"{kind}-{_slug(name)}-{key}-{stamp[:16]}.json"
+        return self.directory / f"{kind}-{_slug(name)}-{key}-{stamp[:16]}"
 
     def latest(self, kind: str, name: str) -> Path | None:
         """The file of the entry last made for (kind, name), under whatever fingerprint (the model's source may have
         changed since): what the viewer shows, what a new build is compared with. Its shapes, if kept, are next to it
         (``SHAPES_SUFFIX``). Making an entry removes the others, so ask before."""
-        file = self._path(kind, name, "").name
-        prefix = file[: file.rindex("-") + 1]
+        prefix = self._path(kind, name, "").name
         entries = sorted(self.directory.glob(f"{prefix}*.json"), key=lambda path: path.stat().st_mtime_ns)
         return entries[-1] if entries else None
 
@@ -93,17 +93,24 @@ class TraceCache:
             lock = self._locks.setdefault(f"{kind}\0{name}", threading.Lock())
         with lock:
             stamp = fingerprint(self.roots, self.salt)
-            path = self._path(kind, name, stamp)
-            shapes = path.with_suffix(SHAPES_SUFFIX)
-            if not fresh and path.is_file():
+            prefix = self._path(kind, name, "").name
+            entries = sorted(
+                self.directory.glob(f"{self._path(kind, name, stamp).name}-*.json"),
+                key=lambda entry: entry.stat().st_mtime_ns,
+            )
+            if not fresh and entries:
+                path = entries[-1]
+                shapes = path.with_suffix(SHAPES_SUFFIX)
                 return path.read_bytes(), True, shapes if shapes.is_file() else None
+            # A fresh build must never overwrite an identity still held by a viewer tab.
+            path = self.directory / f"{self._path(kind, name, stamp).name}-{secrets.token_hex(8)}.json"
+            shapes = path.with_suffix(SHAPES_SUFFIX)
             self.directory.mkdir(parents=True, exist_ok=True)
             staged_shapes = shapes.with_name(f"{shapes.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             body = make(staged_shapes)
             if body is None:
                 staged_shapes.unlink(missing_ok=True)
                 return None, False, None
-            prefix = path.name[: path.name.rindex("-") + 1]
             for stale in [*self.directory.glob(f"{prefix}*.json"), *self.directory.glob(f"{prefix}*{SHAPES_SUFFIX}")]:
                 stale.unlink(missing_ok=True)
             staging = path.with_name(f"{path.name}.{os.getpid()}.tmp")

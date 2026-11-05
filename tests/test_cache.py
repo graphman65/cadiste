@@ -92,3 +92,19 @@ def test_a_build_keeps_its_shapes_with_it_and_drops_them_with_it(tmp_path: Path)
     assert rebuilt is not None and rebuilt.read_bytes() == b"shapes of second"
     assert not shapes.exists()  # the old build's shapes went with its JSON
     assert sorted(p.name for p in (tmp_path / "cache").iterdir()) == sorted([rebuilt.name, rebuilt.stem + ".json"])
+
+
+def test_fresh_builds_get_distinct_identities_even_without_source_changes(tmp_path: Path):
+    source = tmp_path / "model.py"
+    source.write_text("")
+    cache = TraceCache(tmp_path / "cache", [source], salt="")
+    make, _ = _builder([b"first", b"second"], shapes=True)
+
+    _, _, first = cache.get_or_make("trace", "Bracket", make)
+    _, _, second = cache.get_or_make("trace", "Bracket", make, fresh=True)
+
+    assert first is not None and second is not None and first.name != second.name
+    assert not first.exists()
+    assert second.read_bytes() == b"shapes of second"
+    assert cache.latest("trace", "Bracket") == second.with_suffix(".json")
+    assert cache.get_or_make("trace", "Bracket", make)[1:] == (True, second)

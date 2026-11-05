@@ -122,18 +122,6 @@ class Hub:
         tab = self._tabs.get(tab_id) if tab_id is not None else None
         return tab is not None and tab.connection is not None
 
-    def adopt(self, session_id: str, tab: str) -> bool:
-        """Link the session to ``tab`` (the one a reference the user gave it came from) when it has no live tab and
-        ``tab`` is open: pasting the reference says which tab the user works in. Whether it did."""
-        with self._lock:
-            session = self.session(session_id)
-            if self._live(session.tab) or not self._live(tab):
-                return False
-            session.tab, session.requesting, session.declined = tab, False, False
-            self._broadcast_sessions()
-            self._lock.notify_all()
-            return True
-
     def linked_tab(self, session_id: str, timeout: float) -> str:
         """The session's tab; when it has none (or its tab was closed), ask every tab for a link and wait up to
         ``timeout`` for the user to give one."""
