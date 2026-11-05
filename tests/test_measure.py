@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from build123d import Axis, Box, BuildPart, Cylinder, Edge, GeomType, Location, Mode, Part
+from build123d import Axis, Box, BuildPart, Cylinder, Edge, GeomType, Location, Mode, Part, Solid
 
 from cadiste.measure import MeasureError, Shapes, load, measure, save
 from cadiste.mesh import Scene, SceneObject, tessellate
@@ -46,6 +46,25 @@ def test_a_hole_measures_its_exact_diameter_through_the_viewer_path(tmp_path: Pa
     properties = _rows(entity["properties"])
     assert properties["Diameter"] == pytest.approx(4, abs=1e-12)  # the mesh's polygon would fall short of it
     assert properties["Area"] == pytest.approx(2 * math.pi * 2 * 10)
+
+
+@pytest.mark.parametrize(
+    ("shape", "topo", "major", "minor"),
+    [
+        (Edge.make_ellipse(5, 2), "edges", 5, 2),
+        (Solid.make_torus(8, 2), "faces", 8, 2),
+    ],
+)
+def test_major_and_minor_radii_include_their_diameters(tmp_path: Path, shape, topo, major, minor):
+    scene, shapes = _saved(tmp_path, SceneObject("curved", shape))
+
+    (entity,) = measure(shapes, [_path(scene, "curved", topo, 0)])["entities"]
+
+    properties = _rows(entity["properties"])
+    assert properties["Major diameter"] == pytest.approx(2 * major)
+    assert properties["Major radius"] == pytest.approx(major)
+    assert properties["Minor diameter"] == pytest.approx(2 * minor)
+    assert properties["Minor radius"] == pytest.approx(minor)
 
 
 def test_opposite_faces_measure_their_distance_and_angle_without_repeating_it(tmp_path: Path):

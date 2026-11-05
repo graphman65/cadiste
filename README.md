@@ -60,12 +60,13 @@ builds again. One entry is kept per part.
   available; Ctrl/Cmd-click toggles it and Shift-click adds it to the selection. Clicking a sketch or an element
   focuses its feature. Hovering shows a card by the pointer: the operation, sketch or assembly instance under it,
   then the face, edge or vertex with three-cad-viewer's mesh measurements (area, length, radius, centre, ends).
+  Radius readouts also show the corresponding diameter, with the same approximation marker and millimetre units.
 - **Measure** (the ruler in the toolbar): shows exact measurements for the selected faces, edges and vertices.
   Click replaces, Ctrl/Cmd-click toggles, and Shift-click adds a pick. The panel's Clear drops entity picks;
   Escape clears the entire selection. Measurements use the B-rep the mesh was made from (millimetres, degrees):
-  - one: a face's area, a cylinder's or sphere's diameter and radius, a cone's half-angle, a torus' radii, a plane's
-    normal, a cylinder's axis; an edge's length, a circle's or arc's diameter, radius, centre and arc angle, an
-    ellipse's radii, a line's direction; a vertex's position;
+  - one: a face's area, a cylinder's or sphere's diameter and radius, a cone's half-angle, a torus' major/minor
+    diameters and radii, a plane's normal, a cylinder's axis; an edge's length, a circle's or arc's diameter, radius,
+    centre and arc angle, an ellipse's major/minor diameters and radii, a line's direction; a vertex's position;
   - two: the minimum distance between them and its Δx, Δy, Δz; the distance between their centres or axes (a
     circle's, a sphere's centre; a cylinder's, cone's or torus' axis; a straight edge's line) and between parallel
     planes when it is not the minimum; the angle between their lines and planes;

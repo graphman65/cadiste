@@ -387,7 +387,9 @@ def _face(path: str, face: Any) -> _Entity:
         torus = surface.Torus()
         entity.axis = _Line.of(torus.Axis())
         entity.properties = [
+            _quantity("Major diameter", "length", 2 * torus.MajorRadius()),
             _quantity("Major radius", "length", torus.MajorRadius()),
+            _quantity("Minor diameter", "length", 2 * torus.MinorRadius()),
             _quantity("Minor radius", "length", torus.MinorRadius()),
             area,
             _quantity("Axis", "direction", entity.axis.direction),
@@ -426,7 +428,9 @@ def _edge(path: str, edge: Any) -> _Entity:
         ellipse = curve.Ellipse()
         entity.center = _vec(ellipse.Location())
         entity.properties = [
+            _quantity("Major diameter", "length", 2 * ellipse.MajorRadius()),
             _quantity("Major radius", "length", ellipse.MajorRadius()),
+            _quantity("Minor diameter", "length", 2 * ellipse.MinorRadius()),
             _quantity("Minor radius", "length", ellipse.MinorRadius()),
             _quantity("Center", "point", entity.center),
             length,

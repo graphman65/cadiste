@@ -25,6 +25,7 @@ const FACTS: Record<string, [string, string]> = {
   area: ["Area", "mm²"],
   vol: ["Volume", "mm³"],
   len: ["Length", "mm"],
+  d: ["Diameter", "mm"],
   r: ["Radius", "mm"],
   c: ["Center", ""],
   at: ["At", ""],
@@ -63,8 +64,16 @@ function parseReadout(readout: string): { kind: string; facts: Fact[] } {
   for (const segment of segments(rest)) {
     const pair = /^(\w+)\s*(≈|=)\s*(.+)$/.exec(segment);
     const count = /^(\d+) (\w+)$/.exec(segment);
-    if (pair) facts.push({ name: pair[1], value: pair[3], approx: pair[2] === "≈" });
-    else if (count) facts.push({ name: count[2], value: count[1], approx: false });
+    if (pair) {
+      const approx = pair[2] === "≈";
+      if (pair[1] === "r") {
+        const radius = Number(pair[3]);
+        if (Number.isFinite(radius)) {
+          facts.push({ name: "d", value: (2 * radius).toFixed(2), approx });
+        }
+      }
+      facts.push({ name: pair[1], value: pair[3], approx });
+    } else if (count) facts.push({ name: count[2], value: count[1], approx: false });
     else return { kind: readout.slice(0, colon), facts: [{ name: "", value: rest, approx: false }] };
   }
   return { kind: readout.slice(0, colon), facts };
