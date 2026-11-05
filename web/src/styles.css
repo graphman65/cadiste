@@ -314,6 +314,10 @@ body[data-theme] .cad-view {
   display: none !important;
 }
 
+.cad-view.unrendered {
+  visibility: hidden;
+}
+
 /* Its measurement panels (properties, distance, angle: the tools' readouts of a selection), as the app's cards. */
 .cad-view .tcv_panel,
 .hover-card {

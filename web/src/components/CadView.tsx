@@ -599,7 +599,8 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
 
   return (
     <div className={simulation.enabled ? "cad simulation-mode" : "cad"} data-view-mode={simulation.enabled ? "simulation" : "cad"} data-rendered-feedback-stamp={appliedStamp ?? undefined}>
-      <div className="cad-view" ref={host} />
+      {/* Hidden until the first render: three-cad-viewer applies glass and tools only then, its raw panels before. */}
+      <div className={rendered === 0 ? "cad-view unrendered" : "cad-view"} ref={host} />
       {!simulation.enabled && hovered !== null && (
         <div className="hover-card" ref={card}>
           {hovered.path !== null && describe?.(hovered.path)}
