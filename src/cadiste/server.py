@@ -29,7 +29,7 @@ import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from .agent import Agent, ToolError
 from .cache import SHAPES_SUFFIX, TraceCache
 from .hub import Hub
-from .project import FolderStep
+from .project import FolderStep, _CatalogError, _discover
 from .references import SnapshotError
 
 if TYPE_CHECKING:
@@ -113,28 +113,76 @@ class Measurer:
 
 
 @dataclass(frozen=True)
-class Project:
-    target: str
-    """``module:callable`` returning the shape."""
-    args: tuple[str, ...]
-    """Arguments for a project without a part list."""
+class _Catalog:
     parts: tuple[str, ...] | None
-    """Part names, each passed to the target alone; None for a single model built with ``args``."""
-    assemblies: dict[str, str] = field(default_factory=dict)
-    """Assembly name -> ``module:callable`` returning it, built without the tracer; in the order given."""
-    trace_env: dict[str, str] = field(default_factory=dict)
-    """Environment for traced builds only (the assembly build keeps the server's)."""
-    folders: dict[str, list[FolderStep]] = field(default_factory=dict)
-    """Part name -> the folder it is listed in, package by package (then file by file)."""
-    parts_target: str | None = None
-    """``module:attribute`` naming the parts (``--parts``): an assembly's instances are matched to them."""
+    names: tuple[str, ...]
+    folders: dict[str, list[FolderStep]]
+
+    def folder_parts(self, path: str) -> list[str]:
+        """Parts in this folder and its descendants, in catalog order."""
+        return [
+            name
+            for name, steps in self.folders.items()
+            if (folder := "/".join(str(step["name"]) for step in steps)) == path or folder.startswith(f"{path}/")
+        ]
+
+
+class Project:
+    """Fixed build configuration and one atomically replaced catalog shared by HTTP, builds and agents."""
+
+    def __init__(
+        self,
+        target: str,
+        args: tuple[str, ...],
+        parts: tuple[str, ...] | None,
+        assemblies: dict[str, str] | None = None,
+        trace_env: dict[str, str] | None = None,
+        folders: dict[str, list[FolderStep]] | None = None,
+        parts_target: str | None = None,
+    ):
+        self.target = target
+        self.args = args
+        self.assemblies = assemblies if assemblies is not None else {}
+        self.trace_env = trace_env if trace_env is not None else {}
+        self.parts_target = parts_target
+        self._has_parts = parts_target is not None or parts is not None
+        self._catalog = _Catalog(parts, parts if parts is not None else (" ".join([target, *args]),), folders or {})
+        self._catalog_error: _CatalogError | None = None
+        self._catalog_lock = threading.Lock()
+
+    def catalog(self, *, refresh: bool = False) -> _Catalog:
+        """One coherent names/folders snapshot. Refreshes serialize discovery and publish only complete results.
+        A failed discovery blocks stale reads until a later successful refresh; fixed single-model mode never
+        imports anything. Unchanged catalogs keep the same snapshot, but discovery still runs on each refresh."""
+        with self._catalog_lock:
+            if refresh and self.parts_target is not None:
+                try:
+                    parts, folders = _discover(self.parts_target)
+                except _CatalogError as error:
+                    self._catalog_error = error
+                    raise
+                catalog = _Catalog(parts, parts, folders)
+                if catalog != self._catalog:
+                    self._catalog = catalog
+                self._catalog_error = None
+            if self._catalog_error is not None:
+                raise self._catalog_error
+            return self._catalog
+
+    @property
+    def parts(self) -> tuple[str, ...] | None:
+        return self.catalog().parts
+
+    @property
+    def folders(self) -> dict[str, list[FolderStep]]:
+        return self.catalog().folders
 
     @property
     def names(self) -> list[str]:
-        return list(self.parts) if self.parts is not None else [" ".join([self.target, *self.args])]
+        return list(self.catalog().names)
 
     def trace_command(self, name: str) -> list[str]:
-        args = [name] if self.parts is not None else list(self.args)
+        args = [name] if self._has_parts else list(self.args)
         return [sys.executable, "-m", "cadiste", "export", self.target, "--", *args]
 
     def assembly_command(self, name: str) -> list[str]:
@@ -145,25 +193,26 @@ class Project:
         return [*command, self.assemblies[name]]
 
     def folder_parts(self, path: str) -> list[str]:
-        """The parts in the folder at ``path`` and the folders under it: a file's ("chassis/drive_module"), or a
-        package's ("chassis", every file of it), in the order the project lists them."""
-        parts = []
-        for name, steps in self.folders.items():
-            folder = "/".join(str(step["name"]) for step in steps)
-            if folder == path or folder.startswith(f"{path}/"):
-                parts.append(name)
-        return parts
+        return self.catalog().folder_parts(path)
 
 
 def _run(command: list[str], environment: dict[str, str] | None = None) -> tuple[bytes | None, dict[str, str]]:
     """The command's stdout, or None and the error to report."""
-    env = None if not environment else {**os.environ, **environment}
-    try:
-        done = subprocess.run(command, capture_output=True, timeout=_TRACE_TIMEOUT, check=False, env=env)
-    except subprocess.TimeoutExpired:
-        return None, {"error": f"took over {_TRACE_TIMEOUT} s"}
-    if done.returncode != 0:
-        return None, {"error": "the build failed", "log": done.stderr.decode(errors="replace")}
+    with tempfile.TemporaryDirectory(prefix="cadiste-bytecode-") as directory:
+        # -B alone still reads existing .pyc files. An empty prefix bypasses those too, even for edits whose
+        # size and integer-second mtime match. Keep the command layout used to inject --shapes unchanged.
+        env = {
+            **os.environ,
+            **(environment or {}),
+            "PYTHONPYCACHEPREFIX": directory,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        try:
+            done = subprocess.run(command, capture_output=True, timeout=_TRACE_TIMEOUT, check=False, env=env)
+        except subprocess.TimeoutExpired:
+            return None, {"error": f"took over {_TRACE_TIMEOUT} s"}
+        if done.returncode != 0:
+            return None, {"error": "the build failed", "log": done.stderr.decode(errors="replace")}
     return done.stdout, {}
 
 
@@ -203,13 +252,16 @@ class Builds:
         self.always_fresh = always_fresh
         """No cache (``--no-cache``): ``cache`` only holds the latest build of each, for its shapes."""
 
-    def _recipe(self, target: dict[str, Any]) -> tuple[str, str, list[str], dict[str, str] | None, str]:
+    def _recipe(
+        self, target: dict[str, Any], *, refresh: bool = False
+    ) -> tuple[str, str, list[str], dict[str, str] | None, str]:
         """The cache entry's kind and name, the command (a cadiste subcommand: ``[python, -m, cadiste, <sub>, ...]``),
         its environment and what it does; LookupError for a target the project does not have."""
         project = self.project
+        catalog = project.catalog(refresh=refresh)
         match target:
             case {"kind": "part", "name": str(name)}:
-                if name not in project.names:
+                if name not in catalog.names:
                     raise LookupError(f"unknown part {name!r}")
                 return "trace", name, project.trace_command(name), project.trace_env, f"tracing {name!r}"
             case {"kind": "assembly", **rest}:
@@ -220,7 +272,7 @@ class Builds:
                     raise LookupError(f"unknown assembly {name!r}")
                 return "assembly", name, project.assembly_command(name), None, f"building the assembly {name!r}"
             case {"kind": "file", "path": str(path)}:
-                names = project.folder_parts(path)
+                names = catalog.folder_parts(path)
                 if not names:
                     raise LookupError(f"no parts in {path!r}")
                 label = path.rpartition("/")[2]
@@ -232,7 +284,7 @@ class Builds:
     def get(self, target: dict[str, Any], fresh: bool) -> Build:
         """The target's build, from the cache unless ``fresh`` (or its source changed); a failed build is not
         cached."""
-        kind, name, command, environment, doing = self._recipe(target)
+        kind, name, command, environment, doing = self._recipe(target, refresh=True)
         failure: dict[str, str] = {}
 
         def make(shapes: Path) -> bytes | None:
@@ -247,7 +299,7 @@ class Builds:
 
     def latest(self, target: dict[str, Any]) -> Build | None:
         """The target's last build, as the viewer shows it, even if its source changed since (None: never built)."""
-        kind, name, *_ = self._recipe(target)
+        kind, name, *_ = self._recipe(target, refresh=True)
         file = self.cache.latest(kind, name)
         if file is None:
             return None
@@ -259,11 +311,12 @@ class Builds:
         ``form`` (``EXPORT_FORMATS``); for a folder, ``only`` keeps those of its parts (the ones shown). LookupError
         for a target the project does not have."""
         project = self.project
+        catalog = project.catalog(refresh=True)
         match target:
             case {"kind": "part", "name": str(name)}:
-                if name not in project.names:
+                if name not in catalog.names:
                     raise LookupError(f"unknown part {name!r}")
-                if project.parts is None:
+                if catalog.parts is None:
                     stem, command = project.target.rpartition(":")[2], [project.target, "--", *project.args]
                 else:
                     stem, command = name, ["--label", name, project.target, "--", name]
@@ -276,7 +329,7 @@ class Builds:
                     raise LookupError(f"unknown assembly {name!r}")
                 stem, command, doing = name, [project.assemblies[name]], f"exporting the assembly {name!r}"
             case {"kind": "file", "path": str(path)}:
-                names = project.folder_parts(path)
+                names = catalog.folder_parts(path)
                 if not names:
                     raise LookupError(f"no parts in {path!r}")
                 if only is not None:
@@ -315,15 +368,20 @@ class _Handler(BaseHTTPRequestHandler):
             self.builds.always_fresh and query.get("latest", ["0"])[0] != "1"
         )
         if url.path == "/api/project":
-            self._json(
-                {
-                    "target": self.project.target,
-                    "parts": self.project.names,
-                    "folders": self.project.folders,
-                    "assemblies": list(self.project.assemblies),
-                    "root": Path.cwd().name,
-                }
-            )
+            try:
+                catalog = self.project.catalog(refresh=True)
+            except _CatalogError as error:
+                self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            else:
+                self._json(
+                    {
+                        "target": self.project.target,
+                        "parts": catalog.names,
+                        "folders": catalog.folders,
+                        "assemblies": list(self.project.assemblies),
+                        "root": Path.cwd().name,
+                    }
+                )
         elif url.path == "/api/trace":
             self._built({"kind": "part", "name": query.get("part", [""])[0]}, fresh)
         elif url.path == "/api/assembly":
@@ -342,6 +400,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _built(self, target: dict[str, Any], fresh: bool) -> None:
         try:
             build = self.builds.get(target, fresh)
+        except _CatalogError as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
         except LookupError as error:
             # The message itself: str() of a KeyError quotes it.
             self._json({"error": str(error.args[0]) if error.args else str(error)}, HTTPStatus.NOT_FOUND)
@@ -363,6 +424,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             saved = self.builds.save(query, form, parts)
+        except _CatalogError as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
         except LookupError as error:
             self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
             return

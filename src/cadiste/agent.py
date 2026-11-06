@@ -159,13 +159,14 @@ class Agent:
         return Answer("\n".join(lines))
 
     def list_parts(self, session: str) -> Answer:
-        lines = [f"{len(self.project.names)} part(s) of {self.project.target}:"]
-        for name in self.project.names:
-            folder = "/".join(str(step["name"]) for step in self.project.folders.get(name, []))
+        catalog = self.project.catalog(refresh=True)
+        lines = [f"{len(catalog.names)} part(s) of {self.project.target}:"]
+        for name in catalog.names:
+            folder = "/".join(str(step["name"]) for step in catalog.folders.get(name, []))
             lines.append(f"  {name}" + (f"  (in {folder})" if folder else ""))
         for name, assembly in self.project.assemblies.items():
             lines.append(f"assembly {name!r}: {assembly} — show(view='assembly:{name}')")
-        folders = sorted({"/".join(str(s["name"]) for s in steps) for steps in self.project.folders.values() if steps})
+        folders = sorted({"/".join(str(s["name"]) for s in steps) for steps in catalog.folders.values() if steps})
         if folders:
             lines.append("folders (show(view=<folder>) views a folder's parts together): " + ", ".join(folders))
         return Answer("\n".join(lines))
@@ -195,8 +196,9 @@ class Agent:
         return Answer(self._paths(context.describe(trace, node), trace))
 
     def _code_model(self, part: str, revision: str | None) -> CodeModel:
-        if part not in self.project.names:
-            raise ToolError(f"unknown part {part!r}; choose: {', '.join(self.project.names)}")
+        catalog = self.project.catalog(refresh=True)
+        if part not in catalog.names:
+            raise ToolError(f"unknown part {part!r}; choose: {', '.join(catalog.names)}")
         target = {"kind": "part", "name": part}
         if revision is None:
             build = self.builds.get(target, False)
@@ -236,10 +238,11 @@ class Agent:
         if part is None and component is None:
             if revision is not None:
                 raise ValueError("a source revision belongs to a captured part; provide part=...")
+            catalog = self.project.catalog(refresh=True)
             folders = sorted(
                 {
                     "/".join(str(step["name"]) for step in steps[:end])
-                    for steps in self.project.folders.values()
+                    for steps in catalog.folders.values()
                     for end in range(1, len(steps) + 1)
                 }
             )
@@ -250,13 +253,13 @@ class Agent:
                     "parts": [
                         {
                             "part": name,
-                            "folders": self.project.folders.get(name, []),
+                            "folders": catalog.folders.get(name, []),
                             "entry_target": self.project.target,
-                            "arguments": [name] if self.project.parts is not None else list(self.project.args),
+                            "arguments": [name] if catalog.parts is not None else list(self.project.args),
                         }
-                        for name in self.project.names
+                        for name in catalog.names
                     ],
-                    "folders": [{"path": path, "parts": self.project.folder_parts(path)} for path in folders],
+                    "folders": [{"path": path, "parts": catalog.folder_parts(path)} for path in folders],
                     "assemblies": [
                         {"name": name, "entry_target": target} for name, target in self.project.assemblies.items()
                     ],

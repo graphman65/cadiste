@@ -194,11 +194,9 @@ def _assemblies(entries: list[str]) -> dict[str, str]:
 
 def cmd_serve(args: argparse.Namespace) -> None:
     from .cache import TraceCache
-    from .project import part_folders, source_roots
+    from .project import source_roots
     from .server import Project, serve
 
-    definitions = part_definitions(args.parts) if args.parts else None
-    folders = part_folders(args.parts, definitions) if args.parts and definitions is not None else {}
     environment = _environment(args.trace_env)
     assemblies = _assemblies(args.assembly)
     cache = None
@@ -206,8 +204,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         targets = [args.target, *([args.parts] if args.parts else []), *assemblies.values()]
         salt = json.dumps({"target": args.target, "args": args.args, "env": environment}, sort_keys=True)
         cache = TraceCache(args.cache_dir.resolve(), source_roots(targets), salt)
-    parts = tuple(definitions) if definitions is not None else None
-    project = Project(args.target, tuple(args.args), parts, assemblies, environment, folders, parts_target=args.parts)
+    project = Project(args.target, tuple(args.args), None, assemblies, environment, parts_target=args.parts)
+    project.catalog(refresh=True)
     # The lockfile goes where `cadiste mcp` looks for it, with or without a cache.
     serve(project, args.host, args.port, cache, lockfile=args.cache_dir.resolve() / "serve.json")
 

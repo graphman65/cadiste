@@ -30,6 +30,21 @@ follow it. `--assembly [NAME=]module:callable` adds an assembly, listed above th
 unnamed one is "Assembly" alone, else named after its callable). `--trace-env KEY=VALUE` sets environment variables
 for traced builds only (repeatable).
 
+Browser reload and **Rebuild** refresh both the part list and its folder hierarchy from the current `--parts`
+source (`GET /api/project`); no server restart is needed after adding/removing parts or moving their definitions.
+MCP `list_parts` and project-level `walk_components` discover the current catalog independently of the browser.
+Build/export validation uses that same shared catalog, refreshed before requests, so removed parts and empty
+former folders are rejected. Discovery runs in a fresh interpreter in the server's environment, not the
+trace-only `--trace-env`; model import prints cannot contaminate its JSON. Names and folders are published
+together under a lock. Discovery/import failures are reported explicitly, leave the last complete snapshot
+untouched, and block serving it as current until discovery succeeds again.
+
+Even an unchanged catalog costs one fresh import/discovery per refresh or build/export validation (including
+lookups of captured builds); the existing snapshot is retained when its contents match. Discovery does not build
+geometry unless the model's catalog itself does so, and does not invalidate geometry cache entries. Without
+`--parts`, the single-model name and arguments stay fixed and catalog requests import nothing. Discovery and
+geometry subprocesses ignore existing bytecode caches, including source edits of the same size and timestamp.
+
 ```sh
 cd ../pipecrawler
 uv run --with-editable ../cadiste cadiste serve pipecrawler.catalog:build_part --parts pipecrawler.catalog:PARTS \
@@ -43,8 +58,8 @@ cadiste keeps every trace (and each assembly's scene), with the shapes it measur
 (`--cache-dir`; `--no-cache` to trace every request). An entry stands while nothing it could depend on changes:
 every file under the model's top-level packages (path, size, modification time, so an edit, a checkout or a data
 file all count), cadiste's own Python, the CAD library versions, the target and the trace environment. Any change
-rebuilds a part the next time it is opened (the 30-tooth gear: 9.6 s, then 2 ms from the cache); Rebuild always
-builds again. One entry is kept per part.
+rebuilds a part the next time it is opened (the 30-tooth gear: 9.6 s to build, then cached geometry is reused);
+Rebuild always builds again. One entry is kept per part; catalog discovery above is separate from this cache.
 
 - **3D view**: three-cad-viewer (OCP CAD Viewer's renderer) on meshes from `ocp_tessellate`, in the app's colours,
   under the app's own toolbar: preset views, reset, orthographic/perspective, see-through, black edges, axes, XY

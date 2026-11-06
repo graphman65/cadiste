@@ -6,7 +6,11 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import json
+import os
+import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import FunctionType
@@ -120,3 +124,45 @@ def source_roots(targets: Iterable[str]) -> list[Path]:
         elif spec.origin:
             roots.add(Path(spec.origin).resolve())
     return sorted(roots)
+
+
+class _CatalogError(ValueError):
+    """Discovery failed; the last complete catalog must not be served as current."""
+
+
+def _discover(target: str) -> tuple[tuple[str, ...], dict[str, list[FolderStep]]]:
+    """Discover names and folders together in the server's interpreter/environment, never importing the model
+    into the server. A private, empty bytecode directory also bypasses timestamp/size-valid stale .pyc files."""
+    script = """
+import contextlib
+import json
+import sys
+from cadiste.project import part_definitions, part_folders
+with contextlib.redirect_stdout(sys.stderr):
+    definitions = part_definitions(sys.argv[1])
+    folders = part_folders(sys.argv[1], definitions)
+print(json.dumps({"parts": list(definitions), "folders": folders}))
+"""
+    with tempfile.TemporaryDirectory(prefix="cadiste-discover-") as directory:
+        environment = {
+            **os.environ,
+            "PYTHONPYCACHEPREFIX": directory,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        try:
+            done = subprocess.run(
+                [sys.executable, "-c", script, target],
+                capture_output=True,
+                timeout=900,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise _CatalogError(f"part discovery failed: {error}") from error
+    if done.returncode != 0:
+        raise _CatalogError(f"part discovery failed:\n{done.stderr.decode(errors='replace').strip()}")
+    try:
+        data = json.loads(done.stdout)
+        return tuple(data["parts"]), data["folders"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise _CatalogError("part discovery failed: invalid discovery output") from error

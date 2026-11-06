@@ -101,6 +101,15 @@ function keyOf(target: Target): string {
   return target.name;
 }
 
+/** Keep an available target, otherwise open the first assembly or part in the refreshed catalog. */
+function targetIn(project: Project, current: Target | null): Target | null {
+  if (current?.kind === "assembly" && project.assemblies.includes(current.name)) return current;
+  if (current?.kind === "part" && project.parts.includes(current.name)) return current;
+  if (current?.kind === "file" && project.parts.some((part) => inFolder(project, part, current.path))) return current;
+  if (project.assemblies.length > 0) return { kind: "assembly", name: project.assemblies[0] };
+  return project.parts.length > 0 ? { kind: "part", name: project.parts[0] } : null;
+}
+
 function failed(error: unknown): { status: "error"; error: string; log?: string } {
   const failure = error instanceof TraceFailure ? error : new TraceFailure(String(error));
   return { status: "error", error: failure.message, log: failure.log };
@@ -187,6 +196,7 @@ function assemblySelectionParts(data: AssemblyData, selection: SelectionItem[], 
 export function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
+  const [refreshingProject, setRefreshingProject] = useState(false);
   const [target, setTarget] = useState<Target | null>(targetFromHash);
   const [savedView, setSavedView] = useState<SavedViewState | null>(null);
   const [traces, setTraces] = useState<Record<string, Load<TraceData>>>({});
@@ -213,15 +223,7 @@ export function App() {
     fetchProject()
       .then((loaded) => {
         setProject(loaded);
-        setTarget((current) => {
-          if (current?.kind === "assembly" && loaded.assemblies.includes(current.name)) return current;
-          if (current?.kind === "part" && loaded.parts.includes(current.name)) return current;
-          if (current?.kind === "file" && loaded.parts.some((part) => inFolder(loaded, part, current.path))) {
-            return current;
-          }
-          if (loaded.assemblies.length > 0) return { kind: "assembly", name: loaded.assemblies[0] };
-          return loaded.parts.length > 0 ? { kind: "part", name: loaded.parts[0] } : null;
-        });
+        setTarget((current) => targetIn(loaded, current));
       })
       .catch((error: unknown) => setProjectError(String(error)));
   }, []);
@@ -734,8 +736,32 @@ export function App() {
     return () => document.removeEventListener("keydown", onKey, true);
   }, [clearSelection]);
 
+  const rebuild = async () => {
+    if (target === null) return;
+    setRefreshingProject(true);
+    try {
+      const loaded = await fetchProject();
+      if (project !== null && (
+        JSON.stringify(project.parts) !== JSON.stringify(loaded.parts) ||
+        JSON.stringify(project.folders) !== JSON.stringify(loaded.folders)
+      )) {
+        // A folder's cached browser scene must not retain parts that moved or disappeared.
+        setFiles({});
+        for (const key of requested.current) if (key.startsWith("#file:")) requested.current.delete(key);
+      }
+      setProject(loaded);
+      setTarget((current) => targetIn(loaded, current));
+      const next = targetIn(loaded, target);
+      if (next !== null) await load(next, "fresh");
+    } catch (error: unknown) {
+      setProjectError(String(error));
+    } finally {
+      setRefreshingProject(false);
+    }
+  };
+
   if (projectError !== null) {
-    return <div className="fatal">Cannot reach the cadiste server: {projectError}</div>;
+    return <div className="fatal">Cannot load the project: {projectError}</div>;
   }
 
   const title = target?.kind === "file" ? target.path.replaceAll("/", " / ") : target?.name;
@@ -790,11 +816,11 @@ export function App() {
         <ExportMenu target={target} title={title} shown={exportShown} />
         <button
           className="primary"
-          disabled={target === null || state?.status === "loading"}
-          onClick={() => target && load(target, "fresh")}
-          title="Build again, even if the cached build is up to date"
+          disabled={target === null || refreshingProject || state?.status === "loading"}
+          onClick={() => void rebuild()}
+          title="Refresh parts and folders, then build again even if the cached build is up to date"
         >
-          {state?.status === "loading" ? "Building…" : "Rebuild"}
+          {refreshingProject || state?.status === "loading" ? "Building…" : "Rebuild"}
         </button>
       </header>
 
