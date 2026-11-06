@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -373,6 +374,69 @@ class _Handler(BaseHTTPRequestHandler):
         disposition = f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
         self._send(saved.body, EXPORT_FORMATS[form], headers={"Content-Disposition": disposition})
 
+    def _bambu_studio(self, request: Any) -> None:
+        """Export to a retained STEP file, then start the server machine's local slicer."""
+        # A JSON-only POST prevents a cross-origin HTML form from launching a local application.
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        if not isinstance(request, dict) or not isinstance(target := request.get("target"), dict):
+            self._json({"error": "expected a target object"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in target.items()):
+            self._json({"error": "target values must be strings"}, HTTPStatus.BAD_REQUEST)
+            return
+        parts = request.get("parts")
+        if parts is not None and (
+            not isinstance(parts, list) or not parts or not all(isinstance(part, str) for part in parts)
+        ):
+            self._json({"error": "parts must be a non-empty list of part names"}, HTTPStatus.BAD_REQUEST)
+            return
+        executable = next(
+            (found for name in ("bambustudio", "bambu-studio", "BambuStudio") if (found := shutil.which(name))), None
+        )
+        if executable is None:
+            self._json(
+                {"error": "Bambu Studio was not found on the server's PATH (bambustudio, bambu-studio or BambuStudio)"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            saved = self.builds.save(target, "step", parts)
+        except ValueError as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        except LookupError as error:
+            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            return
+        if saved.body is None:
+            self._json(saved.failure, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        output: Path | None = None
+        try:
+            directory = self.builds.cache.directory / "bambu-studio"
+            directory.mkdir(parents=True, exist_ok=True)
+            stem = re.sub(r"[^\w .-]", "_", saved.stem).lstrip(".") or "model"
+            # Keep each handoff: Bambu may read it after this request or reload it later.
+            with tempfile.NamedTemporaryFile(prefix=f"{stem}-", suffix=".step", dir=directory, delete=False) as file:
+                output = Path(file.name).resolve()
+                file.write(saved.body)
+            process = subprocess.Popen(
+                [executable, str(output)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            if output is not None:
+                output.unlink(missing_ok=True)
+            self._json({"error": f"could not open Bambu Studio: {error}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        # The GUI can outlive the request; reap it without blocking other exports.
+        threading.Thread(target=process.wait, daemon=True).start()
+        self._json({})
+
     def _events(self, tab: str) -> None:
         """The tab's Server-Sent Events, until it goes away or a newer stream for it replaces this one."""
         self.send_response(HTTPStatus.OK)
@@ -401,6 +465,8 @@ class _Handler(BaseHTTPRequestHandler):
         match steps:
             case ["measure"]:
                 self._measure(request)
+            case ["bambu-studio"]:
+                self._bambu_studio(request)
             case ["tabs", tab, "state"] if _ID.fullmatch(tab) and isinstance(request, dict):
                 self.hub.set_state(tab, request)
                 self._json({})

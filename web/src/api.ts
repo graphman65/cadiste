@@ -111,6 +111,16 @@ export async function fetchExport(
   return { file: await response.blob(), name };
 }
 
+/** Build a STEP file and start Bambu Studio on the server machine; completion means the launcher started. */
+export async function openInBambuStudio(target: Record<string, string>, parts?: string[]): Promise<void> {
+  const response = await fetch("/api/bambu-studio", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, parts }),
+  });
+  await checked<Record<string, never>>(response);
+}
+
 /** Capture a standalone Markdown snapshot, with no server-side reference store or lookup. */
 export async function createReference(tab: string | null, state: TabState): Promise<{ text: string; label: string }> {
   const response = await fetch("/api/references", {

@@ -143,6 +143,13 @@ builds again. One entry is kept per part.
   eyes: only the parts shown are written (the menu says how many of how many). An assembly's is always whole. It
   builds the target again with `cadiste save`, not traced and in the server's environment, so the model's own part
   cache may serve; nothing is cached. A failed build shows its traceback in the menu.
+  **Open in Bambu Studio** exports the same target as STEP and launches the local app on the machine
+  running `cadiste serve`, not on a remote browser's machine. The server searches its `PATH` for `bambustudio`,
+  `bambu-studio` or `BambuStudio`; a missing app or failed launch is reported in the menu. Each handoff gets a
+  separate file under `<cache-dir>/bambu-studio/`, retained for Bambu's later reloads (with `--no-cache`, only
+  until the server stops). Remove old handoff files when no longer needed. This opens the model; it does not
+  slice or print it. The action uses `POST /api/bambu-studio` with JSON `{"target": {...}, "parts": [...]}`;
+  omit `parts` for all parts, or pass the shown folder parts.
 
 `mise run web-dev` runs Vite with hot reload on <http://localhost:5173>, proxying `/api` to `cadiste serve`.
 
