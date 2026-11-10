@@ -21,6 +21,7 @@ import { Icon } from "./components/Icon";
 import { LinkRequests, LinkedSessions } from "./components/Link";
 import { PartList } from "./components/PartList";
 import { Splitter } from "./components/Splitter";
+import { SimulationControls } from "./components/SimulationControls";
 import { Timeline } from "./components/Timeline";
 import type { SavedViewState } from "./components/SavedViews";
 import { ViewBar } from "./components/ViewBar";
@@ -42,6 +43,7 @@ import {
   type TreeIndex,
 } from "./model";
 import { usePersistentFlag, usePersistentNumber } from "./persist";
+import { useLiveSimulation } from "./simulation";
 import { updateSelection, type SelectionMode } from "./selection";
 import type { AssemblyData, HubCalls, HubRequest, Project, SceneData, SelectionItem, ShapeNode, TabState, TraceData } from "./types";
 
@@ -192,12 +194,20 @@ function assemblySelectionParts(data: AssemblyData, selection: SelectionItem[], 
   ])];
 }
 
+/** Adapter identities only: these nodes do not claim ownership by a traced CAD part. */
+function SimulationSceneNode({ node }: { node: ShapeNode }) {
+  return <li data-scene-node={node.id}><span>{node.name}</span>
+    {node.parts !== undefined && <ul>{node.parts.map((child) => <SimulationSceneNode key={child.id} node={child} />)}</ul>}
+  </li>;
+}
+
 
 export function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [refreshingProject, setRefreshingProject] = useState(false);
   const [target, setTarget] = useState<Target | null>(targetFromHash);
+  const { live: simulation, enable: enableSimulation, disable: disableSimulation } = useLiveSimulation(target?.kind === "assembly" ? target : null);
   const [savedView, setSavedView] = useState<SavedViewState | null>(null);
   const [traces, setTraces] = useState<Record<string, Load<TraceData>>>({});
   const [assemblies, setAssemblies] = useState<Record<string, Load<AssemblyData>>>({});
@@ -297,14 +307,15 @@ export function App() {
   const assemblyData = compositeLoad?.status === "ok" ? compositeLoad.data : null;
   const cached = state?.status === "ok" && state.cached;
   const shapes = state?.status === "ok" ? state.shapes : null;
-  const assemblyParts = useMemo(
-    () => target?.kind === "assembly" && assemblyData !== null && selection.length > 0
-      ? assemblySelectionParts(assemblyData, selection) : [],
+  const selectedParts = useMemo(
+    () => assemblyData !== null && selection.length > 0
+      ? assemblySelectionParts(assemblyData, selection, target?.kind === "file") : [],
     [target, assemblyData, selection],
   );
   useEffect(() => {
-    for (const name of assemblyParts) if (!requested.current.has(name)) void load({ kind: "part", name });
-  }, [assemblyParts, load]);
+    if (target?.kind !== "assembly") return;
+    for (const name of selectedParts) if (!requested.current.has(name)) void load({ kind: "part", name });
+  }, [target, selectedParts, load]);
   const index = trace === null ? null : treeIndex(trace);
   const collapsed = (activePart !== null && collapsedBy[activePart]) || NO_NODES;
   const related = useMemo(
@@ -326,15 +337,6 @@ export function App() {
       }
       const entities = selection.flatMap((item) => item.kind === "entity" ? [item.path] : []);
       // Entity picks retain their exact path; maker focus is only for the Details panel.
-      for (const path of entities) {
-        const maker = nodeForPick(trace, path);
-        if (maker === null) continue;
-        const own = sceneFocus(trace, index, maker);
-        for (const [leaf, state] of Object.entries(own.states)) {
-          const previous = states[leaf] ?? [0, 0];
-          states[leaf] = [previous[0] > state[0] ? previous[0] : state[0], previous[1] > state[1] ? previous[1] : state[1]];
-        }
-      }
       return {
         states,
         lit: [...new Set([...focuses.flatMap((own) => own.lit), ...entities])],
@@ -506,11 +508,12 @@ export function App() {
   );
 
   // The hub's calls read these: this render's, still current once a call has waited for a load or a render.
-  const live = useRef({ target, index, assemblyData, selectIn, onPick, project, traces, selection });
-  live.current = { target, index, assemblyData, selectIn, onPick, project, traces, selection };
+  const live = useRef({ target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation });
+  live.current = { target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation };
 
   const handleHub = useCallback(
     async (request: HubRequest): Promise<unknown> => {
+      if (live.current.simulation.enabled) throw new Error("Live simulation is enabled. Return to CAD view before using CAD harness actions, exact measurements or snapshots.");
       const viewer = () => {
         if (view.current === null) throw new Error("Nothing is rendered");
         return view.current;
@@ -627,10 +630,10 @@ export function App() {
 
   const tabState: TabState = {
     target,
-    status: state?.status ?? "none",
-    error: state?.status === "error" ? state.error : null,
-    shapes,
-    selection,
+    status: simulation.enabled ? "error" : state?.status ?? "none",
+    error: simulation.enabled ? "Live simulation is enabled; measured poses are not static CAD geometry. Return to CAD view for harness actions." : state?.status === "error" ? state.error : null,
+    shapes: simulation.enabled ? null : shapes,
+    selection: simulation.enabled ? [] : selection,
     partShapes: Object.fromEntries(Object.entries(traces).flatMap(([part, load]) =>
       load.status === "ok" && load.shapes !== null ? [[part, load.shapes]] : [])),
     hidden: [...hiddenInstances],
@@ -681,6 +684,7 @@ export function App() {
 
   const copyReference = async (state: TabState) => {
     try {
+      if (live.current.simulation.enabled) throw new Error("Return to CAD view before copying a CAD selection snapshot. Measured simulation poses have no static CAD provenance.");
       if ((state.target?.kind === "assembly" || state.target?.kind === "file") && assemblyData !== null) {
         const parts = assemblySelectionParts(assemblyData, state.selection, state.target.kind === "file");
         const pending = parts.flatMap((part) => {
@@ -704,6 +708,7 @@ export function App() {
         }
         state = { ...state, partShapes };
       }
+      if (live.current.simulation.enabled) throw new Error("Live simulation started before the CAD snapshot finished. Return to CAD view and copy again.");
       const { text } = await createReference(hub.tab, state);
       await copyText(text);
       const label = state.selection.length === 0 ? "entire target" : `${state.selection.length} selected item(s)`;
@@ -738,6 +743,7 @@ export function App() {
 
   const rebuild = async () => {
     if (target === null) return;
+    disableSimulation();
     setRefreshingProject(true);
     try {
       const loaded = await fetchProject();
@@ -765,16 +771,13 @@ export function App() {
   }
 
   const title = target?.kind === "file" ? target.path.replaceAll("/", " / ") : target?.name;
-  const sceneData = target?.kind === "part" ? (trace?.scene.data ?? null) : (assemblyData?.scene.data ?? null);
+  const sceneData = simulation.enabled && simulation.scene !== null ? simulation.scene.scene.data
+    : target?.kind === "part" ? (trace?.scene.data ?? null) : (assemblyData?.scene.data ?? null);
 
   const partView = target?.kind === "part";
   const assemblyView = target?.kind === "assembly";
-  // In an assembly, the part shown selected in both lists: the one lit, or the part of the selected instance (a group
-  // is of no one part).
-  const markedPart =
-    assemblyView && assemblyData !== null
-      ? (litPart ?? (instance === null ? null : (assemblyData.scene.part_of?.[instance] ?? null)))
-      : null;
+  // Both part lists follow actual selection ownership, not the last focus (which can be toggled off).
+  const markedPart = selectedParts.at(-1) ?? null;
   // A part, a file's parts or an assembly share the sidebar with what they list: features, parts and instances.
   const featurePane = target !== null;
   const showDetails = trace !== null && index !== null && (partView || selected !== null);
@@ -807,13 +810,13 @@ export function App() {
           className="icon-button"
           aria-label="Copy standalone selection snapshot"
           data-action="copy-snapshot"
-          disabled={target === null || state?.status === "loading"}
+          disabled={simulation.enabled || target === null || state?.status === "loading"}
           onClick={() => void copyReference(tabState)}
           title="Copy a standalone snapshot of all selected items (no MCP lookup needed). C copies the selection; when empty, C uses pointed context. Ctrl/Cmd-click toggles; Shift-click adds; Escape clears."
         >
           <Icon name="links" />
         </button>
-        <ExportMenu target={target} title={title} shown={exportShown} />
+        <ExportMenu target={target} title={title} shown={exportShown} simulation={target?.kind === "assembly" && (project?.simulations.includes(target.name) ?? false)} />
         <button
           className="primary"
           disabled={target === null || refreshingProject || state?.status === "loading"}
@@ -838,7 +841,7 @@ export function App() {
             traces={traces}
             assemblyLoads={assemblies}
             files={files}
-            marked={markedPart}
+            marked={selectedParts}
             onSelect={setTarget}
           />
         </div>
@@ -852,6 +855,14 @@ export function App() {
               onChange={setPartsHeight}
             />
             <div className="sidebar-tree">
+              {simulation.enabled && (
+                <section className="simulation-scene-tree" aria-label="Simulation adapter scene">
+                  <h3>Live simulation · adapter scene</h3>
+                  <p className="muted">Measured TF and joint states move adapter nodes. CAD provenance and entity picking are disabled.</p>
+                  {simulation.scene === null ? <p>{simulation.error ?? "Loading adapter geometry…"}</p>
+                    : <ul><SimulationSceneNode node={simulation.scene.scene.data.shapes} /></ul>}
+                </section>
+              )}
               {partView && trace && index && trace.roots.length > 0 && (
                 <FeatureTree
                   trace={trace}
@@ -892,7 +903,7 @@ export function App() {
                   onOpen={(name) => setTarget({ kind: "part", name })}
                 />
               )}
-              {assemblyView && assemblyData && (
+              {assemblyView && assemblyData && !simulation.enabled && (
                 <AssemblyPane
                   name={target.name}
                   data={assemblyData}
@@ -900,6 +911,7 @@ export function App() {
                   hidden={hiddenInstances}
                   instance={instance}
                   marked={markedPart}
+                  selectedParts={selectedParts}
                   selectedPaths={new Set(selection.flatMap((item) => item.kind === "instance" ? [item.path] : []))}
                   onVisibility={setVisibility}
                   onSelectInstance={(id, mode = "replace", range) => {
@@ -933,13 +945,14 @@ export function App() {
       <main className="view">
         {target !== null && (
           <ViewBar target={target} project={project}>
+            {simulation.enabled && <strong className="simulation-view-title">Live simulation · {simulation.status} · measured world poses</strong>}
             {partView && trace && (
               <span className="stats">
                 {trace.ops.length} ops · {trace.result.attributed}/{trace.result.faces} faces traced · built in{" "}
                 {trace.build_seconds.toFixed(2)} s{cached && " · from cache"}
               </span>
             )}
-            {assemblyData && (
+            {assemblyData && !simulation.enabled && (
               <span className="stats">
                 {countLeaves(assemblyData.scene.data.shapes)} {target.kind === "file" ? "parts" : "instances"} · built
                 in {assemblyData.build_seconds.toFixed(2)} s{cached && " · from cache"}
@@ -951,18 +964,19 @@ export function App() {
           <CadView
             ref={view}
             data={sceneData}
-            focus={focus}
-            hover={hover}
-            onPick={onPick}
-            describe={describeHover}
-            shapes={shapes}
-            selectionPaths={selection.flatMap((item) => item.kind === "entity" ? [item.path] : [])}
+            focus={simulation.enabled ? null : focus}
+            hover={simulation.enabled ? null : hover}
+            onPick={simulation.enabled ? undefined : onPick}
+            describe={simulation.enabled ? undefined : describeHover}
+            shapes={simulation.enabled ? null : shapes}
+            selectionPaths={simulation.enabled ? [] : selection.flatMap((item) => item.kind === "entity" ? [item.path] : [])}
             onDropPick={(path) => setSelection((current) => current.filter((item) => item.kind !== "entity" || item.path !== path))}
             onClearPicks={() => setSelection((current) => current.filter((item) => item.kind !== "entity"))}
             onClearSelection={clearSelection}
             viewScope={project === null ? null : JSON.stringify([project.root, project.target])}
             viewTarget={target}
             sceneState={{ hidden: [...hiddenInstances], selection, selected, focusPart, instance, litPart }}
+            simulation={simulation}
             onRestoreView={(saved) => {
               setSavedView(saved);
               setTarget((current) => current !== null && keyOf(current) === keyOf(saved.target) ? current : saved.target);
@@ -978,6 +992,10 @@ export function App() {
               <h2>{state.error}</h2>
               {state.log && <pre>{state.log}</pre>}
             </div>
+          )}
+          {project !== null && target?.kind === "assembly" && project.simulations.includes(target.name) && (
+            <SimulationControls key={JSON.stringify([project.root, project.target, target.name])} target={target}
+              live={simulation} onEnableLive={enableSimulation} onDisableLive={disableSimulation} />
           )}
         </div>
       </main>

@@ -13,11 +13,11 @@ interface Props {
   /** The project's parts, in its order: the Parts tab lists those the assembly has instances of in this order. */
   parts: string[];
   hidden: ReadonlySet<string>;
-  /** The selected instance-tree node; the part whose instances are all lit; the part shown selected: the lit one, or
-   * the selected instance's. */
+  /** The focused instance-tree node and the last selected owning part, used for navigation and scrolling. */
   instance: string | null;
   marked: string | null;
   selectedPaths: ReadonlySet<string>;
+  selectedParts: readonly string[];
   onVisibility: (leaves: string[], visible: boolean) => void;
   onSelectInstance: (id: string, mode?: SelectionMode, range?: string[]) => void;
   onSelectPart: (part: string, mode?: SelectionMode, range?: string[]) => void;
@@ -29,7 +29,7 @@ const TABS = ["parts", "instances"] as const;
 
 /** An assembly's sidebar: its parts (every instance of each at once) or its instances as built. */
 export function AssemblyPane(props: Props) {
-  const { name, data, parts, hidden, instance, marked, selectedPaths, onVisibility, onSelectInstance, onSelectPart } = props;
+  const { name, data, parts, hidden, instance, marked, selectedPaths, selectedParts, onVisibility, onSelectInstance, onSelectPart } = props;
   const { onHover, onOpen } = props;
   const [tab, setTab] = usePersistentChoice("cadiste.assembly-tab", TABS);
   const root = data.scene.data.shapes;
@@ -68,7 +68,7 @@ export function AssemblyPane(props: Props) {
           data={data}
           parts={parts}
           hidden={hidden}
-          selectedPaths={selectedPaths}
+          selectedParts={selectedParts}
           marked={marked}
           onVisibility={onVisibility}
           onSelect={onSelectPart}
@@ -95,7 +95,7 @@ interface PartsProps {
   data: AssemblyData;
   parts: string[];
   hidden: ReadonlySet<string>;
-  selectedPaths: ReadonlySet<string>;
+  selectedParts: readonly string[];
   onVisibility: (leaves: string[], visible: boolean) => void;
   marked: string | null;
   onSelect: (part: string, mode?: SelectionMode, range?: string[]) => void;
@@ -103,7 +103,7 @@ interface PartsProps {
 }
 
 /** The assembly's parts, each with its instances: hide or show them all, light them all, open the part. */
-function AssemblyParts({ data, parts, hidden, selectedPaths, marked, onVisibility, onSelect, onOpen }: PartsProps) {
+function AssemblyParts({ data, parts, hidden, selectedParts, marked, onVisibility, onSelect, onOpen }: PartsProps) {
   const [filter, setFilter] = useState("");
   const list = useRef<HTMLUListElement>(null);
   const anchor = useRef<string | null>(null);
@@ -161,7 +161,7 @@ function AssemblyParts({ data, parts, hidden, selectedPaths, marked, onVisibilit
         {shown.map(({ part, leaves }) => {
           const showing = leaves.filter((leaf) => !hidden.has(leaf)).length;
           const visible = showing > 0;
-          const selected = leaves.length > 0 && leaves.every((leaf) => selectedPaths.has(leaf));
+          const selected = selectedParts.includes(part);
           return (
             <li key={part} role="presentation">
               <div

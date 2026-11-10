@@ -1,15 +1,16 @@
-"""Command line: ``cadiste trace | export | mesh | save | serve | mcp``."""
+"""Command line: ``cadiste trace | export | mesh | save | gazebo | controls | serve | mcp``."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
 import json
+import shlex
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from build123d import export_brep, export_step, export_stl
 from build123d.topology import Compound, Shape
@@ -21,6 +22,9 @@ from .project import part_definitions
 from .provenance import OriginPath, Provenance, unlocated_key
 from .trace import Trace, tracing
 from .tree import feature_tree, op_label, render
+
+if TYPE_CHECKING:
+    from .simulation import Simulation
 
 
 def _build(target: str, args: list[str]) -> tuple[Trace, Shape, float]:
@@ -166,6 +170,61 @@ def cmd_save(args: argparse.Namespace) -> None:
             raise SystemExit(f"could not write {args.output} as {args.format.upper()}")
 
 
+def _simulation(args: argparse.Namespace) -> Simulation:
+    from .simulation import Simulation
+
+    with contextlib.redirect_stdout(sys.stderr):
+        build = _load(args.target)
+        if not callable(build):
+            raise SystemExit(f"{args.target} is not callable")
+        result = build(*args.args)
+    if not isinstance(result, Simulation):
+        raise SystemExit(f"{args.target} returned {type(result).__name__}, not a cadiste.simulation.Simulation")
+    return result
+
+
+def cmd_controls(args: argparse.Namespace) -> None:
+    from .simulation import control_config
+
+    with contextlib.redirect_stdout(sys.stderr):
+        data = control_config(_simulation(args))
+    _write_json(data, args.output)
+
+
+def cmd_simulation_scene(args: argparse.Namespace) -> None:
+    from .simulation import simulation_scene
+
+    started = time.perf_counter()
+    with contextlib.redirect_stdout(sys.stderr):
+        data = simulation_scene(_simulation(args))
+    data["build_seconds"] = time.perf_counter() - started
+    _write_json(data, args.output)
+
+
+def cmd_gazebo(args: argparse.Namespace) -> None:
+    from .simulation import launch_bundle, write_bundle
+
+    result = _simulation(args)
+    try:
+        launch = write_bundle(result, args.output)
+        print(f"Gazebo bundle: {launch.parent}")
+        print(f"Launch: ros2 launch {launch}")
+        print(f"Control topics: {launch.parent / 'control.json'}")
+        if args.launch:
+            process = launch_bundle(launch.parent)
+            print(f"Gazebo log: {launch.parent / 'gazebo.log'}")
+            try:
+                status = process.wait()
+            except KeyboardInterrupt:
+                process.terminate()
+                process.wait()
+                raise SystemExit(130) from None
+            if status:
+                raise SystemExit(f"ros2 launch exited with status {status}; see {launch.parent / 'gazebo.log'}")
+    except (ValueError, TypeError, RuntimeError, OSError) as error:
+        raise SystemExit(f"cadiste gazebo: {error}") from error
+
+
 def _environment(pairs: list[str]) -> dict[str, str]:
     environment = {}
     for pair in pairs:
@@ -192,6 +251,13 @@ def _assemblies(entries: list[str]) -> dict[str, str]:
     return assemblies
 
 
+def _ros_command(value: str) -> tuple[str, ...]:
+    command = tuple(shlex.split(value))
+    if not command:
+        raise argparse.ArgumentTypeError("ROS command must contain an executable")
+    return command
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     from .cache import TraceCache
     from .project import source_roots
@@ -199,15 +265,25 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     environment = _environment(args.trace_env)
     assemblies = _assemblies(args.assembly)
+    simulations = _assemblies(args.simulation)
+    unknown = simulations.keys() - assemblies.keys()
+    if unknown:
+        raise SystemExit(f"simulation names must match --assembly names; unknown: {', '.join(sorted(unknown))}")
     cache = None
     if not args.no_cache:
         targets = [args.target, *([args.parts] if args.parts else []), *assemblies.values()]
         salt = json.dumps({"target": args.target, "args": args.args, "env": environment}, sort_keys=True)
         cache = TraceCache(args.cache_dir.resolve(), source_roots(targets), salt)
-    project = Project(args.target, tuple(args.args), None, assemblies, environment, parts_target=args.parts)
+    project = Project(
+        args.target, tuple(args.args), None, assemblies, environment,
+        parts_target=args.parts, simulations=simulations,
+    )
     project.catalog(refresh=True)
     # The lockfile goes where `cadiste mcp` looks for it, with or without a cache.
-    serve(project, args.host, args.port, cache, lockfile=args.cache_dir.resolve() / "serve.json")
+    serve(
+        project, args.host, args.port, cache, lockfile=args.cache_dir.resolve() / "serve.json",
+        ros_command=args.ros_command,
+    )
 
 
 def cmd_mcp(args: argparse.Namespace) -> None:
@@ -272,6 +348,27 @@ def main(argv: list[str] | None = None) -> None:
     save.add_argument("--label", help="name of the shape written (of the group made with --each)")
     save.set_defaults(run=cmd_save)
 
+    gazebo = commands.add_parser("gazebo", help="export an articulated Simulation for ROS 2 Jazzy / Gazebo Harmonic")
+    gazebo.add_argument("--output", type=Path, required=True, help="directory for the relocatable simulation bundle")
+    gazebo.add_argument("--launch", action="store_true", help="also start native ros2 launch (requires sourced ROS 2)")
+    gazebo.add_argument("target", help="module:callable returning cadiste.simulation.Simulation (not traced)")
+    gazebo.add_argument("args", nargs="*", help="string arguments passed to the callable")
+    gazebo.set_defaults(run=cmd_gazebo)
+
+    controls = commands.add_parser("controls", help="discover a Simulation's ROS 2 controls without exporting meshes")
+    controls.add_argument("--output", type=Path, help="file to write (default: stdout)")
+    controls.add_argument("target", help="module:callable returning cadiste.simulation.Simulation")
+    controls.add_argument("args", nargs="*", help="string arguments passed to the callable")
+    controls.set_defaults(run=cmd_controls)
+
+    scene = commands.add_parser(
+        "simulation-scene", help="build a Simulation's CAD scene with explicit live link mappings"
+    )
+    scene.add_argument("--output", type=Path, help="file to write (default: stdout)")
+    scene.add_argument("target", help="module:callable returning cadiste.simulation.Simulation")
+    scene.add_argument("args", nargs="*", help="string arguments passed to the callable")
+    scene.set_defaults(run=cmd_simulation_scene)
+
     serve = commands.add_parser("serve", help="serve the viewer; every request traces a fresh build")
     serve.add_argument("target", help="module:callable returning the shape")
     serve.add_argument("args", nargs="*", help="string arguments passed to the callable (without --parts)")
@@ -286,6 +383,21 @@ def main(argv: list[str] | None = None) -> None:
         default=[],
         metavar="[NAME=]MODULE:CALLABLE",
         help="an assembly, viewed (not traced) on its own; repeat for several",
+    )
+    serve.add_argument(
+        "--simulation",
+        action="append",
+        default=[],
+        metavar="[NAME=]MODULE:CALLABLE",
+        help="Simulation factory for a matching --assembly name; enables Gazebo export, launch "
+        "and ROS controls with measured live feedback (repeatable)",
+    )
+    serve.add_argument(
+        "--ros-command",
+        type=_ros_command,
+        default=("ros2",),
+        metavar="COMMAND",
+        help="ROS command prefix, e.g. 'docker exec -i cadiste-ros2 /ros_entrypoint.sh ros2' (default: ros2)",
     )
     serve.add_argument(
         "--trace-env",

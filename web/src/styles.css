@@ -1917,3 +1917,304 @@ body[data-theme] .cad-view {
   color: var(--fg);
   white-space: pre-wrap;
 }
+
+/* Adapter-driven ROS controls float over the viewer without blocking the rest of it. */
+.simulation-controls {
+  position: absolute;
+  z-index: 30;
+  top: 12px;
+  right: 12px;
+  width: min(420px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.simulation-controls-trigger {
+  flex: none;
+  align-self: flex-end;
+  pointer-events: auto;
+}
+
+.simulation-controls-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+  pointer-events: auto;
+  user-select: text;
+}
+
+.simulation-controls-unavailable {
+  padding: 10px 12px;
+  gap: 8px;
+}
+
+.simulation-controls-unavailable p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.simulation-controls-header,
+.simulation-controls-actions,
+.simulation-joint-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.simulation-controls-header,
+.simulation-controls-actions {
+  flex: none;
+  padding: 10px 12px;
+}
+
+.simulation-controls-header {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+.simulation-controls-header h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.simulation-controls-warning {
+  flex: none;
+  margin: 10px 12px 0;
+  color: var(--intersect);
+  line-height: 1.5;
+}
+
+.simulation-stop-all {
+  border-color: var(--subtract);
+}
+
+.simulation-controls-body {
+  flex: 1;
+  min-height: 60px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 0 12px 12px;
+}
+
+.simulation-controls-model,
+.simulation-controls-body > p {
+  margin: 8px 0;
+  line-height: 1.5;
+}
+
+.simulation-joint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.simulation-joint legend {
+  max-width: 100%;
+  padding: 0 5px;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.simulation-topic,
+.simulation-controls-model,
+.simulation-controls-body > .muted {
+  overflow-wrap: anywhere;
+}
+
+.simulation-joint-limits {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.simulation-joint input[type="number"] {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.simulation-joint input[aria-invalid="true"] {
+  border-color: var(--subtract);
+}
+
+.simulation-joint input[type="range"] {
+  width: 100%;
+  margin: 4px 0;
+  accent-color: var(--accent);
+}
+
+.simulation-controls-error {
+  color: var(--subtract);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.simulation-controls-status {
+  flex: none;
+  max-height: min(24vh, 160px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.simulation-controls-status p {
+  margin: 6px 0;
+  line-height: 1.4;
+}
+
+.simulation-mode-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.simulation-live-status {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.simulation-live-status.state-live {
+  color: var(--add);
+  border-color: var(--add);
+}
+
+.simulation-live-status.state-stale,
+.simulation-live-status.state-waiting,
+.simulation-live-status.state-loading {
+  color: var(--intersect);
+}
+
+.simulation-live-status.state-error,
+.simulation-live-status.state-disconnected {
+  color: var(--subtract);
+  border-color: var(--subtract);
+}
+
+.simulation-live-toggle.on {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.simulation-feedback {
+  margin: 12px 0;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.simulation-feedback h3,
+.simulation-scene-tree h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.simulation-feedback p {
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.simulation-joint-measurements summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.simulation-measurements-scroll {
+  max-height: 220px;
+  margin-top: 8px;
+  overflow: auto;
+}
+
+.simulation-measured-joints thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
+.simulation-measured-joints {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.simulation-measured-joints th,
+.simulation-measured-joints td {
+  padding: 6px 3px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+}
+
+.simulation-measured-joints th:first-child {
+  text-align: left;
+  overflow-wrap: anywhere;
+  max-width: 130px;
+}
+
+.simulation-measured-joints small {
+  display: block;
+  margin-top: 3px;
+  font-weight: normal;
+  color: var(--muted);
+}
+
+.simulation-scene-tree {
+  padding: 12px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.simulation-scene-tree ul {
+  padding-left: 16px;
+  list-style: none;
+}
+
+.simulation-scene-tree li {
+  margin: 7px 0;
+}
+
+.simulation-view-title {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.simulation-view-note {
+  position: absolute;
+  bottom: 65px;
+  left: 12px;
+  max-width: min(560px, calc(100% - 24px));
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--intersect);
+  background: var(--panel);
+  font-size: 12px;
+  pointer-events: none;
+}

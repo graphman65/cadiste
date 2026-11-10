@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { Target } from "../App";
-import { type ExportFormat, fetchExport, openInBambuStudio, TraceFailure } from "../api";
+import { type ExportFormat, fetchExport, fetchGazebo, openInBambuStudio, openInGazebo, TraceFailure } from "../api";
 import { Icon } from "./Icon";
 
 const FORMATS: { format: ExportFormat; label: string; hint: string }[] = [
@@ -12,8 +12,9 @@ const FORMATS: { format: ExportFormat; label: string; hint: string }[] = [
 
 type State =
   | { status: "idle" }
-  | { status: "exporting"; format: ExportFormat }
-  | { status: "launching" }
+  | { status: "exporting"; format: ExportFormat | "gazebo" }
+  | { status: "launching"; app: "Bambu Studio" | "Gazebo" }
+  | { status: "launched"; log: string }
   | { status: "error"; error: string; log?: string };
 
 /** Hands a file to the browser as a download. */
@@ -34,16 +35,21 @@ export interface Shown {
 }
 
 /**
- * The top bar's Export button: what is open built again and downloaded or opened in Bambu Studio on the server;
- * in a folder's view, only the parts shown.
+ * The top bar's Export button: CAD downloads and server-local application handoffs.
+ * A configured assembly also exports an articulated Gazebo/ROS 2 bundle.
  */
-export function ExportMenu({ target, title, shown }: { target: Target | null; title: string | undefined; shown: Shown | null }) {
+export function ExportMenu({ target, title, shown, simulation }: {
+  target: Target | null;
+  title: string | undefined;
+  shown: Shown | null;
+  simulation: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<State>({ status: "idle" });
   const root = useRef<HTMLDivElement>(null);
 
   // A failure is about the target it was for.
-  useEffect(() => setState((current) => (current.status === "error" ? { status: "idle" } : current)), [target]);
+  useEffect(() => setState((current) => (current.status === "error" || current.status === "launched" ? { status: "idle" } : current)), [target]);
 
   useEffect(() => {
     if (!open) return;
@@ -83,10 +89,32 @@ export function ExportMenu({ target, title, shown }: { target: Target | null; ti
   const launch = () => {
     if (target === null || pending || shown?.parts.length === 0) return;
     setOpen(false);
-    setState({ status: "launching" });
+    setState({ status: "launching", app: "Bambu Studio" });
     openInBambuStudio(target, shown?.parts)
       .then(() => setState({ status: "idle" }))
       .catch(fail);
+  };
+
+  const gazebo = (launch: boolean) => {
+    if (target === null || pending || !simulation) return;
+    setOpen(false);
+    if (launch) {
+      setState({ status: "launching", app: "Gazebo" });
+      openInGazebo(target)
+        .then(({ log }) => {
+          setState({ status: "launched", log });
+          setOpen(true);
+        })
+        .catch(fail);
+    } else {
+      setState({ status: "exporting", format: "gazebo" });
+      fetchGazebo(target)
+        .then(({ file, name }) => {
+          download(file, name);
+          setState({ status: "idle" });
+        })
+        .catch(fail);
+    }
   };
   return (
     <div className="export" ref={root}>
@@ -95,10 +123,10 @@ export function ExportMenu({ target, title, shown }: { target: Target | null; ti
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((shown) => !shown)}
-        title={title ? `Export ${title} as a CAD file or open in Bambu Studio` : "Export what is open as a CAD file or open in Bambu Studio"}
+        title={title ? `Export ${title} or open in an external application` : "Export what is open or open in an external application"}
       >
         {pending ? <span className="spinner" /> : <Icon name="download" />}
-        {state.status === "exporting" ? `Exporting ${state.format.toUpperCase()}…` : state.status === "launching" ? "Launching Bambu Studio…" : "Export"}
+        {state.status === "exporting" ? `Exporting ${state.format.toUpperCase()}…` : state.status === "launching" ? `Launching ${state.app}…` : "Export"}
       </button>
       {open && (
         <div className="export-menu" role="menu">
@@ -127,6 +155,21 @@ export function ExportMenu({ target, title, shown }: { target: Target | null; ti
             <span className="export-label">Open in Bambu Studio</span>
             <span className="export-hint">Build a STEP file and open Bambu Studio on the machine running Cadiste</span>
           </button>
+          {simulation && (
+            <>
+              <button role="menuitem" className="export-format" disabled={pending} onClick={() => gazebo(false)}>
+                <span className="export-label">Gazebo + ROS 2 bundle</span>
+                <span className="export-hint">Articulated SDF model, collision geometry, meshes, world and ROS 2 launch file</span>
+              </button>
+              <button role="menuitem" className="export-format" disabled={pending} onClick={() => gazebo(true)}>
+                <span className="export-label">Open in Gazebo (ROS 2)</span>
+                <span className="export-hint">Start Gazebo and ROS 2 bridges on the machine running Cadiste</span>
+              </button>
+            </>
+          )}
+          {state.status === "launched" && (
+            <div className="export-note">ROS 2 launcher started. Gazebo loading and runtime errors are logged in {state.log}</div>
+          )}
           {shown?.parts.length === 0 && <div className="export-error">Every part is hidden: show some to export them.</div>}
           <div className="export-note">Built anew, not traced: the model's own part cache may serve.</div>
           {state.status === "error" && (

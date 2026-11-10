@@ -67,6 +67,8 @@ interface Props {
   /** Whether the section tool is open: the scene cut along a plane. */
   sectioning: boolean;
   onSection: (sectioning: boolean) => void;
+  /** Measured simulation mode cannot offer tools that read static CAD geometry. */
+  cadActions?: boolean;
   children?: ReactNode;
 }
 
@@ -81,6 +83,7 @@ export function ViewToolbar({
   onExplode,
   sectioning,
   onSection,
+  cadActions = true,
   children,
 }: Props) {
   return (
@@ -120,6 +123,7 @@ export function ViewToolbar({
       <button
         className={measuring ? "icon-button on" : "icon-button"}
         aria-pressed={measuring}
+        disabled={!cadActions}
         onClick={() => onMeasure(!measuring)}
         title="Measure selected faces, edges and vertices. Click replaces; Ctrl/Cmd-click toggles; Shift-click adds. All picks are included in standalone snapshots (C)."
       >
@@ -128,6 +132,7 @@ export function ViewToolbar({
       <button
         className={exploded ? "icon-button on" : "icon-button"}
         aria-pressed={exploded}
+        disabled={!cadActions}
         onClick={() => onExplode(!exploded)}
         title="Explode: draw the parts apart, away from the scene's centre"
       >
@@ -136,6 +141,7 @@ export function ViewToolbar({
       <button
         className={sectioning ? "icon-button on" : "icon-button"}
         aria-pressed={sectioning}
+        disabled={!cadActions}
         onClick={() => onSection(!sectioning)}
         title="Section: cut the scene along a flat face or a principal plane, and move the cut"
       >
@@ -144,6 +150,7 @@ export function ViewToolbar({
       <span className="divider" />
       <button
         className={settings.tools ? "icon-button on" : "icon-button"}
+        disabled={!cadActions}
         aria-pressed={settings.tools}
         onClick={() => onChange({ tools: !settings.tools })}
         title="Viewer tools: clipping, measuring, explode, zebra"

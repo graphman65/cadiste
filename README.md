@@ -48,7 +48,7 @@ geometry subprocesses ignore existing bytecode caches, including source edits of
 ```sh
 cd ../pipecrawler
 uv run --with-editable ../cadiste cadiste serve pipecrawler.catalog:build_part --parts pipecrawler.catalog:PARTS \
-  --assembly "Pipe crawler=pipecrawler.assembly:build_assembly" --trace-env PIPECRAWLER_CACHE_DIR=
+  --assembly "Pipe crawler=pipecrawler.assembly:build_scene" --trace-env PIPECRAWLER_CACHE_DIR=
 ```
 
 The project's part cache is turned off for traces (a part loaded from a BREP file was never built, so there is
@@ -71,9 +71,10 @@ Rebuild always builds again. One entry is kept per part; catalog discovery above
   - a sketch element (`Polygon`, `Circle`, a `BuildLine`'s `Line`) shows on its sketch;
   - a function group or a nested part builder lights the faces of every operation in it.
 
-  Clicking a face, edge or vertex selects that exact entity and shows its creating feature in Details when
-  available; Ctrl/Cmd-click toggles it and Shift-click adds it to the selection. Clicking a sketch or an element
-  focuses its feature. Hovering shows a card by the pointer: the operation, sketch or assembly instance under it,
+  Clicking a face, edge or vertex selects only that exact entity and shows its creating feature in Details when
+  available, without revealing the feature's construction sketches; select the operation in the feature tree to
+  inspect those. Ctrl/Cmd-click toggles the entity and Shift-click adds it to the selection. Clicking a sketch or
+  an element focuses its feature. Hovering shows a card by the pointer: the operation, sketch or assembly instance under it,
   then the face, edge or vertex with three-cad-viewer's mesh measurements (area, length, radius, centre, ends).
   Radius readouts also show the corresponding diameter, with the same approximation marker and millimetre units.
 - **Saved views** (in the view toolbar): arrange an overall or detailed view, enter a name, then **Save current
@@ -115,10 +116,11 @@ Rebuild always builds again. One entry is kept per part; catalog discovery above
     group: all of its instances), the eye hides or shows it; clicking an instance in the view selects its row. The
     filter narrows the rows to matching instances.
 
-  The part selected (in the Parts tab, or the part of the instance selected in the Instances tab or the view) is
-  marked in both the Parts tab and the part list above, each scrolled to it; the part list opens the folders above
-  it. The head counts the hidden instances, with **Show all**. Each assembly is opened from its entry atop the part
-  list (`#assembly=NAME`; `#assembly` opens the first).
+  Parts owning selected faces, edges, vertices or instances are marked in both the Parts tab and the part list
+  above, including when only one of a part's repeated instances is selected. Ctrl/Cmd-click additions and removals
+  update both lists; clearing the selection clears their marks. The last marked part is scrolled into view, and
+  the part list opens its folders. The head counts the hidden instances, with **Show all**. Each assembly is opened
+  from its entry atop the part list (`#assembly=NAME`; `#assembly` opens the first).
 - **Sidebar**: the part list has it to itself until a part is open, then shares it with the part's feature tree.
   Its width and the split are dragged and kept across reloads. Parts are in folders named after the package they
   are defined in (pipecrawler: `chassis`, `gears`, `omni_wheel`, ..., `electronics`), relative to the package all
@@ -132,10 +134,12 @@ Rebuild always builds again. One entry is kept per part; catalog discovery above
   the sidebar), each with its feature tree (their traces are fetched alongside, cached once made), its eye and its
   own **Open**; hovering a part's row highlights it in the view. Selecting a
   feature of one part lights its faces among the others, with its Details on the right; clicking a face in the
-  view selects the feature that made it, in whichever part. This needs the folder's build of a part to number its
-  faces like the part's trace (checked by face count; pipecrawler's cached and fresh builds list every face in the
-  same order). The folder's view has no sketches to show. Parts that occupy the same place (pipecrawler's front
-  and rear drive modules) overlap; hide some with their eye.
+  view selects the feature that made it, in whichever part. Selected entities and features also mark their owning
+  parts in the part list above, opening the folders and scrolling to the last marked part. This marking does not
+  depend on a part's trace being available. Feature lookup needs the folder's build of a part to number its faces
+  like the part's trace (checked by face count; pipecrawler's cached and fresh builds list every face in the same
+  order). The folder's view has no sketches to show. Parts that occupy the same place (pipecrawler's front and rear
+  drive modules) overlap; hide some with their eye.
 - **Feature tree**: builders (`Part body`, `Sketch relief`), the function calls that grouped their operations
   (`hinge_drum()`), and the operations with their mode (+ add, − subtract, ∩ intersect, ↻ replace, · private); the
   call site is in the tooltip. Arrow keys move and fold; double-click folds.
@@ -180,6 +184,226 @@ faces, edges and vertices, placed and numbered as the viewer has them, for `cadi
 model without the tracer and writes it as a CAD file (`GET /api/export?format=&kind=part&name=` | `kind=file&path=`,
 with `part=` repeated to keep only those of the folder's parts | `kind=assembly&name=` serves it); `--label` names the
 shape (the STEP product), `--each` builds one shape per argument and groups them under it, as a folder's view does.
+
+## Gazebo with ROS 2
+
+Cadiste exports **articulated SDF models for ROS 2 Jazzy / Gazebo Harmonic** (not Gazebo Classic).
+A simulation factory returns `cadiste.simulation.Simulation`: explicit links, joints, collision shapes and optional
+static environment links. CAD shapes and `Location` translations stay in millimetres; the exporter converts to
+metres, kilograms and kg·m², including each link's centre of mass and full inertia tensor. A supplied mass
+overrides density-based estimation. Joint limits and spring references are radians relative to the assembled
+CAD pose; axes are in each joint's frame. Geometry alone does not establish mates, motors or material properties,
+so ordinary assembly factories are not silently converted into a rigid or guessed robot.
+
+The pipe-crawler project supplies `pipecrawler.simulation:build_simulation`: four articulated chassis modules,
+three shared drive axles, two steering hubs, 48 passive rollers and three sprung hinges, with a separate hollow
+test pipe. Five motor-output-shaft inputs drive the physical joints through signed ideal ratios; idlers,
+pinions and exposed shafts animate from measured axle positions. Its `SimulationParams` exposes estimated
+masses, friction, spring dynamics and output-space effort-bounded velocity PI gains. These remain tunable
+estimates, **not calibrated hardware dynamics or validated locomotion**; see that project's simulation section.
+
+From the pipe-crawler checkout, with Cadiste installed in its environment:
+
+```sh
+uv pip install --python .venv/bin/python -e ../cadiste
+.venv/bin/cadiste gazebo --output out/gazebo pipecrawler.simulation:build_simulation
+```
+
+This builds without tracing or ROS dependencies. The relocatable directory contains `models/` (SDF, model
+configuration and visual/collision meshes), `world.sdf`, `bridge.yaml`, `control.json` and `sim.launch.py`.
+Mesh URIs are bundle-local `model://` references; the launch file preserves existing `GZ_SIM_RESOURCE_PATH`
+entries. Copy or unzip the complete directory onto a ROS machine; the runtime does not need Python CAD
+packages. Models with ideal transmissions or driven gear visuals additionally need the native system below.
+
+```sh
+# On a ROS 2 Jazzy installation (Ubuntu 24.04):
+sudo apt install ros-jazzy-ros-gz
+source /opt/ros/jazzy/setup.bash
+# For geared models, first install the IdealTransmission runtime described below.
+ros2 launch "$PWD/out/gazebo/sim.launch.py"
+# Headless:
+ros2 launch "$PWD/out/gazebo/sim.launch.py" gui:=false
+```
+
+`cadiste gazebo --output DIR [--launch] module:callable [ARG ...]` forwards string arguments to the simulation
+factory; `--launch` exports and starts native `ros2 launch`, with output retained in `DIR/gazebo.log`.
+Source the ROS setup **before starting Cadiste** when using that option or the viewer's local handoff.
+
+Register a simulation adapter under its assembly's name to expose both **Gazebo + ROS 2 bundle** (ZIP download)
+and **Open in Gazebo (ROS 2)** in the Export menu:
+
+```sh
+.venv/bin/cadiste serve pipecrawler.catalog:build_part --parts pipecrawler.catalog:PARTS \
+  --assembly 'Pipe crawler=pipecrawler.assembly:build_scene' \
+  --simulation 'Pipe crawler=pipecrawler.simulation:build_simulation'
+```
+
+`--simulation [NAME=]module:callable` is repeatable and must match a configured assembly. Simulation exports
+always include the adapter's whole robot/environment, independently of viewer visibility; folders and individual
+parts do not define a robot. `GET /api/gazebo?kind=assembly&name=...` downloads the bundle.
+`POST /api/gazebo` with JSON `{"target":{"kind":"assembly","name":"Pipe crawler"}}` exports and starts ROS on the
+**server machine**, not the browser's. Handoff bundles are retained under `<cache-dir>/gazebo/model-*/`;
+the response and menu identify `gazebo.log`. Success means the launcher started, not that Gazebo finished
+loading. Missing ROS packages are reported before a build. Remove old handoff directories after closing Gazebo;
+with `--no-cache` they last only until the Cadiste server stops.
+
+The launch file bridges `/clock`, `/tf`, `/<model>/joint_states` (`sensor_msgs/msg/JointState`) and each public
+command (`std_msgs/msg/Float64`, rad/s). Direct actuators use `/<model>/joints/<joint>/cmd_vel`; ideal motor inputs
+use `/<model>/motors/<motor>/cmd_vel`. Passive joints have no command topics.
+`control.json` lists the commands and limits. For example:
+
+```sh
+ros2 topic pub --rate 10 /pipe_crawler/motors/front_axle_0_motor/cmd_vel \
+  std_msgs/msg/Float64 '{data: 2.0}'
+ros2 topic echo /pipe_crawler/joint_states sensor_msgs/msg/JointState
+# Commands remain latched: send zero explicitly to stop.
+ros2 topic pub --once /pipe_crawler/motors/front_axle_0_motor/cmd_vel \
+  std_msgs/msg/Float64 '{data: 0.0}'
+```
+
+### Ideal motor transmissions
+
+`Simulation.transmissions` accepts `Transmission(name, joint, ratio)` entries: one named motor input for an
+actuated physical output joint. The signed ratio is **output coordinate / motor coordinate**. Output joint
+limits and PID gains stay in output units; motor speed limits divide by `abs(ratio)` and motor torque limits
+multiply by it. The native system relays `ratio * motor_velocity` to the existing torque-limited physical
+controller. It does not replace force-controlled dynamics with enforced joint motion.
+
+`Simulation.visuals` accepts `DrivenVisual(name, parent, joint, shape, pose, axis, multiplier)` entries.
+The parent is a physical robot link, `pose` is the model-absolute CAD zero spin frame, and `shape` is local to
+that frame. A unit axis in the spin frame rotates by `multiplier * measured_joint_position`. These are ordinary
+colored visuals in Gazebo, not extra collision bodies or massive servo joints. Cadiste derives their world
+poses from measured parent TF and joint state using the same bindings.
+
+Joint-state ROS messages remain physical measurements. The browser separately labels ideal motor q/v/effort
+derived from output samples (`q_motor = q_output / ratio`, `v_motor = v_output / ratio`,
+`torque_motor = ratio * torque_output`); missing samples remain unknown. No command integration or independent
+motor encoder is implied. Ideal gearing is lossless and massless: no tooth contact, backlash, separate rotor
+inertia or electrical motor model is added.
+
+Cadiste's ROS Docker image compiles and installs `libcadiste-ideal-transmission-system.so`. Rebuild the image
+and recreate older containers when upgrading. For a native Jazzy/Harmonic installation, from this checkout:
+
+```sh
+sudo apt install ros-jazzy-ros-gz build-essential cmake
+source /opt/ros/jazzy/setup.bash
+cmake -S gazebo/ideal_transmission -B .cache/ideal-transmission-build \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/.cache/ideal-transmission-runtime"
+cmake --build .cache/ideal-transmission-build --parallel 2
+cmake --install .cache/ideal-transmission-build
+export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/.cache/ideal-transmission-runtime/lib${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
+```
+
+Launch preserves existing plugin paths and searches installed `AMENT_PREFIX_PATH` prefixes' `lib` directories
+too. A geared bundle fails clearly if the system is absent. Projects without transmissions or driven visuals
+do not need this native system. Re-export old bundles after changing the transmission configuration.
+
+### Browser ROS 2 controls
+
+An assembly registered with `--simulation` has **ROS 2 Controls** and **Live simulation** buttons over the viewer.
+Selecting it discovers the adapter's metadata; the panel generates one control card per motor input or direct
+actuated joint: command name, topic, units, velocity/effort limits, a numeric setpoint and a slider. It uses the
+same metadata as the exported `control.json`; no crawler-specific joint names or topics are built into the UI.
+Passive physical joints have no command cards.
+
+**Live simulation** is disabled while its adapter configuration loads, including CAD construction. The badge
+shows **Loading simulation controls…** during that wait; the button enables automatically when ready. If loading
+fails, the error and **Retry controls** appear below the toggle without opening the panel, rather than silently
+leaving the button disabled. Large adapters can take several seconds to load.
+
+- Edit a setpoint, then click **Send**. Editing alone never publishes. Values must be finite and inside the
+  configured signed velocity limit, enforced in both browser and server.
+- **Stop** sends zero to one joint; **Stop all** sends zero to every configured joint, including joints whose
+  cards are scrolled out of view. Stop all remains available while Send is pending and is queued after older
+  sends, so an in-flight command cannot overwrite the requested stop.
+- **Reload controls** re-runs the adapter after a configuration edit. It does not export meshes, rebuild the
+  running simulator, or change the simulator's existing command. Relaunch Gazebo when its model configuration
+  changes. A failed refresh or changed metadata invalidates older browser configurations.
+
+Commands are **latched**: closing the panel, changing assemblies or disconnecting the browser does not stop
+motion. Use Stop explicitly. Setpoints and publish acknowledgements are not measured state; a successful
+publish does not prove motor response. Stop all is not an emergency stop.
+
+**Live simulation** subscribes to the configured joint-state, TF and clock topics through a separate ROS Python
+process. The panel shows measured position, velocity and optional effort for every configured joint (including
+passive joints), plus the model's world position, quaternion, simulation timestamp and data age. Expand
+**Joint measurements** for the scrollable table. Missing values remain unknown, not zero.
+
+The 3D view uses a separate scene built from the simulation adapter, with explicit link-to-scene mappings.
+Its **Robot (<model>)** and **Environment** groups are siblings: only robot link nodes are driven by measured
+world transforms, including base translation and rotation; static environment geometry stays fixed outside
+the robot group. This is not animation inferred from command setpoints. CAD provenance, entity picking,
+measurements, snapshots and saved views are unavailable in this mode. Turn Live simulation off to restore the
+normal CAD scene. Live updates continue with the controls panel closed; changing targets or disabling Live
+simulation closes the subscriber, not the simulator or its latched commands. Waiting, stale and error states
+are explicit; stale geometry retains the last measured pose rather than pretending to be current.
+
+Clock rewinds discard the previous epoch's samples. Gazebo Harmonic can stop publishing TF after a world reset
+even while clock and joint states continue. If feedback stays **waiting** with missing frames after a reset,
+restart Gazebo (or its Docker container); restarting Cadiste alone cannot restore an absent upstream TF stream.
+
+By default the server runs `ros2 topic pub --once` for commands and `ros2 run cadiste_ros feedback` for measured
+feedback, without importing ROS Python modules into Cadiste. Source ROS before starting `cadiste serve`, use the
+same ROS domain/network as the simulator, and keep its ROS bridge running. On a native ROS installation, add
+the helper package from the Cadiste checkout to the sourced environment before starting the server:
+
+```sh
+export AMENT_PREFIX_PATH="/path/to/cadiste/ros/cadiste_ros:${AMENT_PREFIX_PATH}"
+```
+
+The Docker image below includes this helper. Alternatively, `--ros-command 'COMMAND ...'` explicitly selects
+the ROS command prefix, such as `docker exec -i cadiste-ros2 /ros_entrypoint.sh ros2`. Keep `-i` for feedback:
+forwarded stdin controls the remote subscriber's lifetime. Arguments are parsed once at server startup and executed
+without a shell; the browser cannot change this runtime selection. Missing executables, subscriber discovery
+timeout and per-joint failures are shown in the panel. Stop all attempts every joint even when one publisher
+fails; its result lists successes and failures separately. Only the currently supported
+`std_msgs/msg/Float64` velocity-command schema is exposed. Panel text, topics and status messages can be selected
+and copied without enabling selection on the CAD canvas.
+
+`cadiste controls [--output FILE] module:simulation_factory [ARG ...]` discovers the metadata without mesh
+export/tessellation (the factory still builds its CAD objects). The HTTP interface is
+`GET /api/simulation/controls?kind=assembly&name=...`; its response includes a target-bound `config_id`.
+`POST /api/simulation/command` accepts JSON `{"target": {...}, "config_id": "...", "values": {"joint": 1.0}}`
+or `{"target": {...}, "config_id": "...", "stop_all": true}`. Topics, message types and executables cannot be
+supplied by the browser: routing comes only from the server's registered adapter snapshot.
+
+The approved metadata includes world/model frames, each link's rest pose and all joint names. The viewer gets
+its adapter scene from `GET /api/simulation/scene?kind=assembly&name=...&config_id=...` and measured snapshots
+over the `feedback` SSE event at `/api/simulation/feedback` with the same query. Both reject stale configuration
+IDs. `cadiste simulation-scene [--output FILE] module:simulation_factory [ARG ...]` builds the mapped scene
+without starting ROS.
+
+#### Docker runtime without host ROS
+
+Build the ROS 2 Jazzy / Gazebo Harmonic image from the Cadiste checkout:
+
+```sh
+docker build -t cadiste-ros2:jazzy -f docker/ros2/Dockerfile .
+```
+
+From the model checkout, export the current simulation and start the headless simulator and ROS bridge:
+
+```sh
+.venv/bin/cadiste gazebo --output out/gazebo pipecrawler.simulation:build_simulation
+docker run -d --name cadiste-ros2 --restart unless-stopped -e ROS_DOMAIN_ID=71 \
+  -v "$PWD/out/gazebo:/bundle:ro" cadiste-ros2:jazzy \
+  ros2 launch /bundle/sim.launch.py gui:=false
+.venv/bin/cadiste serve pipecrawler.catalog:build_part --parts pipecrawler.catalog:PARTS \
+  --assembly 'Pipe crawler=pipecrawler.assembly:build_scene' \
+  --simulation 'Pipe crawler=pipecrawler.simulation:build_simulation' \
+  --ros-command 'docker exec -i cadiste-ros2 /ros_entrypoint.sh ros2'
+```
+
+The prefix sends commands and reads measured feedback inside that existing container, using its ROS environment
+and domain. It works with any project's adapter; replace the factory and viewer targets above. The Cadiste
+server needs Docker access. Rebuild the image and recreate an older container to install an updated feedback helper.
+Use `docker logs cadiste-ros2` for simulator errors, `docker stop cadiste-ros2` to stop it, and
+`docker start cadiste-ros2` to start it again. Re-export and restart the container after model changes.
+The container is independent of Cadiste's lifetime and does not stop motors merely because a browser closes.
+This mode runs Gazebo headlessly; **Open in Gazebo (ROS 2)** remains a separate native desktop launch action.
+
+ROS launch/bridge conventions follow the upstream [Gazebo launch guide](https://gazebosim.org/docs/harmonic/ros2_launch_gazebo/)
+and [ros_gz_bridge topic mappings](https://github.com/gazebosim/ros_gz/tree/jazzy/ros_gz_bridge).
 
 ## Edit with a coding agent
 

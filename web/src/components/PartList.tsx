@@ -16,8 +16,8 @@ interface Props {
   assemblyLoads: Record<string, Load<AssemblyData>>;
   /** Every file opened whole, by folder path. */
   files: Record<string, Load<AssemblyData>>;
-  /** A part shown selected without being open: in an assembly, the one selected there. Its folders open to it. */
-  marked: string | null;
+  /** Parts owning the current composite selection. Reveal the last one's row and folders. */
+  marked: readonly string[];
   onSelect: (target: Target) => void;
 }
 
@@ -79,13 +79,13 @@ export function PartList(props: Props) {
   // The marked part still to scroll to: once the folders opened for it have rendered its row.
   const reveal = useRef<string | null>(null);
 
-  // Reveal the marked part: open the folders above it (only as it is marked, so they can be closed again: hence
-  // `marked` alone as the dependency).
+  // Reveal the last marked part only when the selection changes, so its folders can be closed again.
   useEffect(() => {
-    reveal.current = marked;
-    if (marked === null) return;
+    const part = marked.at(-1) ?? null;
+    reveal.current = part;
+    if (part === null) return;
     let path = "";
-    for (const { name } of folders[marked] ?? []) {
+    for (const { name } of folders[part] ?? []) {
       path = path ? `${path}/${name}` : name;
       if (closed.has(path)) toggleClosed(path);
     }
@@ -101,7 +101,7 @@ export function PartList(props: Props) {
 
   const renderPart = (part: string, depth: number) => {
     const state = traces[part];
-    const selected = (target?.kind === "part" && target.name === part) || marked === part;
+    const selected = (target?.kind === "part" && target.name === part) || marked.includes(part);
     return (
       <li key={part}>
         <button

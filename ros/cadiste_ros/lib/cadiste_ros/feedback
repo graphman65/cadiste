@@ -1,0 +1,353 @@
+#!/usr/bin/python3
+"""Measured ROS feedback. Pure aggregation stays importable without ROS installed."""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import sys
+import threading
+import time
+
+
+def finite(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def quaternion(value):
+    if len(value) != 4 or not all(finite(item) for item in value):
+        return None
+    norm = math.hypot(*value)
+    if not finite(norm) or norm < 1e-12:
+        return None
+    return tuple(item / norm for item in value)
+
+
+def multiply(a, b):
+    x, y, z, w = a
+    u, v, t, s = b
+    return (w*u + x*s + y*t - z*v, w*v - x*t + y*s + z*u,
+            w*t + x*v - y*u + z*s, w*s - x*u - y*v - z*t)
+
+
+def compose(parent, local):
+    """Compose parent<-child poses; quaternions are ROS xyzw, lengths metres."""
+    position, rotation = parent
+    offset, orientation = local
+    vector = multiply(multiply(rotation, (*offset, 0.0)), (-rotation[0], -rotation[1], -rotation[2], rotation[3]))
+    return (tuple(position[i] + vector[i] for i in range(3)), multiply(rotation, orientation))
+
+
+def pose_json(pose):
+    return {"position": list(pose[0]), "quaternion": list(pose[1])}
+
+
+class Measurements:
+    """Last measured values, with graph provenance and wall-clock freshness.
+
+    No rest pose, command, or kinematic fallback enters this accumulator. Clock
+    rewinds invalidate the entire previous simulation epoch, even while paused.
+    """
+
+    def __init__(self, config, *, monotonic=time.monotonic):
+        self.model = config["model"]
+        feedback = config["feedback"]
+        self.world = feedback["world_frame"].lstrip("/")
+        self.model_frame = feedback["model_frame"].lstrip("/")
+        self.links = {name: item["frame"].lstrip("/") for name, item in feedback["links"].items()}
+        self.joint_names = tuple(feedback["joints"])
+        self.transmissions = {item["name"]: (item["joint"], item["ratio"]) for item in config["transmissions"]}
+        self.visuals = feedback["visuals"]
+        self.monotonic = monotonic
+        self.clock = None
+        self.reset()
+
+    def reset(self):
+        self.transforms = {}
+        self.transform_stamps = {}
+        self.joints = {}
+        self.last_poses = {}
+        self.last_pose_times = {}
+        self.last_visual_poses = {}
+        self.last_visual_times = {}
+        self.was_live = False
+
+    def update_clock(self, stamp):
+        if not finite(stamp) or stamp < 0:
+            return
+        if self.clock is not None and stamp < self.clock - 1e-9:
+            self.reset()
+        self.clock = stamp
+
+    def update_transform(self, parent, child, position, rotation, stamp):
+        parent, child = parent.lstrip("/"), child.lstrip("/")
+        if not child or child == self.world:
+            return
+        if not finite(stamp) or stamp < 0:
+            return
+        previous_stamp = self.transform_stamps.get(child)
+        if previous_stamp is not None and stamp < previous_stamp:
+            return  # Out-of-order DDS delivery is not a simulation clock reset.
+        self.transform_stamps[child] = stamp
+        q = quaternion(rotation)
+        if (not parent or parent == child or len(position) != 3
+                or not all(finite(value) for value in position) or q is None):
+            self.transforms.pop(child, None)
+            return
+        self.transforms[child] = (parent, (tuple(position), q), stamp, self.monotonic())
+
+    def update_joints(self, names, positions, velocities, efforts, stamp):
+        if not finite(stamp) or stamp < 0:
+            return
+        now = self.monotonic()
+        seen = set()
+        for index, name in enumerate(names):
+            if name not in self.joint_names:
+                continue
+            previous = self.joints.get(name)
+            if previous is not None and stamp < previous[1]:
+                continue
+            if name in seen:
+                self.joints[name] = (dict.fromkeys(("position", "velocity", "effort")), stamp, now)
+                continue
+            seen.add(name)
+            values = {}
+            for key, sequence in (("position", positions), ("velocity", velocities), ("effort", efforts)):
+                value = sequence[index] if index < len(sequence) else None
+                values[key] = float(value) if finite(value) else None
+            self.joints[name] = (values, stamp, now)
+
+    def snapshot(self):
+        now = self.monotonic()
+        missing = set()
+        used = {}
+        resolved = {self.world: ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))}
+        provenance = {self.world: None}
+
+        def resolve(frame, visiting):
+            if frame in resolved:
+                return resolved[frame]
+            if frame in visiting:
+                missing.add(frame)
+                return None
+            edge = self.transforms.get(frame)
+            if edge is None:
+                missing.add(frame)
+                return None
+            parent, local, stamp, received = edge
+            base = resolve(parent, visiting | {frame})
+            if base is None:
+                missing.add(frame)
+                return None
+            value = compose(base, local)
+            # Finite source floats can still overflow during composition.
+            if not all(finite(item) for vector in value for item in vector):
+                missing.add(frame)
+                return None
+            resolved[frame] = value
+            used[frame] = (stamp, received)
+            inherited = provenance[parent]
+            provenance[frame] = (
+                min(stamp, inherited[0]) if inherited else stamp,
+                min(received, inherited[1]) if inherited else received,
+            )
+            return value
+
+        frames = [self.model_frame, *self.links.values()]
+        for frame in frames:
+            value = resolve(frame, set())
+            if value is not None:
+                self.last_poses[frame] = pose_json(value)
+                self.last_pose_times[frame] = provenance[frame]
+        stamps = [item[0] for item in used.values()]
+        received = [item[1] for item in used.values()]
+        for frame in frames:
+            if frame not in resolved and self.last_pose_times.get(frame) is not None:
+                stamp, arrival = self.last_pose_times[frame]
+                stamps.append(stamp)
+                received.append(arrival)
+        complete = not missing
+        joints = {}
+        for name in self.joint_names:
+            measured = self.joints.get(name)
+            if measured is None:
+                joints[name] = dict.fromkeys(("position", "velocity", "effort"))
+                complete = False
+            else:
+                values, stamp, arrival = measured
+                joints[name] = dict(values)
+                stamps.append(stamp)
+                received.append(arrival)
+                if values["position"] is None or values["velocity"] is None:
+                    complete = False
+        for name, (source, ratio) in self.transmissions.items():
+            values = joints[source]
+            derived = {}
+            for key, value in values.items():
+                if value is not None:
+                    value = value * ratio if key == "effort" else value / ratio
+                derived[key] = value if finite(value) else None
+            joints[name] = derived
+            if derived["position"] is None or derived["velocity"] is None:
+                complete = False
+
+        links = {name: self.last_poses[frame] for name, frame in self.links.items() if frame in self.last_poses}
+        for name, visual in self.visuals.items():
+            frame = self.links[visual["parent"]]
+            parent = resolved.get(frame)
+            measured = self.joints.get(visual["joint"])
+            valid = False
+            if parent is not None and measured is not None:
+                values, stamp, arrival = measured
+                parent_time = provenance[frame]
+                position = values["position"]
+                # Do not animate a new joint sample against an old or invalid
+                # parent pose (or vice versa). Keep only the last measured pose.
+                if (position is not None and now - arrival <= 1.0
+                        and (parent_time is None or now - parent_time[1] <= 1.0)):
+                    angle = position * visual["multiplier"]
+                    if finite(angle):
+                        half = angle * 0.5
+                        sine = math.sin(half)
+                        spin = tuple(component * sine for component in visual["axis"]) + (math.cos(half),)
+                        pivot = visual["pose"]
+                        pose = compose(compose(parent, (pivot["position"], pivot["quaternion"])),
+                                       ((0.0, 0.0, 0.0), spin))
+                        if all(finite(item) for vector in pose for item in vector):
+                            self.last_visual_poses[name] = pose_json(pose)
+                            self.last_visual_times[name] = (
+                                min(stamp, parent_time[0]) if parent_time else stamp,
+                                min(arrival, parent_time[1]) if parent_time else arrival,
+                            )
+                            valid = True
+            if not valid:
+                complete = False
+            if name in self.last_visual_poses:
+                links[name] = self.last_visual_poses[name]
+                stamp, arrival = self.last_visual_times[name]
+                stamps.append(stamp)
+                received.append(arrival)
+        age = max(0.0, now - min(received)) if received else None
+        if complete and age is not None and age <= 1.0:
+            status = "live"
+            self.was_live = True
+        elif self.was_live or (complete and age is not None):
+            status = "stale"
+        else:
+            status = "waiting"
+        return {
+            "status": status, "model": self.model,
+            "stamp": min(stamps) if stamps else None, "age": age,
+            "joints": joints, "model_pose": self.last_poses.get(self.model_frame),
+            "links": links,
+            "missing_frames": sorted(missing),
+        }
+
+
+def ros_stamp(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def run(config, output, stopped):
+    # Import only inside the ROS executable, never inside Cadiste's Python.
+    import rclpy
+    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.signals import SignalHandlerOptions
+    from rosgraph_msgs.msg import Clock
+    from sensor_msgs.msg import JointState
+    from tf2_msgs.msg import TFMessage
+
+    state = Measurements(config)
+    rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
+    node = None
+    try:
+        node = rclpy.create_node("cadiste_measured_feedback")
+
+        def transforms(message):
+            for item in message.transforms:
+                t, q = item.transform.translation, item.transform.rotation
+                state.update_transform(item.header.frame_id, item.child_frame_id,
+                                       (t.x, t.y, t.z), (q.x, q.y, q.z, q.w), ros_stamp(item.header.stamp))
+
+        def joints(message):
+            state.update_joints(message.name, message.position, message.velocity,
+                                message.effort, ros_stamp(message.header.stamp))
+
+        # Best-effort readers match both best-effort simulator and reliable publishers.
+        subscriptions = [
+            node.create_subscription(TFMessage, config["tf"], transforms, qos_profile_sensor_data),
+            node.create_subscription(JointState, config["joint_states"], joints, qos_profile_sensor_data),
+            node.create_subscription(Clock, config["clock"],
+                                     lambda msg: state.update_clock(ros_stamp(msg.clock)), qos_profile_sensor_data),
+        ]
+        deadline = 0.0
+        while not stopped.is_set() and rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+            now = time.monotonic()
+            if now >= deadline:
+                output(state.snapshot())
+                deadline = now + 0.1
+        # Keep subscription handles alive until node destruction.
+        del subscriptions
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    config = json.loads(args.config)
+    # DDS/rclpy native log output must not corrupt the JSON-lines transport.
+    transport = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    stopped = threading.Event()
+
+    def emit(value):
+        transport.write(json.dumps(value, allow_nan=False, separators=(",", ":")) + "\n")
+        transport.flush()
+
+    def failure(detail):
+        value = Measurements(config).snapshot()
+        value.update(status="error", error=detail)
+        emit(value)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda *_: stopped.set())
+    if sys.stdin.readline().strip() != "start":
+        failure("Feedback stdin closed before start; the ROS command prefix must forward stdin (docker exec -i).")
+        return 1
+
+    def monitor():
+        # Raw reads avoid a daemon holding Python's buffered-stdin lock at
+        # interpreter shutdown after SIGTERM or a ROS initialization failure.
+        while os.read(sys.stdin.fileno(), 1024):
+            pass
+        stopped.set()
+
+    threading.Thread(target=monitor, name="feedback-stdin", daemon=True).start()
+    try:
+        if not stopped.is_set():
+            run(config, emit, stopped)
+    except BrokenPipeError:
+        return 0
+    except Exception as error:
+        failure(f"ROS feedback worker failed: {type(error).__name__}: {error}")
+        return 1
+    finally:
+        transport.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

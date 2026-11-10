@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import io
 import json
 import mimetypes
 import os
@@ -35,12 +36,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, quote, urlsplit
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from .agent import Agent, ToolError
 from .cache import SHAPES_SUFFIX, TraceCache
+from .feedback import Feedback
 from .hub import Hub
 from .project import FolderStep, _CatalogError, _discover
 from .references import SnapshotError
+from .ros import ConfigConflictError, Controls, InvalidConfigError
 
 if TYPE_CHECKING:
     from .measure import Shapes
@@ -139,10 +143,12 @@ class Project:
         trace_env: dict[str, str] | None = None,
         folders: dict[str, list[FolderStep]] | None = None,
         parts_target: str | None = None,
+        simulations: dict[str, str] | None = None,
     ):
         self.target = target
         self.args = args
         self.assemblies = assemblies if assemblies is not None else {}
+        self.simulations = simulations if simulations is not None else {}
         self.trace_env = trace_env if trace_env is not None else {}
         self.parts_target = parts_target
         self._has_parts = parts_target is not None or parts is not None
@@ -349,6 +355,52 @@ class Builds:
                 return Saved(None, stem, {**failure, "error": f"{doing}: {failure.get('error', 'no output')}"})
             return Saved(output.read_bytes(), stem, {})
 
+    def _simulation_target(self, target: dict[str, str]) -> str:
+        """Resolve only explicitly registered assembly adapters."""
+        self.project.catalog(refresh=True)
+        if target.get("kind") != "assembly":
+            raise LookupError("Gazebo export requires an assembly with a simulation adapter")
+        name = target.get("name") or next(iter(self.project.assemblies), "")
+        if name not in self.project.assemblies:
+            raise LookupError(f"unknown assembly {name!r}")
+        if name not in self.project.simulations:
+            raise LookupError(
+                f"no simulation adapter for {name!r}; configure cadiste serve --simulation NAME=module:callable"
+            )
+        return self.project.simulations[name]
+
+    def control_config(self, target: dict[str, str]) -> dict[str, Any]:
+        adapter = self._simulation_target(target)
+        body, failure = _run([sys.executable, "-m", "cadiste", "controls", adapter])
+        if body is None:
+            detail = failure.get("log", failure.get("error", ""))
+            raise RuntimeError(f"could not discover simulation controls: {detail}")
+        try:
+            config = json.loads(body)
+        except ValueError as error:
+            raise RuntimeError("simulation controls discovery returned invalid JSON") from error
+        if not isinstance(config, dict):
+            raise RuntimeError("simulation controls discovery did not return an object")
+        return config
+
+    def simulation_scene(self, target: dict[str, str]) -> dict[str, Any]:
+        adapter = self._simulation_target(target)
+        body, failure = _run([sys.executable, "-m", "cadiste", "simulation-scene", adapter])
+        if body is None:
+            detail = failure.get("log", failure.get("error", ""))
+            raise RuntimeError(f"could not build simulation scene: {detail}")
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise RuntimeError("simulation scene did not return an object")
+        return data
+
+    def gazebo(self, target: dict[str, str], output: Path) -> dict[str, str]:
+        """Build an explicitly configured simulation; CAD geometry alone does not define robot joints."""
+        adapter = self._simulation_target(target)
+        command = [sys.executable, "-m", "cadiste", "gazebo", "--output", str(output), adapter]
+        body, failure = _run(command)
+        return failure if body is None else {}
+
 
 _ID = re.compile(r"[\w-]{1,64}")
 
@@ -359,6 +411,8 @@ class _Handler(BaseHTTPRequestHandler):
     measurer: Measurer
     hub: Hub
     agent: Agent
+    controls: Controls
+    ros_command: tuple[str, ...]
 
     def do_GET(self) -> None:
         url = urlsplit(self.path)
@@ -379,6 +433,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "parts": catalog.names,
                         "folders": catalog.folders,
                         "assemblies": list(self.project.assemblies),
+                        "simulations": list(self.project.simulations),
                         "root": Path.cwd().name,
                     }
                 )
@@ -390,6 +445,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._built({"kind": "file", "path": query.get("path", [""])[0]}, fresh)
         elif url.path == "/api/export":
             self._export({key: values[0] for key, values in query.items() if key != "part"}, query.get("part"))
+        elif url.path == "/api/gazebo":
+            self._gazebo_export({key: values[0] for key, values in query.items()})
+        elif url.path == "/api/simulation/controls":
+            self._simulation_controls({key: values[0] for key, values in query.items()})
+        elif url.path == "/api/simulation/scene":
+            self._simulation_scene({key: values[0] for key, values in query.items()})
+        elif url.path == "/api/simulation/feedback":
+            self._simulation_feedback({key: values[0] for key, values in query.items()})
         elif url.path == "/api/events" and _ID.fullmatch(tab := query.get("tab", [""])[0]):
             self._events(tab)
         elif url.path.startswith("/api/"):
@@ -437,6 +500,176 @@ class _Handler(BaseHTTPRequestHandler):
         fallback = re.sub(r"[^\w .-]", "_", filename.encode("ascii", "replace").decode())
         disposition = f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
         self._send(saved.body, EXPORT_FORMATS[form], headers={"Content-Disposition": disposition})
+
+    def _gazebo_export(self, target: dict[str, str]) -> None:
+        """Download a relocatable SDF, meshes and ROS 2 launch bundle."""
+        with tempfile.TemporaryDirectory(prefix="cadiste-gazebo-") as directory:
+            output = Path(directory)
+            try:
+                failure = self.builds.gazebo(target, output)
+            except _CatalogError as error:
+                self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            except LookupError as error:
+                self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+                return
+            if failure:
+                self._json(failure, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            body = io.BytesIO()
+            with ZipFile(body, "w", ZIP_DEFLATED) as archive:
+                for path in sorted(output.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(output))
+            self._send(
+                body.getvalue(), "application/zip",
+                headers={"Content-Disposition": 'attachment; filename="cadiste-gazebo.zip"'},
+            )
+
+    def _simulation_controls(self, target: dict[str, str]) -> None:
+        try:
+            config = self.controls.describe(target)
+        except (InvalidConfigError, _CatalogError) as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        except ValueError as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        except LookupError as error:
+            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+        except (OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        else:
+            self._json(config)
+
+    def _simulation_snapshot(self, query: dict[str, str]) -> dict[str, Any] | None:
+        config_id = query.pop("config_id", "")
+        try:
+            return self.controls.snapshot(query, config_id)
+        except ConfigConflictError as error:
+            self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+        except ValueError as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return None
+
+    def _simulation_scene(self, query: dict[str, str]) -> None:
+        config = self._simulation_snapshot(query)
+        if config is None:
+            return
+        try:
+            data = self.builds.simulation_scene(config["target"])
+            expected = {key: value for key, value in config.items() if key not in ("target", "config_id")}
+            if data.pop("controls", None) != expected:
+                self._json(
+                    {"error": "Simulation changed while building its scene; reload controls"},
+                    HTTPStatus.CONFLICT,
+                )
+                return
+        except (ValueError, OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        except LookupError as error:
+            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+        else:
+            self._json({**data, "config_id": config["config_id"]})
+
+    def _simulation_feedback(self, query: dict[str, str]) -> None:
+        config = self._simulation_snapshot(query)
+        if config is None:
+            return
+        with contextlib.ExitStack() as stack:
+            try:
+                receiver = stack.enter_context(Feedback(self.ros_command, config))
+            except (OSError, RuntimeError) as error:
+                self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                for snapshot in receiver.events():
+                    body = json.dumps(snapshot, allow_nan=False)
+                    self.wfile.write(f"event: feedback\ndata: {body}\n\n".encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _simulation_command(self, request: Any) -> None:
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        if (
+            not isinstance(request, dict)
+            or not isinstance(target := request.get("target"), dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in target.items())
+            or not isinstance(config_id := request.get("config_id"), str)
+            or not isinstance(stop_all := request.get("stop_all", False), bool)
+        ):
+            self._json({"error": "expected target, config_id and command values or stop_all"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            result = self.controls.send(target, config_id, request.get("values"), stop_all=stop_all)
+        except ConfigConflictError as error:
+            self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+        except ValueError as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        except LookupError as error:
+            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+        except (OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+        else:
+            if result["failed"]:
+                failures = "\n".join(f"{joint}: {error}" for joint, error in result["failed"].items())
+                self._json(
+                    {**result, "error": "Some ROS 2 commands failed; see the per-joint errors", "log": failures},
+                    HTTPStatus.BAD_GATEWAY,
+                )
+            else:
+                self._json(result)
+
+    def _gazebo_open(self, request: Any) -> None:
+        """Launch ROS 2 on the server machine with a retained, independently exported model."""
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        if (
+            not isinstance(request, dict)
+            or not isinstance(target := request.get("target"), dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in target.items())
+        ):
+            self._json({"error": "expected a target object with string values"}, HTTPStatus.BAD_REQUEST)
+            return
+        from .simulation import check_runtime, launch_bundle
+
+        try:
+            check_runtime()
+        except RuntimeError as error:
+            self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        output: Path | None = None
+        launched = False
+        try:
+            directory = self.builds.cache.directory / "gazebo"
+            directory.mkdir(parents=True, exist_ok=True)
+            output = Path(tempfile.mkdtemp(prefix="model-", dir=directory)).resolve()
+            failure = self.builds.gazebo(target, output)
+            if failure:
+                self._json(failure, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            process = launch_bundle(output)
+            launched = True
+            threading.Thread(target=process.wait, daemon=True).start()
+            self._json({"directory": str(output), "log": str(output / "gazebo.log")})
+        except _CatalogError as error:
+            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        except LookupError as error:
+            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            return
+        except (OSError, RuntimeError) as error:
+            self._json({"error": f"could not launch Gazebo: {error}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        finally:
+            if output is not None and not launched:
+                shutil.rmtree(output, ignore_errors=True)
 
     def _bambu_studio(self, request: Any) -> None:
         """Export to a retained STEP file, then start the server machine's local slicer."""
@@ -531,6 +764,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._measure(request)
             case ["bambu-studio"]:
                 self._bambu_studio(request)
+            case ["gazebo"]:
+                self._gazebo_open(request)
+            case ["simulation", "command"]:
+                self._simulation_command(request)
             case ["tabs", tab, "state"] if _ID.fullmatch(tab) and isinstance(request, dict):
                 self.hub.set_state(tab, request)
                 self._json({})
@@ -645,7 +882,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def serve(
-    project: Project, host: str, port: int, cache: TraceCache | None = None, lockfile: Path | None = None
+    project: Project, host: str, port: int, cache: TraceCache | None = None, lockfile: Path | None = None,
+    *, ros_command: tuple[str, ...] = ("ros2",),
 ) -> None:
     """Serve until interrupted; ``lockfile`` says where (``{"url", "pid"}``) for ``cadiste mcp`` to find it."""
     with contextlib.ExitStack() as stack:
@@ -664,6 +902,8 @@ def serve(
             "measurer": measurer,
             "hub": hub,
             "agent": Agent(hub, builds, measurer, project, Path.cwd()),
+            "controls": Controls(builds.control_config, ros_command=ros_command),
+            "ros_command": ros_command,
         }
         handler = type("Handler", (_Handler,), attributes)
         # Measuring needs OCP: import it now rather than on the first measurement.

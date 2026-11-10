@@ -1,4 +1,4 @@
-import type { AssemblyData, Measurement, Project, TabState, TraceData, TraceError } from "./types";
+import type { AssemblyData, Measurement, Project, SimulationCommandResult, SimulationControlsConfig, SimulationFeedback, SimulationScene, SimulationTarget, TabState, TraceData, TraceError } from "./types";
 
 export class TraceFailure extends Error {
   readonly log: string | undefined;
@@ -119,6 +119,86 @@ export async function openInBambuStudio(target: Record<string, string>, parts?: 
     body: JSON.stringify({ target, parts }),
   });
   await checked<Record<string, never>>(response);
+}
+
+/** A portable articulated Gazebo model, world, meshes and ROS 2 launch file. */
+export async function fetchGazebo(target: Record<string, string>): Promise<{ file: Blob; name: string }> {
+  const response = await fetch(`/api/gazebo?${new URLSearchParams(target)}`);
+  if (!response.ok) await checked<never>(response);
+  return { file: await response.blob(), name: attachmentName(response.headers.get("Content-Disposition")) ?? "cadiste-gazebo.zip" };
+}
+
+/** Completion means the ROS 2 launcher started on the server, not that Gazebo finished loading. */
+export async function openInGazebo(target: Record<string, string>): Promise<{ directory: string; log: string }> {
+  const response = await fetch("/api/gazebo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target }),
+  });
+  return checked<{ directory: string; log: string }>(response);
+}
+
+/** Load an adapter's control metadata without exporting or tessellating meshes. */
+export async function fetchSimulationControls(target: SimulationTarget, signal?: AbortSignal): Promise<SimulationControlsConfig> {
+  return (await getResponse<SimulationControlsConfig>(`/api/simulation/controls?${new URLSearchParams({ ...target })}`, signal)).body;
+}
+
+/** The adapter's one-time tessellated scene and explicit physical-link mapping. */
+export async function fetchSimulationScene(target: SimulationTarget, configId: string, signal?: AbortSignal): Promise<SimulationScene> {
+  return (await getResponse<SimulationScene>(`/api/simulation/scene?${new URLSearchParams({ ...target, config_id: configId })}`, signal)).body;
+}
+
+/** One subscriber lifetime. A broken connection is explicit, never silently called live. */
+export function listenSimulationFeedback(
+  target: SimulationTarget,
+  configId: string,
+  receive: (feedback: SimulationFeedback) => void,
+  failed: (message: string) => void,
+): () => void {
+  const source = new EventSource(`/api/simulation/feedback?${new URLSearchParams({ ...target, config_id: configId })}`);
+  source.addEventListener("feedback", (event) => {
+    try {
+      receive(JSON.parse((event as MessageEvent<string>).data) as SimulationFeedback);
+    } catch (error) {
+      source.close();
+      failed(`Invalid simulation feedback: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  source.onerror = () => {
+    source.close();
+    failed("Simulation feedback disconnected. Disable and enable Live simulation to reconnect; check the ROS runtime if it persists.");
+  };
+  return () => source.close();
+}
+
+export class SimulationCommandFailure extends TraceFailure {
+  readonly result: SimulationCommandResult;
+
+  constructor(message: string, result: SimulationCommandResult) {
+    super(message);
+    this.result = result;
+  }
+}
+
+/** Publish explicit setpoints; topics and message types are resolved only on the server. */
+export async function sendSimulationCommand(
+  target: SimulationTarget,
+  configId: string,
+  command: { values: Record<string, number> } | { stop_all: true },
+): Promise<SimulationCommandResult> {
+  const response = await fetch("/api/simulation/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, config_id: configId, ...command }),
+  });
+  const body = await response.json().catch(() => null) as (Partial<SimulationCommandResult> & Partial<TraceError>) | null;
+  if (!response.ok) {
+    throw new SimulationCommandFailure(body?.error ?? `${response.status} ${response.statusText}`, {
+      published: body?.published ?? {},
+      failed: body?.failed ?? {},
+    });
+  }
+  return body as SimulationCommandResult;
 }
 
 /** Capture a standalone Markdown snapshot, with no server-side reference store or lookup. */

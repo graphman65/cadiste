@@ -12,7 +12,8 @@ import "three-cad-viewer/css";
 import type { Target } from "../App";
 import type { Focus } from "../model";
 import { selectionMode, type SelectionMode } from "../selection";
-import type { HubCalls, SceneData } from "../types";
+import type { LiveSimulation } from "../simulation";
+import type { HubCalls, SceneData, SimulationPose, SimulationScene } from "../types";
 import { type SceneHover, Readout } from "./HoverCard";
 import { MeasureMarks, MeasurePanel, type Picked, measurementOf, useMeasurement } from "./Measure";
 import { SectionPanel, useSection } from "./Section";
@@ -83,6 +84,7 @@ interface Props {
   viewTarget: Target | null;
   sceneState: SceneViewState;
   onRestoreView: (state: SavedViewState) => void;
+  simulation: LiveSimulation;
   ref?: Ref<CadViewHandle>;
 }
 
@@ -133,12 +135,41 @@ function displayOptions(width: number, height: number, settings: ViewSettings) {
   };
 }
 
+// Structural types keep the renderer's own THREE instance: no second bundled Three.js runtime.
+interface LiveMatrix {
+  clone: () => LiveMatrix;
+  set: (...values: number[]) => LiveMatrix;
+  invert: () => LiveMatrix;
+  multiply: (matrix: LiveMatrix) => LiveMatrix;
+  decompose: (position: unknown, quaternion: unknown, scale: unknown) => void;
+}
+interface LiveNode {
+  matrix: LiveMatrix;
+  position: unknown;
+  quaternion: unknown;
+  scale: unknown;
+  updateMatrix: () => void;
+  updateMatrixWorld: (force: boolean) => void;
+}
+
+/** Rigid transform; Matrix4.set takes row-major entries. Measured SI translations become CAD millimetres. */
+function poseMatrix(pose: SimulationPose, translationScale: number, matrix: LiveMatrix): LiveMatrix {
+  const [x, y, z, w] = pose.quaternion;
+  const [px, py, pz] = pose.position;
+  return matrix.set(
+    1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), px * translationScale,
+    2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), py * translationScale,
+    2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), pz * translationScale,
+    0, 0, 0, 1,
+  );
+}
+
 /**
  * three-cad-viewer (OCP CAD Viewer's renderer) in a div it owns, with the app's own toolbar over it; one viewer,
  * Section-plane picking consumes a click first. Measurement mode keeps its additive picks in the same canonical
  * selection as tree/scene items, so copying never omits measurements or resets unrelated selected items.
  */
-export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, viewTarget, sceneState, onRestoreView, ref }: Props) {
+export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, viewTarget, sceneState, onRestoreView, simulation, ref }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const instance = useRef<Instance | null>(null);
   const [rendered, setRendered] = useState(0);
@@ -166,6 +197,11 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   const section = useSection(viewerOf, rendered);
   const { picking: sectionPicking, pickFace: pickSectionFace } = section;
   const pendingView = useRef<SavedViewState | null>(null);
+  const simulationMode = useRef(simulation.enabled);
+  simulationMode.current = simulation.enabled;
+  const liveNodes = useRef<{ scene: SimulationScene; nodes: { link: string; node: LiveNode; restToInitial: LiveMatrix }[]; fitted: boolean } | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [appliedStamp, setAppliedStamp] = useState<number | null>(null);
 
   /** The hover card beside the pointer, flipped to its other side near the view's right and bottom edges. */
   const placeCard = () => {
@@ -188,9 +224,14 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     const options = displayOptions(width, height, settingsRef.current);
     const display = new Display(element, options);
     const viewer = new Viewer(display, options, null);
+    const handleHover = viewer.pickingController.handleHover.bind(viewer.pickingController);
+    viewer.pickingController.handleHover = () => {
+      if (!simulationMode.current) handleHover();
+    };
     // three-cad-viewer reads out what the pointer is over (or a copied point) on a status line under the canvas,
     // set as the hovered component changes; the hover card shows it instead.
     display.setStatusLine = (readout: string) => {
+      if (simulationMode.current) return;
       const picked = viewer.lastObject;
       hoveredPath.current = readout === "" ? null : (picked?.backendId ?? null);
       setHovered(readout === "" ? null : { path: picked?.backendId ?? null, topo: picked?.topo ?? null, readout });
@@ -204,6 +245,13 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       placeCard();
     };
     element.addEventListener("pointermove", onMove);
+    const guardLiveKeys = (event: KeyboardEvent) => {
+      if (simulationMode.current) {
+        event.stopImmediatePropagation();
+        event.preventDefault();
+      }
+    };
+    element.addEventListener("keydown", guardLiveKeys, true);
     const fit = () => {
       if (!viewer.ready) return; // resizeCadView throws before the first render
       const box = element.getBoundingClientRect();
@@ -218,6 +266,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     return () => {
       stopExplodeSync();
       element.removeEventListener("pointermove", onMove);
+      element.removeEventListener("keydown", guardLiveKeys, true);
       observer.disconnect();
       viewer.dispose();
       display.dispose();
@@ -228,6 +277,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   useEffect(() => {
     const current = instance.current;
     if (current === null || data === null) return;
+    liveNodes.current = null;
     if (current.viewer.ready) current.viewer.clear();
     // render() takes the instanced format too (it decodes it first), but its type only names the decoded tree.
     const shapes = data as unknown as Shapes;
@@ -239,6 +289,71 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   }, [data]);
 
   useEffect(() => {
+    const viewer = instance.current?.viewer;
+    if (viewer === undefined || !viewer.ready) return;
+    viewer.setPickHandler(!simulation.enabled);
+    viewer.setSelectionInput(false);
+    if (simulation.enabled) {
+      setMeasuring(false);
+      section.open(false);
+      viewer.setExplode(false);
+      viewer.setLocalClipping(false);
+      viewer.pickingController.clearHover();
+      hoveredPath.current = null;
+      setHovered(null);
+      setExtra([]);
+    }
+  }, [simulation.enabled, rendered]);
+
+  useEffect(() => {
+    if (simulation.enabled && liveNodes.current?.scene === simulation.scene) return;
+    liveNodes.current = null;
+    setLiveError(null);
+    setAppliedStamp(null);
+    const viewer = instance.current?.viewer;
+    const scene = simulation.scene;
+    if (!simulation.enabled || scene === null || viewer === undefined || !viewer.ready || shown.current !== scene.scene.data) return;
+    try {
+      const nodes = Object.entries(scene.links).map(([link, mapping]) => {
+        const group = viewer.rendered.nestedGroup.groups[mapping.path];
+        if (group === undefined) throw new Error(`Adapter scene has no mapped node for ${link}: ${mapping.path}`);
+        const node = group as unknown as LiveNode;
+        node.updateMatrix();
+        // Preserve all initial shape offsets. Never multiply a delta into last frame's pose.
+        const restToInitial = poseMatrix(mapping.rest, 1, node.matrix.clone()).invert().multiply(node.matrix);
+        return { link, node, restToInitial };
+      });
+      liveNodes.current = { scene, nodes, fitted: false };
+    } catch (error: unknown) {
+      setLiveError(error instanceof Error ? error.message : String(error));
+    }
+  }, [simulation.enabled, simulation.scene, rendered]);
+
+  useEffect(() => {
+    const viewer = instance.current?.viewer;
+    const mapping = liveNodes.current;
+    const feedback = simulation.feedback;
+    if (!simulation.enabled || mapping === null || mapping.scene !== simulation.scene || viewer === undefined || feedback === null) return;
+    // Before the first complete sample, do not present CAD rest geometry as a measured robot.
+    if (mapping.nodes.some(({ link }) => feedback.links[link] === undefined)) return;
+    for (const { link, node, restToInitial } of mapping.nodes) {
+      poseMatrix(feedback.links[link], 1000, node.matrix).multiply(restToInitial);
+      node.matrix.decompose(node.position, node.quaternion, node.scale);
+      node.updateMatrixWorld(true);
+    }
+    // Public API recomputes world bounds, camera clip ranges, reset target and picker/hover caches.
+    // It does not retessellate geometry or move the current camera.
+    viewer.updateBounds();
+    if (!mapping.fitted) {
+      viewer.reset();
+      mapping.fitted = true;
+    }
+    viewer.idPicker?.setDirty();
+    viewer.update(true, false);
+    setAppliedStamp(feedback.stamp);
+  }, [simulation.enabled, simulation.scene, simulation.feedback, rendered]);
+
+  useEffect(() => {
     const current = instance.current;
     if (current === null || !current.viewer.ready) return;
     const { viewer } = current;
@@ -246,11 +361,12 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     viewer.setAxes(settings.axes);
     viewer.setGrids([settings.grid, false, false]);
     viewer.setBlackEdges(settings.edges);
-    if (viewer.getTools() !== settings.tools) {
-      viewer.showTools(settings.tools);
+    const tools = settings.tools && !simulation.enabled;
+    if (viewer.getTools() !== tools) {
+      viewer.showTools(tools);
       current.fit();
     }
-  }, [settings, rendered]);
+  }, [settings, rendered, simulation.enabled]);
 
   useEffect(() => {
     const viewer = instance.current?.viewer;
@@ -317,6 +433,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     ref,
     (): CadViewHandle => {
       const readyViewer = () => {
+        if (simulationMode.current) throw new Error("Return to CAD view before using CAD harness actions or snapshots.");
         const viewer = instance.current?.viewer;
         return viewer !== undefined && viewer.ready ? viewer : null;
       };
@@ -324,6 +441,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       return {
         hovered: () => hoveredPath.current,
         restore: (saved) => {
+          if (simulationMode.current) throw new Error("Return to CAD view before restoring a saved CAD view.");
           pendingView.current = saved;
           setExtra([]);
           changeSettings(saved.settings);
@@ -404,6 +522,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       down = { x: event.clientX, y: event.clientY };
     };
     const onUp = (event: PointerEvent) => {
+      if (simulationMode.current) return;
       // A drag orbits the camera; only a click picks.
       if (down === null || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
       const box = canvas.getBoundingClientRect();
@@ -457,6 +576,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
 
   const captureView = (): SavedViewState | null => {
     const viewer = instance.current?.viewer;
+    if (simulationMode.current) return null;
     if (viewer === undefined || !viewer.ready || data === null || shown.current !== data || viewTarget === null) return null;
     const [x, y, z] = viewer.getCameraPosition();
     const states = viewer.getStates();
@@ -478,15 +598,15 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   };
 
   return (
-    <div className="cad">
+    <div className={simulation.enabled ? "cad simulation-mode" : "cad"} data-view-mode={simulation.enabled ? "simulation" : "cad"} data-rendered-feedback-stamp={appliedStamp ?? undefined}>
       <div className="cad-view" ref={host} />
-      {hovered !== null && (
+      {!simulation.enabled && hovered !== null && (
         <div className="hover-card" ref={card}>
           {hovered.path !== null && describe?.(hovered.path)}
           <Readout hover={hovered} />
         </div>
       )}
-      {measuring && data !== null && (
+      {!simulation.enabled && measuring && data !== null && (
         <>
           <MeasureMarks viewer={viewerOf} measurement={measurementOf(measureState, picked)} />
           <MeasurePanel
@@ -498,10 +618,16 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           />
         </>
       )}
-      {section.active && data !== null && <SectionPanel tool={section} viewer={viewerOf} />}
+      {!simulation.enabled && section.active && data !== null && <SectionPanel tool={section} viewer={viewerOf} />}
+      {simulation.enabled && (liveError !== null || simulation.scene === null || appliedStamp === null) && (
+        <div className="simulation-view-note" role="status">
+          {liveError ?? simulation.error ?? (simulation.scene === null ? "Loading simulation geometry… Commands and Stop all remain available." : "Waiting for measured link transforms… CAD rest geometry is not live state.")}
+        </div>
+      )}
       {(data !== null || viewScope !== null) && (
         <ViewToolbar
           settings={settings}
+          cadActions={!simulation.enabled}
           onChange={changeSettings}
           onView={(direction) => withViewer((viewer) => viewer.presetCamera(direction))}
           onFit={() => withViewer((viewer) => viewer.reset())}
@@ -512,7 +638,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           sectioning={section.active}
           onSection={section.open}
         >
-          {viewScope !== null && <SavedViews key={viewScope} scope={viewScope} capture={captureView} restore={onRestoreView} />}
+          {!simulation.enabled && viewScope !== null && <SavedViews key={viewScope} scope={viewScope} capture={captureView} restore={onRestoreView} />}
         </ViewToolbar>
       )}
     </div>

@@ -118,7 +118,86 @@ export interface Project {
   folders: Record<string, { name: string; file: boolean }[]>;
   /** The assemblies' names, in the order `cadiste serve --assembly` gave them. */
   assemblies: string[];
+  /** Assemblies with explicit simulation adapters (`cadiste serve --simulation`). */
+  simulations: string[];
   root: string;
+}
+
+export interface SimulationTarget {
+  kind: "assembly";
+  name: string;
+}
+
+export interface SimulationCommand {
+  /** Command input identity: a virtual motor name when transmitted, otherwise a physical joint. */
+  joint: string;
+  topic: string;
+  type: "std_msgs/msg/Float64";
+  units: string;
+  effort_limit: number;
+  velocity_limit: number;
+  example: string;
+}
+
+/** Ideal, lossless output-coordinate / exposed motor-output-shaft coordinate ratio. */
+export interface SimulationTransmission {
+  name: string;
+  joint: string;
+  ratio: number;
+}
+
+/** The simulation adapter's control metadata, with the server's snapshot identity. */
+export interface SimulationControlsConfig {
+  config_id: string;
+  target: SimulationTarget;
+  model: string;
+  commands: SimulationCommand[];
+  transmissions: SimulationTransmission[];
+  feedback: {
+    world_frame: string;
+    model_frame: string;
+    links: Record<string, { frame: string; rest: SimulationPose }>;
+    joints: string[];
+    visuals: Record<string, {
+      parent: string;
+      joint: string;
+      multiplier: number;
+      axis: [number, number, number];
+      pose: SimulationPose;
+    }>;
+  };
+}
+
+/** A publish acknowledgement, not measured motor state. */
+export interface SimulationCommandResult {
+  published: Record<string, number>;
+  failed: Record<string, string>;
+}
+
+/** TF poses are absolute in feedback.world_frame; metres and xyzw quaternions. */
+export interface SimulationPose {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+}
+
+export interface SimulationFeedback {
+  status: "waiting" | "live" | "stale" | "error";
+  model: string;
+  stamp: number | null;
+  age: number | null;
+  /** Physical joint samples plus explicitly declared ideal motor states derived from them. */
+  joints: Record<string, { position: number | null; velocity: number | null; effort: number | null }>;
+  model_pose: SimulationPose | null;
+  links: Record<string, SimulationPose>;
+  missing_frames: string[];
+  error?: string;
+}
+
+export interface SimulationScene extends AssemblyData {
+  model: string;
+  config_id: string;
+  /** Explicit physical-link and driven-visual nodes; rest positions are CAD millimetres, not metres. */
+  links: Record<string, { path: string; rest: SimulationPose }>;
 }
 
 export interface TraceError {
