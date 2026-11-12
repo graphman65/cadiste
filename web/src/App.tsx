@@ -3,11 +3,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type Built,
   type BuildMode,
+  type BackgroundBuild,
+  type BuildsSnapshot,
   createReference,
   fetchAssembly,
   fetchFile,
   fetchProject,
   fetchTrace,
+  listenBuilds,
   TraceFailure,
 } from "./api";
 import { AssemblyPane } from "./components/AssemblyPane";
@@ -61,11 +64,13 @@ function folderParts(project: Project | null, path: string): string[] {
 }
 
 /** A part's trace and its leaf in a file's scene, when the leaf has the trace's faces (the same build of it). */
-function partInFile(data: SceneData, traces: Record<string, Load<TraceData>>, part: string) {
+function partInFile(data: AssemblyData, traces: Record<string, Load<TraceData>>, part: string) {
   const load = traces[part];
-  const leaf = leafOfPart(data.shapes, part);
+  const leaf = leafOfPart(data.scene.data.shapes, part);
   if (load?.status !== "ok" || leaf === null) return null;
-  return leafFaceCount(data, leaf) === load.data.result.faces ? { trace: load.data, leaf } : null;
+  if (data.source_fingerprint !== undefined && load.data.source_fingerprint !== undefined &&
+    data.source_fingerprint !== load.data.source_fingerprint) return null;
+  return leafFaceCount(data.scene.data, leaf) === load.data.result.faces ? { trace: load.data, leaf } : null;
 }
 
 /**
@@ -78,7 +83,7 @@ export type Target = { kind: "part"; name: string } | { kind: "assembly"; name: 
 export type Load<T> =
   | { status: "loading" }
   /** `cached`: the server had it, built for the model's current source; `shapes`: the file to measure on. */
-  | { status: "ok"; data: T; cached: boolean; shapes: string | null }
+  | { status: "ok"; data: T; cached: boolean; shapes: string | null; refreshing?: boolean; failure?: { error: string; log?: string } }
   | { status: "error"; error: string; log?: string };
 
 function targetFromHash(): Target | null {
@@ -138,18 +143,32 @@ async function copyText(text: string): Promise<void> {
   if (!copied) throw new Error("the browser refused to copy");
 }
 
+/** A failed refresh must not take a usable scene (or its trace) away. */
+function retain<T>(previous: Load<T> | undefined, next: Load<T>): Load<T> {
+  if (previous?.status !== "ok") return next;
+  if (next.status === "loading") return { ...previous, refreshing: true, failure: undefined };
+  if (next.status === "error") return { ...previous, refreshing: false, failure: next };
+  return next;
+}
+
+function stopLoading<T>(all: Record<string, Load<T>>, name: string): Record<string, Load<T>> {
+  const previous = all[name];
+  return previous?.status === "ok" && previous.refreshing
+    ? { ...all, [name]: { ...previous, refreshing: false } } : all;
+}
+
 /** A load's outcome: the scene to render, or why there is none. */
-type Loaded = { status: "ok"; scene: SceneData } | { status: "error"; error: string; log?: string };
+type Loaded = { status: "ok"; scene: SceneData; build_id: string } | { status: "error"; error: string; log?: string };
 
 /** Puts a fetched build (or its failure) where it is kept, and tells what came of it. */
-function settle<T extends { scene: { data: SceneData } }>(
+function settle<T extends { build_id: string; scene: { data: SceneData } }>(
   fetched: Promise<Built<T>>,
   put: (load: Load<T>) => void,
 ): Promise<Loaded> {
   return fetched.then(
     (built): Loaded => {
       put({ status: "ok", ...built });
-      return { status: "ok", scene: built.data.scene.data };
+      return { status: "ok", scene: built.data.scene.data, build_id: built.data.build_id };
     },
     (error: unknown): Loaded => {
       const failure = failed(error);
@@ -242,32 +261,166 @@ export function App() {
       .catch((error: unknown) => setProjectError(String(error)));
   }, []);
 
-  // Targets asked for once already: selecting one again shows what it has; Rebuild asks again.
+  // Only download generations of targets the browser needs, not every server-warmed scene.
   const requested = useRef(new Set<string>());
   const traceLoads = useRef(new Map<string, Promise<Loaded>>());
+  const loadVersions = useRef(new Map<string, number>());
+  const pendingLoads = useRef(new Map<string, BuildMode>());
+  const loadedIds = useRef(new Map<string, string>());
+  const obsoleteIds = useRef(new Map<string, Set<string>>());
+  const readyBuilds = useRef(new Map<string, BackgroundBuild>());
+  const attemptedIds = useRef(new Map<string, string>());
+  const latestFingerprint = useRef("");
+  const catalogFingerprint = useRef<string | null>(null);
+  const reconcileBuilds = useRef<() => void>(() => {});
+  const context = useRef({ target, project, simulation: simulation.enabled });
+  context.current = { target, project, simulation: simulation.enabled };
+  const pauseLoad = useCallback((what: Target) => {
+    if (what.kind === "part") setTraces((all) => stopLoading(all, what.name));
+    else if (what.kind === "assembly") setAssemblies((all) => stopLoading(all, what.name));
+    else setFiles((all) => stopLoading(all, what.path));
+  }, []);
+  const [background, setBackground] = useState<BackgroundBuild | null>(null);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const load = useCallback((what: Target, mode: BuildMode = "cached"): Promise<Loaded> => {
-    requested.current.add(keyOf(what));
+    if (what.kind === "part" && mode === "cached") {
+      const pending = traceLoads.current.get(what.name);
+      if (pending !== undefined) return pending;
+    }
+    const key = keyOf(what);
+    const version = (loadVersions.current.get(key) ?? 0) + 1;
+    loadVersions.current.set(key, version);
+    pendingLoads.current.set(key, mode);
+    requested.current.add(key);
+    const startedFingerprint = latestFingerprint.current;
+    const forget = (id: string | undefined) => {
+      if (id === undefined) return;
+      let ids = obsoleteIds.current.get(key);
+      if (ids === undefined) obsoleteIds.current.set(key, ids = new Set());
+      ids.add(id);
+    };
+    if (mode === "fresh") {
+      forget(loadedIds.current.get(key));
+      forget(readyBuilds.current.get(key)?.build_id);
+    }
+    const accept = (next: Load<TraceData | AssemblyData>) => {
+      if (loadVersions.current.get(key) !== version) return false;
+      pendingLoads.current.delete(key);
+      // An exact download started in CAD may finish after simulation was enabled.
+      if (typeof mode === "object" && context.current.simulation) {
+        attemptedIds.current.delete(key);
+        pauseLoad(what);
+        return false;
+      }
+      if (next.status !== "ok") return true;
+      const previous = loadedIds.current.get(key);
+      const id = next.data.build_id;
+      if (previous !== id) {
+        forget(previous);
+        const current = context.current.target;
+        if (current !== null && (keyOf(current) === key || current.kind === "file" && what.kind === "part")) {
+          setSelection([]);
+          setSelected(null);
+          setFocusPart(null);
+          setInstance(null);
+          setLitPart(null);
+          setHover(null);
+        }
+      }
+      if (mode === "fresh") {
+        const advertised = readyBuilds.current.get(key)?.build_id;
+        if (advertised !== id && (latestFingerprint.current === startedFingerprint ||
+          next.data.source_fingerprint === latestFingerprint.current)) forget(advertised);
+      }
+      loadedIds.current.set(key, id);
+      return true;
+    };
+    let loading: Promise<Loaded>;
     if (what.kind === "assembly") {
       const name = what.name;
-      setAssemblies((all) => ({ ...all, [name]: { status: "loading" } }));
-      return settle(fetchAssembly(name, mode), (load) => setAssemblies((all) => ({ ...all, [name]: load })));
-    }
-    if (what.kind === "file") {
+      setAssemblies((all) => ({ ...all, [name]: retain(all[name], { status: "loading" }) }));
+      loading = settle(fetchAssembly(name, mode), (next) => {
+        if (accept(next)) setAssemblies((all) => ({ ...all, [name]: retain(all[name], next) }));
+      });
+    } else if (what.kind === "file") {
       const path = what.path;
-      setFiles((all) => ({ ...all, [path]: { status: "loading" } }));
-      return settle(fetchFile(path, mode), (load) => setFiles((all) => ({ ...all, [path]: load })));
+      setFiles((all) => ({ ...all, [path]: retain(all[path], { status: "loading" }) }));
+      loading = settle(fetchFile(path, mode), (next) => {
+        if (accept(next)) setFiles((all) => ({ ...all, [path]: retain(all[path], next) }));
+      });
+    } else {
+      const name = what.name;
+      setTraces((all) => ({ ...all, [name]: retain(all[name], { status: "loading" }) }));
+      loading = settle(fetchTrace(name, mode), (next) => {
+        if (accept(next)) setTraces((all) => ({ ...all, [name]: retain(all[name], next) }));
+      });
+      traceLoads.current.set(name, loading);
+      void loading.finally(() => {
+        if (traceLoads.current.get(name) === loading) traceLoads.current.delete(name);
+      });
     }
-    const name = what.name;
-    const pending = traceLoads.current.get(name);
-    if (pending !== undefined && mode === "cached") return pending;
-    setTraces((all) => ({ ...all, [name]: { status: "loading" } }));
-    const loading = settle(fetchTrace(name, mode), (load) => setTraces((all) => ({ ...all, [name]: load })));
-    traceLoads.current.set(name, loading);
-    void loading.finally(() => {
-      if (traceLoads.current.get(name) === loading) traceLoads.current.delete(name);
-    });
+    void loading.finally(() => reconcileBuilds.current());
     return loading;
-  }, []);
+  }, [pauseLoad]);
+
+  const applyReady = useCallback(() => {
+    if (context.current.simulation) return;
+    for (const [key, entry] of readyBuilds.current) {
+      const id = entry.build_id;
+      if (entry.status !== "ready" || id === undefined || !requested.current.has(key) ||
+        pendingLoads.current.get(key) === "fresh" || loadedIds.current.get(key) === id ||
+        attemptedIds.current.get(key) === id || obsoleteIds.current.get(key)?.has(id)) continue;
+      attemptedIds.current.set(key, id);
+      void load(entry.target, { build_id: id });
+    }
+  }, [load]);
+  reconcileBuilds.current = applyReady;
+
+  const receiveBuilds = useCallback((snapshot: BuildsSnapshot) => {
+    latestFingerprint.current = snapshot.fingerprint;
+    setWatchError((previous) => previous === snapshot.error ? previous : snapshot.error);
+    if (snapshot.project !== null && catalogFingerprint.current !== snapshot.fingerprint) {
+      catalogFingerprint.current = snapshot.fingerprint;
+      const catalog = snapshot.project;
+      const previous = context.current.project;
+      if (previous !== null && JSON.stringify([previous.parts, previous.folders, previous.assemblies]) !==
+        JSON.stringify([catalog.parts, catalog.folders, catalog.assemblies])) {
+        const updated = { ...previous, ...catalog };
+        setProject(updated);
+        setTarget((current) => targetIn(updated, current));
+      }
+    }
+    readyBuilds.current.clear();
+    let current: BackgroundBuild | null = null;
+    for (const entry of snapshot.targets) {
+      const key = keyOf(entry.target);
+      readyBuilds.current.set(key, entry);
+      if (context.current.target !== null && key === keyOf(context.current.target)) current = entry;
+      // Queuing a later revision invalidates any older exact download still in flight.
+      const pending = pendingLoads.current.get(key);
+      if (entry.status !== "ready" && typeof pending === "object") {
+        loadVersions.current.set(key, (loadVersions.current.get(key) ?? 0) + 1);
+        pendingLoads.current.delete(key);
+        attemptedIds.current.delete(key);
+        pauseLoad(entry.target);
+      }
+    }
+    setBackground((previous) => JSON.stringify(previous) === JSON.stringify(current) ? previous : current);
+    applyReady();
+  }, [applyReady, pauseLoad]);
+
+  const targetKey = target === null ? null : keyOf(target);
+  const watching = project !== null;
+  useEffect(() => {
+    if (!watching) return;
+    setConnection("connecting");
+    setBackground(null);
+    return listenBuilds(context.current.target, receiveBuilds, setConnection, setWatchError);
+  }, [watching, targetKey, receiveBuilds]);
+  useEffect(() => {
+    applyReady();
+  }, [simulation.enabled, applyReady]);
   const view = useRef<CadViewHandle>(null);
   const clearSelection = useCallback(() => {
     setSelection([]);
@@ -323,7 +476,7 @@ export function App() {
     if (target?.kind !== "assembly") return;
     for (const name of selectedParts) if (!requested.current.has(name)) void load({ kind: "part", name });
   }, [target, selectedParts, load]);
-  const index = trace === null ? null : treeIndex(trace);
+  const index = useMemo(() => trace === null ? null : treeIndex(trace), [trace]);
   const collapsed = (activePart !== null && collapsedBy[activePart]) || NO_NODES;
   const related = useMemo(
     () => (trace === null || index === null ? new Set<string>() : relatedTo(trace, index, selected)),
@@ -382,7 +535,7 @@ export function App() {
         const node = findShape(root, item.path);
         return node === undefined ? [] : shapeLeaves(node).map((leaf) => leaf.id);
       }
-      const inFile = target?.kind === "file" ? partInFile(assemblyData.scene.data, traces, item.part) : null;
+      const inFile = target?.kind === "file" ? partInFile(assemblyData, traces, item.part) : null;
       return inFile === null ? [] : fileFocus(root, effectiveHidden, { ...inFile, selected: item.node }).lit;
     });
     return { ...base, lit: [...new Set(lit)] };
@@ -440,7 +593,7 @@ export function App() {
       if (target?.kind !== "file" || assemblyData === null) return null;
       const leaf = leafOfPick(assemblyData.scene.data.shapes, path);
       const part = shapeLeaves(assemblyData.scene.data.shapes).find((candidate) => candidate.id === leaf)?.name;
-      const inFile = part === undefined ? null : partInFile(assemblyData.scene.data, traces, part);
+      const inFile = part === undefined ? null : partInFile(assemblyData, traces, part);
       if (part === undefined || inFile === null) return null;
       return { part, trace: inFile.trace, path: pathInPart(inFile.trace, inFile.leaf, path) };
     },
@@ -601,12 +754,15 @@ export function App() {
               ? { kind: "assembly", name: first ?? "" }
               : asked;
           // Asked for before the target is set, so its effect does not ask for the cached build too.
-          const loading = load(next, "latest");
+          const loading = load(next, { build_id: (request.params as HubCalls["open"]["params"]).build_id });
           setTarget(next);
           const loaded = await loading;
           if (loaded.status === "error") {
             await afterCommit();
             return loaded;
+          }
+          if (loaded.build_id !== (request.params as HubCalls["open"]["params"]).build_id) {
+            throw new Error("Server substituted a different build; navigation discarded");
           }
           await viewer().rendered(loaded.scene);
           if (chosen !== undefined && chosen !== null) {
@@ -786,20 +942,13 @@ export function App() {
     setRefreshingProject(true);
     try {
       const loaded = await fetchProject();
-      if (project !== null && (
-        JSON.stringify(project.parts) !== JSON.stringify(loaded.parts) ||
-        JSON.stringify(project.folders) !== JSON.stringify(loaded.folders)
-      )) {
-        // A folder's cached browser scene must not retain parts that moved or disappeared.
-        setFiles({});
-        for (const key of requested.current) if (key.startsWith("#file:")) requested.current.delete(key);
-      }
+      setWatchError(null);
       setProject(loaded);
       setTarget((current) => targetIn(loaded, current));
       const next = targetIn(loaded, target);
-      if (next !== null) await load(next, "fresh");
+      if (next !== null && keyOf(next) === keyOf(target)) await load(target, "fresh");
     } catch (error: unknown) {
-      setProjectError(String(error));
+      setWatchError(failed(error).error);
     } finally {
       setRefreshingProject(false);
     }
@@ -812,6 +961,17 @@ export function App() {
   const title = target?.kind === "file" ? target.path.replaceAll("/", " / ") : target?.name;
   const sceneData = simulation.enabled && simulation.scene !== null ? simulation.scene.scene.data
     : target?.kind === "part" ? (trace?.scene.data ?? null) : (assemblyData?.scene.data ?? null);
+  const buildFailure = background?.status === "error"
+    ? { error: background.error ?? "Background build failed", log: background.log }
+    : state?.status === "error" ? state : state?.status === "ok" ? state.failure : undefined;
+  const stale = state?.status === "ok" && (background?.status === "queued" || background?.status === "building" ||
+    background?.status === "error" || state.refreshing || state.failure !== undefined ||
+    background?.status === "ready" && background.build_id !== state.data.build_id &&
+      !obsoleteIds.current.get(targetKey ?? "")?.has(background.build_id ?? ""));
+  const buildStatus = background?.status === "queued" ? "Queued" : background?.status === "building" ? "Building" :
+    buildFailure !== undefined ? "Build failed" :
+    state?.status === "loading" || state?.status === "ok" && state.refreshing ? "Loading build" :
+    stale ? simulation.enabled ? "CAD update deferred until returning to CAD" : "Loading latest build" : "Up to date";
 
   const partView = target?.kind === "part";
   const assemblyView = target?.kind === "assembly";
@@ -858,11 +1018,11 @@ export function App() {
         <ExportMenu target={target} title={title} shown={exportShown} simulation={target?.kind === "assembly" && (project?.simulations.includes(target.name) ?? false)} />
         <button
           className="primary"
-          disabled={target === null || refreshingProject || state?.status === "loading"}
+          disabled={target === null || refreshingProject}
           onClick={() => void rebuild()}
-          title="Refresh parts and folders, then build again even if the cached build is up to date"
+          title="Rebuild only the current target, even if its cached build is up to date"
         >
-          {refreshingProject || state?.status === "loading" ? "Building…" : "Rebuild"}
+          {refreshingProject ? "Building…" : "Rebuild"}
         </button>
       </header>
 
@@ -1006,6 +1166,18 @@ export function App() {
               </span>
             )}
           </ViewBar>
+        )}
+        {watching && (
+          <div className={`build-status-strip${buildFailure !== undefined || watchError !== null ? " failure" : ""}`}>
+            {target !== null && <span role="status">{buildStatus}{stale && " · showing previous geometry"}</span>}
+            <span className="stats">Source updates: {connection === "connected" ? "connected" :
+              connection === "connecting" ? "connecting…" : "disconnected · reconnecting…"}</span>
+            {(buildFailure !== undefined || watchError !== null) && <details>
+              <summary>Build error details</summary>
+              {watchError !== null && <pre>{watchError}</pre>}
+              {buildFailure !== undefined && <><p>{buildFailure.error}</p>{buildFailure.log && <pre>{buildFailure.log}</pre>}</>}
+            </details>}
+          </div>
         )}
         <div className="view-body">
           <CadView

@@ -39,6 +39,7 @@ export function FileFeatures(props: Props) {
       {parts.map((part) => {
         const state = traces[part];
         const trace = state?.status === "ok" ? state.data : null;
+        const failure = state?.status === "error" ? state : state?.status === "ok" ? state.failure : undefined;
         const open = !closed.has(part);
         const shown = visible(part);
         const soloed = solo === part;
@@ -53,8 +54,8 @@ export function FileFeatures(props: Props) {
                 <Icon name="chevron" className={open ? "chevron open" : "chevron"} />
                 <Icon name="part" className="builder-icon" />
                 <span className="part-name">{part}</span>
-                {state?.status === "loading" && <span className="spinner" title="Tracing…" />}
-                {state?.status === "error" && <span className="part-status error">failed</span>}
+                {(state?.status === "loading" || state?.status === "ok" && state.refreshing) && <span className="spinner" title="Tracing…" />}
+                {failure !== undefined && <span className="part-status error">failed</span>}
                 {trace && <span className="part-status">{trace.ops.length} ops</span>}
               </button>
               <button
@@ -77,6 +78,10 @@ export function FileFeatures(props: Props) {
                 Open
               </button>
             </div>
+            {open && failure !== undefined && <details className="saved-views-error">
+              <summary>Trace error: {failure.error}</summary>
+              {failure.log && <pre>{failure.log}</pre>}
+            </details>}
             {open && trace && trace.roots.length > 0 && (
               <FeatureTree
                 trace={trace}

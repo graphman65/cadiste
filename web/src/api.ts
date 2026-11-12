@@ -1,4 +1,5 @@
 import type { AssemblyData, Measurement, Project, SimulationCommandResult, SimulationControlsConfig, SimulationFeedback, SimulationScene, SimulationTarget, TabState, TraceData, TraceError } from "./types";
+import type { Target } from "./App";
 
 export class TraceFailure extends Error {
   readonly log: string | undefined;
@@ -33,14 +34,12 @@ async function getResponse<T>(url: string, signal?: AbortSignal): Promise<{ body
   return { body: await checked<T>(response), response };
 }
 
-/**
- * Which build to ask for: the cached one if still valid; `fresh`, built again even so; `latest`, the one the hub has
- * just made for a harness session.
- */
-export type BuildMode = "cached" | "fresh" | "latest";
+/** Cached/current-source, explicitly fresh, or one exact retained build generation. */
+export type BuildMode = "cached" | "fresh" | { build_id: string };
 
 async function getBuilt<T>(url: string, mode: BuildMode, signal?: AbortSignal): Promise<Built<T>> {
-  const query = mode === "cached" ? "" : `${url.includes("?") ? "&" : "?"}${mode}=1`;
+  const query = mode === "cached" ? "" : typeof mode === "object"
+    ? `&build_id=${encodeURIComponent(mode.build_id)}` : "&fresh=1";
   const { body, response } = await getResponse<T>(url + query, signal);
   return {
     data: body,
@@ -51,6 +50,50 @@ async function getBuilt<T>(url: string, mode: BuildMode, signal?: AbortSignal): 
 
 export async function fetchProject(): Promise<Project> {
   return (await getResponse<Project>("/api/project")).body;
+}
+
+export interface BackgroundBuild {
+  target: Target;
+  status: "queued" | "building" | "ready" | "error";
+  build_id?: string;
+  error?: string;
+  log?: string;
+}
+
+export interface BuildsSnapshot {
+  fingerprint: string;
+  project: Pick<Project, "parts" | "folders" | "assemblies"> | null;
+  error: string | null;
+  targets: BackgroundBuild[];
+}
+
+/** Reconnects automatically; every event is a complete snapshot, not a delta. */
+export function listenBuilds(
+  target: Target | null,
+  receive: (snapshot: BuildsSnapshot) => void,
+  connection: (state: "connecting" | "connected" | "disconnected") => void,
+  failed: (message: string) => void,
+): () => void {
+  const query = target === null ? "" : `?${new URLSearchParams({ ...target })}`;
+  const source = new EventSource(`/api/builds/events${query}`);
+  let previous = "";
+  let active = true;
+  source.onopen = () => { if (active) connection("connected"); };
+  source.onerror = () => { if (active) connection("disconnected"); };
+  source.addEventListener("builds", (event) => {
+    const data = (event as MessageEvent<string>).data;
+    if (!active || data === previous) return;
+    try {
+      receive(JSON.parse(data) as BuildsSnapshot);
+      previous = data;
+    } catch (error) {
+      failed(`Invalid build update: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  return () => {
+    active = false;
+    source.close();
+  };
 }
 
 /** The part's trace. */

@@ -1038,6 +1038,38 @@ body[data-theme] .cad-view {
   color: var(--subtract);
 }
 
+.build-status-strip {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+  padding: 6px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.build-status-strip.failure {
+  color: var(--subtract);
+}
+
+.build-status-strip details {
+  min-width: 0;
+  width: 100%;
+}
+
+.build-status-strip summary {
+  cursor: pointer;
+}
+
+.build-status-strip pre {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* The right-hand column: the details (or the assembly tree), resizable from its left edge, or hidden to a rail. */
 .panel {
   grid-area: details;

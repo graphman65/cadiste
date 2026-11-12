@@ -24,6 +24,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,11 +40,12 @@ from urllib.parse import parse_qs, quote, urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .agent import Agent, ToolError
+from .background import BackgroundBuilds
 from .cache import SHAPES_SUFFIX, TraceCache
 from .feedback import Feedback
 from .hub import Hub
 from .process import locked, run
-from .project import FolderStep, _CatalogError, _discover
+from .project import FolderStep, _CatalogError, _discover, source_roots
 from .references import SnapshotError
 from .ros import ConfigConflictError, Controls, InvalidConfigError
 
@@ -457,6 +459,7 @@ class _Handler(BaseHTTPRequestHandler):
     agent: Agent
     controls: Controls
     ros_command: tuple[str, ...]
+    background: BackgroundBuilds | None = None
 
     def do_GET(self) -> None:
         url = urlsplit(self.path)
@@ -465,6 +468,9 @@ class _Handler(BaseHTTPRequestHandler):
         fresh = query.get("fresh", ["0"])[0] == "1" or (
             self.builds.always_fresh and query.get("latest", ["0"])[0] != "1"
         )
+        if url.path == "/api/builds/events":
+            self._build_events({key: values[0] for key, values in query.items() if key in ("kind", "name", "path")})
+            return
         if url.path == "/api/project":
             try:
                 catalog = self.project.catalog(refresh=True)
@@ -783,6 +789,25 @@ class _Handler(BaseHTTPRequestHandler):
         threading.Thread(target=process.wait, daemon=True).start()
         self._json({})
 
+    def _build_events(self, target: dict[str, str]) -> None:
+        if self.background is None:
+            self._json({"error": "background builds are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        stream = self.background.events(target)
+        try:
+            for snapshot in stream:
+                chunk = ": keepalive\n\n" if snapshot is None else f"event: builds\ndata: {json.dumps(snapshot)}\n\n"
+                self.wfile.write(chunk.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            stream.close()
+
     def _events(self, tab: str) -> None:
         """The tab's Server-Sent Events, until it goes away or a newer stream for it replaces this one."""
         self.send_response(HTTPStatus.OK)
@@ -926,7 +951,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         # A tab's event stream and state pushes are its heartbeat, not worth a line each.
-        if self.path.startswith("/api/") and not self.path.startswith(("/api/events", "/api/tabs/")):
+        if self.path.startswith("/api/") and not self.path.startswith(
+            ("/api/events", "/api/tabs/", "/api/builds/events")
+        ):
             super().log_message(format, *args)
 
 
@@ -936,18 +963,35 @@ def serve(
 ) -> None:
     """Serve until interrupted; ``lockfile`` says where (``{"url", "pid"}``) for ``cadiste mcp`` to find it."""
     with contextlib.ExitStack() as stack:
+        if threading.current_thread() is threading.main_thread():
+
+            def terminate(_signum: int, _frame: Any) -> None:
+                raise KeyboardInterrupt
+
+            previous_signal = signal.signal(signal.SIGTERM, terminate)
+            stack.callback(signal.signal, signal.SIGTERM, previous_signal)
         if cache is None:
             # Builds still go through a cache, in a directory of its own, so that their shapes are kept to measure.
             directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="cadiste-")))
-            entries, where = TraceCache(directory, [], ""), "no trace cache"
+            targets = [
+                project.target,
+                *([project.parts_target] if project.parts_target else []),
+                *project.assemblies.values(),
+            ]
+            roots = source_roots(targets)
+            entries, where = TraceCache(directory, roots, ""), "no trace cache"
         else:
             entries, where = cache, f"traces kept in {cache.directory}"
         builds = Builds(project, entries, always_fresh=cache is None)
+        background = BackgroundBuilds(builds)
+        builds.on_build = background.completed
+        stack.callback(background.close)
         measurer = Measurer(entries.directory)
         hub = Hub()
         attributes = {
             "project": project,
             "builds": builds,
+            "background": background,
             "measurer": measurer,
             "hub": hub,
             "agent": Agent(hub, builds, measurer, project, Path.cwd()),
@@ -964,6 +1008,7 @@ def serve(
                 lockfile.write_text(json.dumps({"url": url, "pid": os.getpid()}))
                 stack.callback(_remove_lockfile, lockfile)
             print(f"cadiste: {len(project.names)} part(s) from {project.target}, {where}, on {url}", flush=True)
+            background.start()
             with contextlib.suppress(KeyboardInterrupt):
                 server.serve_forever()
 

@@ -30,8 +30,9 @@ follow it. `--assembly [NAME=]module:callable` adds an assembly, listed above th
 unnamed one is "Assembly" alone, else named after its callable). `--trace-env KEY=VALUE` sets environment variables
 for traced builds only (repeatable).
 
-Browser reload and **Rebuild** refresh both the part list and its folder hierarchy from the current `--parts`
-source (`GET /api/project`); no server restart is needed after adding/removing parts or moving their definitions.
+The server watches the model's source roots and automatically refreshes the part list and folder hierarchy after
+edits. Browser reload and **Rebuild** also refresh the current `--parts` source (`GET /api/project`); no server
+restart is needed after adding/removing parts or moving their definitions.
 MCP `list_parts` and project-level `walk_components` discover the current catalog independently of the browser.
 Build/export validation uses that same shared catalog, refreshed before requests, so removed parts and empty
 former folders are rejected. Discovery runs in a fresh interpreter in the server's environment, not the
@@ -39,9 +40,10 @@ trace-only `--trace-env`; model import prints cannot contaminate its JSON. Names
 together under a lock. Discovery/import failures are reported explicitly, leave the last complete snapshot
 untouched, and block serving it as current until discovery succeeds again.
 
-Even an unchanged catalog costs one fresh import/discovery per refresh or build/export validation (including
-lookups of captured builds); the existing snapshot is retained when its contents match. Discovery does not build
-geometry unless the model's catalog itself does so, and does not invalidate geometry cache entries. Without
+Explicit refresh and build/export validation still cost one fresh import/discovery (including lookups of captured
+builds); background warmup shares one catalog discovery per stable source revision. Unchanged catalogs keep their
+existing snapshot. Discovery does not build geometry unless the model's catalog itself does so, and does not
+invalidate geometry cache entries. Without
 `--parts`, the single-model name and arguments stay fixed and catalog requests import nothing. Discovery and
 geometry subprocesses ignore existing bytecode caches, including source edits of the same size and timestamp.
 
@@ -57,9 +59,26 @@ nothing to trace) and kept for the assembly, which is only viewed: 2 s with a wa
 cadiste keeps every trace (and each assembly's scene), with the shapes it measures on, in `.cache/cadiste`
 (`--cache-dir`; `--no-cache` to trace every request). An entry stands while nothing it could depend on changes:
 every file under the model's top-level packages (path, size, modification time, so an edit, a checkout or a data
-file all count), cadiste's own Python, the CAD library versions, the target and the trace environment. Any change
-rebuilds a part the next time it is opened (the 30-tooth gear: 9.6 s to build, then cached geometry is reused);
-Rebuild always builds again. One entry is kept per part; catalog discovery above is separate from this cache.
+file all count), cadiste's own Python, the CAD library versions, the target and the trace environment. Cache
+invalidation remains conservative: any watched change queues all targets, not just inferred dependencies.
+The latest eight generations per target retain their JSON and exact shapes; requests with `build_id=` either
+retrieve that exact target-bound generation or fail explicitly. The cache's own directory is excluded from source
+fingerprints. Catalog discovery is separate from this cache.
+
+At startup and after edits, a single background worker warms parts, assemblies and every folder view. Source
+polling runs every 0.5 s, with a 0.75 s quiet period to coalesce saves. Connected views have first priority, recently
+visited targets next, and remaining targets last; an already-running build is not preempted. Builds reuse the
+current cache, while **Rebuild** always forces only the current target. With `--no-cache`, explicit requests still
+build again; automatic warmup runs once per source revision.
+
+Browsers receive full build/catalog snapshots over `GET /api/builds/events` (SSE), but fetch geometry only for
+targets they have requested. Old geometry stays interactive while queued/building or after a failed refresh;
+the status strip identifies stale geometry, connection state and expandable errors. Successful generations replace
+visited views automatically and clear selections tied to the previous geometry. Folder traces refresh separately
+and only map onto scenes from the same source fingerprint. Live simulation defers CAD replacements until returning
+to CAD. Failures are retried after the next source edit or an explicit
+rebuild, not continuously. This removes the on-demand CAD wait when warmup has completed; scene rendering itself
+still runs on the browser's main thread when switching targets.
 
 - **3D view**: three-cad-viewer (OCP CAD Viewer's renderer) on meshes from `ocp_tessellate`, in the app's colours,
   under the app's own toolbar: preset views, reset, orthographic/perspective, see-through, black edges, axes, XY
@@ -162,8 +181,9 @@ Rebuild always builds again. One entry is kept per part; catalog discovery above
 - **View bar** (atop the 3D view): what is open, its kind (icon and word: part, assembly, file, package) and name
   after the folders it is in (`chassis / steering_module / Steering Module`), and its build: ops and faces traced
   for a part, parts or instances for the others, the build time, and whether it came from the cache.
-- **Rebuild** traces the part again, past the cache. Each trace runs `cadiste export` in a fresh interpreter, so
-  source edits show up, and a model's in-process memoisation (pipecrawler's `functools.cache` on `build_part`)
+- **Rebuild** rebuilds only the current target, past the cache: a traced part, an untraced assembly, or a folder's
+  combined scene (not forced rebuilds of its individual traces). Each trace runs `cadiste export` in a fresh
+  interpreter, so source edits show up, and a model's in-process memoisation (`functools.cache` on `build_part`)
   cannot hand back a part that was never built under the tracer. The view bar says when a trace came from the cache.
 - **Export** (top bar) downloads what is open as STEP, STL or BREP: a part, a folder's parts (a STEP keeps them
   as one group of named parts, each in its own frame) or an assembly (a STEP keeps its tree: group and instance
@@ -546,6 +566,8 @@ for record in trace.builders:
 | `mesh.py` | Shapes tessellated by `ocp_tessellate` into three-cad-viewer's format, with each object's viewer path and each leaf's faces, edges and vertices placed and numbered as the viewer has them. |
 | `measure.py` | Those faces, edges and vertices written next to a build's JSON and read back; exact measurements of the ones the viewer picked, and the faces an edge or vertex bounds. |
 | `server.py` | `cadiste serve`: the built frontend, the part list, one `cadiste export` subprocess per trace, one `cadiste mesh` per assembly view, through the cache; one `cadiste save` per CAD export; measurements on the last few builds' shapes, kept loaded; the hub's endpoints. |
+| `background.py` | Debounced source watching, current/visited/remaining target priorities, one background build worker and revision-bound SSE snapshots. |
+| `process.py` | Cancellable captured subprocesses and lock acquisition, so background work stops before temporary caches are removed. |
 | `hub.py` | Agent sessions and viewer tabs: link requests, each tab's event stream (Server-Sent Events) and state, requests to a tab and their replies. |
 | `agent.py` | What `cadiste mcp`'s tools do, run in the server: cached builds, linked-tab state, and self-contained selection snapshots. |
 | `references.py` | Self-contained Markdown selection snapshots, ordered multi-selection validation, build identity checks, and captured geometry/provenance; no lookup store. |

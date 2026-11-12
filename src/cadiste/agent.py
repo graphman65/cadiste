@@ -325,12 +325,17 @@ class Agent:
         kind = target["kind"]
         previous = self.builds.latest(target) if kind == "part" and fresh else None
         build = self.builds.get(target, fresh)
-        tab = self._tab_if_any(session)
-        if tab is not None:
-            self.hub.call(tab, "open", {"target": target, "select": select}, _OPEN_WAIT)
         if build.body is None:
             return Answer(_failure(build))
         built = json.loads(build.body)
+        tab = self._tab_if_any(session)
+        if tab is not None:
+            self.hub.call(
+                tab,
+                "open",
+                {"target": target, "build_id": built["build_id"], "select": select},
+                _OPEN_WAIT,
+            )
         source = "from the cache, the source unchanged since" if build.cached else "built"
         if kind == "part":
             text = f"{_target_text(target)} {source}: {context.trace_summary(built)}"

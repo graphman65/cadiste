@@ -96,6 +96,8 @@ export interface PartScene {
 
 export interface TraceData {
   /** `volume` in mm³ (of its solids), `bbox` its axis-aligned bounds in mm. */
+  build_id: string;
+  source_fingerprint?: string;
   result: { type: string; faces: number; attributed: number; volume: number; bbox: { min: Vec3; max: Vec3 } };
   build_seconds: number;
   roots: TreeNode[];
@@ -106,6 +108,8 @@ export interface TraceData {
 }
 
 export interface AssemblyData {
+  build_id: string;
+  source_fingerprint?: string;
   /** `part_of`: instance (leaf path) -> the part it is an instance of, when the server could tell. */
   scene: { data: SceneData; root: string; part_of?: Record<string, string> };
   build_seconds: number;
@@ -269,7 +273,7 @@ export interface TabState {
 export interface HubCalls {
   /** Open a target, its build fetched again, then select a tree node (part) or an instance (assembly, file). */
   open: {
-    params: { target: Target; select?: string | null };
+    params: { target: Target; build_id: string; select?: string | null };
     result: { status: "ok" } | { status: "error"; error: string; log?: string };
   };
   /** Replace the entire explicit selection; [] clears it. */
