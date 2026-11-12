@@ -67,7 +67,7 @@ class Snapshot:
         self.root = root
 
     def _pinned(self, target: dict[str, Any], shapes: Any) -> Build:
-        build = self.builds.latest(target)
+        build = self.builds.latest(target, refresh=False)
         if (
             not isinstance(shapes, str)
             or not shapes

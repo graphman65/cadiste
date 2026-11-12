@@ -340,9 +340,9 @@ class Builds:
             self.on_build(target, result)
         return result
 
-    def latest(self, target: dict[str, Any]) -> Build | None:
-        """The target's last build, as the viewer shows it, even if its source changed since (None: never built)."""
-        kind, name, *_ = self._recipe(target, refresh=True)
+    def latest(self, target: dict[str, Any], *, refresh: bool = True) -> Build | None:
+        """The last retained build; snapshots can skip discovery of the live project catalog."""
+        kind, name, *_ = self._recipe(target, refresh=refresh)
         file = self.cache.latest(kind, name)
         if file is None:
             return None

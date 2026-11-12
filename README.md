@@ -475,6 +475,11 @@ claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
   call stacks and captured source, with exact geometry as supporting evidence.
   Folder picks include their owning part and available part provenance. Missing or unverifiable context is
   reported explicitly rather than guessed. A snapshot describes the captured build, not necessarily current source.
+  Preparation loads any missing owning-part traces, measures picked B-rep geometry and validates its source
+  mapping; it is not just formatting the viewer's labels. Snapshot lookup reuses the loaded catalog and
+  retained builds without rediscovering or importing the live model. Build-identity, expiry and geometric
+  correspondence checks remain enforced; copying never silently substitutes newer geometry. First-time
+  owning-part trace builds can still take longer than copying already-loaded geometry.
 - **Multiple selection.** Click replaces the selection; Ctrl/Cmd-click toggles an item, and Shift-click adds
   items (a range in a feature tree). Features, assembly instances, and faces, edges and vertices can be selected
   together, including across parts in a folder. The toolbar shows the selection count and a clear action;

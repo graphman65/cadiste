@@ -10,6 +10,7 @@ from build123d import Axis, Box, BuildPart, Cylinder, Location, Locations, Mode,
 
 from cadiste import Provenance, context, tracing
 from cadiste.agent import Agent
+from cadiste.cache import TraceCache
 from cadiste.export import export_trace
 from cadiste.hub import Hub
 from cadiste.measure import Shapes, adjacent_faces, corresponding_entity, load, save
@@ -25,7 +26,7 @@ class _Builds:
     def put(self, target: dict[str, Any], build: Build) -> None:
         self.entries[json.dumps(target, sort_keys=True)] = build
 
-    def latest(self, target: dict[str, Any]) -> Build | None:
+    def latest(self, target: dict[str, Any], *, refresh: bool = True) -> Build | None:
         return self.entries.get(json.dumps(target, sort_keys=True))
 
 
@@ -234,6 +235,52 @@ def test_missing_identity_is_not_replaced_by_the_latest_build(tmp_path: Path):
 
     with pytest.raises(SnapshotError, match="unavailable or expired"):
         snapshot.create(None, state)
+
+
+def test_loaded_assembly_snapshot_does_not_import_changed_live_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    snapshot, retained, state, trace = _setup(tmp_path, folder=True)
+    composite = retained.latest(state["target"])
+    owner = retained.latest({"kind": "part", "name": "A"})
+    assert composite is not None and owner is not None
+    assert composite.body is not None and owner.body is not None
+    selected_path = f"{_folder_path(retained, state, 'A')}/faces/faces_{_face(trace, 'Cylinder')}"
+    target = {"kind": "assembly", "name": "Captured"}
+    snapshot.project.assemblies = {"Captured": "unavailable_model:assembly"}
+    snapshot.project.parts_target = "unavailable_model:PARTS"
+    # Loaded geometry must remain copyable even when executing the edited live
+    # model would now fail. Real cache lookup and B-rep measurement still run.
+    (tmp_path / "unavailable_model.py").write_text("raise RuntimeError('live model is temporarily broken')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    cache = TraceCache(tmp_path / "retained", [], "")
+
+    def keep(build: Build, kind: str, name: str) -> Path:
+        assert build.body is not None and build.shapes is not None
+
+        def save_retained(shapes: Path) -> bytes:
+            assert build.body is not None and build.shapes is not None
+            shapes.write_bytes(build.shapes.read_bytes())
+            return build.body
+
+        _, _, shapes = cache.get_or_make(kind, name, save_retained)
+        assert shapes is not None
+        return shapes
+
+    assembly_shapes = keep(composite, "assembly", "Captured")
+    owner_shapes = keep(owner, "trace", "A")
+    state.update(
+        target=target,
+        shapes=assembly_shapes.name,
+        partShapes={"A": owner_shapes.name},
+        selection=[{"kind": "entity", "path": selected_path}],
+    )
+    snapshot.builds = Builds(snapshot.project, cache, always_fresh=False)
+    snapshot.measurer = Measurer(cache.directory)
+    copied = snapshot.create(None, state)["text"]
+
+    assert hashlib.sha256(composite.body).hexdigest() in copied
+    assert hashlib.sha256(owner.body).hexdigest() in copied
+    assert assembly_shapes.name in copied and owner_shapes.name in copied
+    assert selected_path in copied
 
 
 def test_missing_or_mismatched_folder_trace_reports_why_provenance_is_unavailable(tmp_path: Path):
