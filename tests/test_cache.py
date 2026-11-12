@@ -48,8 +48,6 @@ def test_a_trace_is_built_once_until_the_model_source_changes(tmp_path: Path):
 
     module.write_text("WIDTH = 22\n")  # an edit: another size
     assert cache.get_or_make("trace", "Bracket", make)[:2] == (b"second", False)
-    # The entry made for the old source is gone, not left to pile up.
-    assert len(list((tmp_path / "cache").glob("trace-Bracket-*.json"))) == 1
 
 
 def test_an_edit_that_keeps_the_size_still_invalidates(tmp_path: Path):
@@ -92,7 +90,7 @@ def test_entries_are_separate_per_part_and_per_salt(tmp_path: Path):
     assert other_environment.get_or_make("trace", "Bracket", make)[:2] == (b"c", False)
 
 
-def test_a_build_keeps_its_shapes_with_it_and_drops_them_with_it(tmp_path: Path):
+def test_rebuild_retains_captured_geometry_until_generation_expiry(tmp_path: Path):
     source = tmp_path / "model.py"
     source.write_text("")
     cache = TraceCache(tmp_path / "cache", [source], salt="")
@@ -105,8 +103,15 @@ def test_a_build_keeps_its_shapes_with_it_and_drops_them_with_it(tmp_path: Path)
     source.write_text("WIDTH = 2\n")
     _, _, rebuilt = cache.get_or_make("trace", "Bracket", make)
     assert rebuilt is not None and rebuilt.read_bytes() == b"shapes of second"
-    assert not shapes.exists()  # the old build's shapes went with its JSON
-    assert sorted(p.name for p in (tmp_path / "cache").iterdir()) == sorted([rebuilt.name, rebuilt.stem + ".json"])
+    assert shapes.read_bytes() == b"shapes of first"
+    assert cache.captured("trace", "Bracket", shapes.stem) == shapes.with_suffix(".json")
+    assert cache.captured("trace", "Other", shapes.stem) is None
+    assert cache.captured("trace", "Bracket", "../" + shapes.stem) is None
+    for _ in range(7):
+        cache.get_or_make("trace", "Bracket", make, fresh=True)
+    assert cache.captured("trace", "Bracket", shapes.stem) is None
+    assert not shapes.exists()
+    assert rebuilt.read_bytes() == b"shapes of second"
 
 
 def test_fresh_builds_get_distinct_identities_even_without_source_changes(tmp_path: Path):
@@ -119,7 +124,7 @@ def test_fresh_builds_get_distinct_identities_even_without_source_changes(tmp_pa
     _, _, second = cache.get_or_make("trace", "Bracket", make, fresh=True)
 
     assert first is not None and second is not None and first.name != second.name
-    assert not first.exists()
+    assert first.read_bytes() == b"shapes of first"
     assert second.read_bytes() == b"shapes of second"
     assert cache.latest("trace", "Bracket") == second.with_suffix(".json")
     assert cache.get_or_make("trace", "Bracket", make)[1:] == (True, second)
@@ -335,3 +340,22 @@ def test_single_model_catalog_and_arguments_stay_fixed(live_catalog: Path, tmp_p
         live_catalog.write_text("raise RuntimeError('not needed for catalog')\n")
         status, body = _request(url, "/api/project")
         assert status == 200 and json.loads(body)["parts"] == expected
+
+
+def test_exact_http_capture_keeps_old_geometry_and_rejects_another_target(live_catalog: Path, tmp_path: Path):
+    project = Project("live_catalog.catalog:build", (), None, parts_target="live_catalog.catalog:PARTS")
+    with _catalog_server(tmp_path, project) as (url, _, _):
+        status, body = _request(url, "/api/trace?part=Aaa")
+        assert status == 200
+        first = json.loads(body)
+        module = live_catalog.parent / "alpha.py"
+        module.write_text(module.read_text().replace("Box(1, 2, 3)", "Box(7, 2, 3)"))
+        status, body = _request(url, "/api/trace?part=Aaa")
+        assert status == 200
+        second = json.loads(body)
+        assert second["result"]["volume"] == pytest.approx(42)
+        assert second["build_id"] != first["build_id"]
+        status, body = _request(url, f"/api/trace?part=Aaa&build_id={first['build_id']}")
+        assert status == 200
+        assert json.loads(body)["result"]["volume"] == pytest.approx(6)
+        assert _request(url, f"/api/trace?part=Anchor&build_id={first['build_id']}")[0] == 410

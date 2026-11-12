@@ -42,6 +42,7 @@ from .agent import Agent, ToolError
 from .cache import SHAPES_SUFFIX, TraceCache
 from .feedback import Feedback
 from .hub import Hub
+from .process import locked, run
 from .project import FolderStep, _CatalogError, _discover
 from .references import SnapshotError
 from .ros import ConfigConflictError, Controls, InvalidConfigError
@@ -57,7 +58,7 @@ _KEPT_SHAPES = 4
 """Shapes files kept loaded: the views open lately."""
 
 
-class _ShapesGoneError(Exception):
+class _ShapesGoneError(LookupError):
     """The shapes file asked for is not (or no longer) there: its build was made again, or never wrote one."""
 
 
@@ -156,14 +157,16 @@ class Project:
         self._catalog_error: _CatalogError | None = None
         self._catalog_lock = threading.Lock()
 
-    def catalog(self, *, refresh: bool = False) -> _Catalog:
+    def catalog(self, *, refresh: bool = False, cancel: threading.Event | None = None) -> _Catalog:
         """One coherent names/folders snapshot. Refreshes serialize discovery and publish only complete results.
         A failed discovery blocks stale reads until a later successful refresh; fixed single-model mode never
         imports anything. Unchanged catalogs keep the same snapshot, but discovery still runs on each refresh."""
-        with self._catalog_lock:
+        with locked(self._catalog_lock, cancel):
             if refresh and self.parts_target is not None:
                 try:
-                    parts, folders = _discover(self.parts_target)
+                    parts, folders = (
+                        _discover(self.parts_target) if cancel is None else _discover(self.parts_target, cancel=cancel)
+                    )
                 except _CatalogError as error:
                     self._catalog_error = error
                     raise
@@ -202,7 +205,9 @@ class Project:
         return self.catalog().folder_parts(path)
 
 
-def _run(command: list[str], environment: dict[str, str] | None = None) -> tuple[bytes | None, dict[str, str]]:
+def _run(
+    command: list[str], environment: dict[str, str] | None = None, *, cancel: threading.Event | None = None
+) -> tuple[bytes | None, dict[str, str]]:
     """The command's stdout, or None and the error to report."""
     with tempfile.TemporaryDirectory(prefix="cadiste-bytecode-") as directory:
         # -B alone still reads existing .pyc files. An empty prefix bypasses those too, even for edits whose
@@ -214,9 +219,11 @@ def _run(command: list[str], environment: dict[str, str] | None = None) -> tuple
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         try:
-            done = subprocess.run(command, capture_output=True, timeout=_TRACE_TIMEOUT, check=False, env=env)
+            done = run(command, timeout=_TRACE_TIMEOUT, env=env, cancel=cancel)
         except subprocess.TimeoutExpired:
             return None, {"error": f"took over {_TRACE_TIMEOUT} s"}
+        except InterruptedError as error:
+            return None, {"error": str(error)}
         if done.returncode != 0:
             return None, {"error": "the build failed", "log": done.stderr.decode(errors="replace")}
     return done.stdout, {}
@@ -256,15 +263,16 @@ class Builds:
         self.project = project
         self.cache = cache
         self.always_fresh = always_fresh
-        """No cache (``--no-cache``): ``cache`` only holds the latest build of each, for its shapes."""
+        """No cache: successful geometry is still retained for exact captured-generation requests."""
+        self.on_build: Callable[[dict[str, Any], Build], None] | None = None
 
     def _recipe(
-        self, target: dict[str, Any], *, refresh: bool = False
+        self, target: dict[str, Any], *, refresh: bool = False, cancel: threading.Event | None = None
     ) -> tuple[str, str, list[str], dict[str, str] | None, str]:
         """The cache entry's kind and name, the command (a cadiste subcommand: ``[python, -m, cadiste, <sub>, ...]``),
         its environment and what it does; LookupError for a target the project does not have."""
         project = self.project
-        catalog = project.catalog(refresh=refresh)
+        catalog = project.catalog(refresh=refresh, cancel=cancel)
         match target:
             case {"kind": "part", "name": str(name)}:
                 if name not in catalog.names:
@@ -287,21 +295,48 @@ class Builds:
                 return "file", path, [*command, *names], None, f"building {path!r}"
         raise LookupError(f"not something to build: {target!r}")
 
-    def get(self, target: dict[str, Any], fresh: bool) -> Build:
+    def get(
+        self,
+        target: dict[str, Any],
+        fresh: bool,
+        *,
+        refresh: bool = True,
+        cancel: threading.Event | None = None,
+        notify: bool = True,
+    ) -> Build:
         """The target's build, from the cache unless ``fresh`` (or its source changed); a failed build is not
         cached."""
-        kind, name, command, environment, doing = self._recipe(target, refresh=True)
+        kind, name, command, environment, doing = self._recipe(target, refresh=refresh, cancel=cancel)
         failure: dict[str, str] = {}
 
         def make(shapes: Path) -> bytes | None:
-            body, failed = _run([*command[:4], "--shapes", str(shapes), *command[4:]], environment)
+            before = self.cache.fingerprint()
+            invocation = [*command[:4], "--shapes", str(shapes), *command[4:]]
+            body, failed = (
+                _run(invocation, environment) if cancel is None else _run(invocation, environment, cancel=cancel)
+            )
             failure.update(failed)
-            return body
+            if body is None:
+                return None
+            if before != self.cache.fingerprint():
+                failure["error"] = "source changed during the build; request the target again"
+                return None
+            data = json.loads(body)
+            data["build_id"] = shapes.name.split(".shapes.", 1)[0]
+            data["source_fingerprint"] = before
+            return json.dumps(data, separators=(",", ":")).encode()
 
-        body, cached, shapes = self.cache.get_or_make(kind, name, make, fresh)
+        try:
+            body, cached, shapes = self.cache.get_or_make(kind, name, make, fresh, cancel=cancel)
+        except InterruptedError as error:
+            body, cached, shapes = None, False, None
+            failure["error"] = str(error)
         if body is None:
             failure["error"] = f"{doing}: {failure.get('error', 'no output')}"
-        return Build(body, cached, shapes, failure)
+        result = Build(body, cached, shapes, failure)
+        if notify and self.on_build is not None:
+            self.on_build(target, result)
+        return result
 
     def latest(self, target: dict[str, Any]) -> Build | None:
         """The target's last build, as the viewer shows it, even if its source changed since (None: never built)."""
@@ -311,6 +346,15 @@ class Builds:
             return None
         shapes = file.with_suffix(SHAPES_SUFFIX)
         return Build(file.read_bytes(), True, shapes if shapes.is_file() else None, {})
+
+    def captured(self, target: dict[str, Any], build_id: str) -> Build:
+        """Read only the named retained generation of this exact target."""
+        kind, name, *_ = self._recipe(target, refresh=True)
+        path = self.cache.captured(kind, name, build_id)
+        if path is None:
+            raise _ShapesGoneError("the requested build is unavailable or expired; rebuild explicitly")
+        shapes = path.with_suffix(SHAPES_SUFFIX)
+        return Build(path.read_bytes(), True, shapes if shapes.is_file() else None, {})
 
     def save(self, target: dict[str, Any], form: str, only: list[str] | None = None) -> Saved:
         """The target built again (not traced: the model's own part cache may serve) and written as a CAD file in
@@ -438,11 +482,13 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 )
         elif url.path == "/api/trace":
-            self._built({"kind": "part", "name": query.get("part", [""])[0]}, fresh)
+            self._built({"kind": "part", "name": query.get("part", [""])[0]}, fresh, query.get("build_id", [None])[0])
         elif url.path == "/api/assembly":
-            self._built({"kind": "assembly", "name": query.get("name", [""])[0]}, fresh)
+            self._built(
+                {"kind": "assembly", "name": query.get("name", [""])[0]}, fresh, query.get("build_id", [None])[0]
+            )
         elif url.path == "/api/file":
-            self._built({"kind": "file", "path": query.get("path", [""])[0]}, fresh)
+            self._built({"kind": "file", "path": query.get("path", [""])[0]}, fresh, query.get("build_id", [None])[0])
         elif url.path == "/api/export":
             self._export({key: values[0] for key, values in query.items() if key != "part"}, query.get("part"))
         elif url.path == "/api/gazebo":
@@ -460,9 +506,12 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._static(url.path)
 
-    def _built(self, target: dict[str, Any], fresh: bool) -> None:
+    def _built(self, target: dict[str, Any], fresh: bool, build_id: str | None = None) -> None:
         try:
-            build = self.builds.get(target, fresh)
+            build = self.builds.captured(target, build_id) if build_id else self.builds.get(target, fresh)
+        except _ShapesGoneError as error:
+            self._json({"error": str(error)}, HTTPStatus.GONE)
+            return
         except _CatalogError as error:
             self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
