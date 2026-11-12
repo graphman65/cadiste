@@ -11,10 +11,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import FunctionType
 from typing import Any
+
+from .process import run
 
 
 def load(target: str) -> Any:
@@ -130,7 +133,9 @@ class _CatalogError(ValueError):
     """Discovery failed; the last complete catalog must not be served as current."""
 
 
-def _discover(target: str) -> tuple[tuple[str, ...], dict[str, list[FolderStep]]]:
+def _discover(
+    target: str, *, cancel: threading.Event | None = None
+) -> tuple[tuple[str, ...], dict[str, list[FolderStep]]]:
     """Discover names and folders together in the server's interpreter/environment, never importing the model
     into the server. A private, empty bytecode directory also bypasses timestamp/size-valid stale .pyc files."""
     script = """
@@ -150,13 +155,7 @@ print(json.dumps({"parts": list(definitions), "folders": folders}))
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         try:
-            done = subprocess.run(
-                [sys.executable, "-c", script, target],
-                capture_output=True,
-                timeout=900,
-                check=False,
-                env=environment,
-            )
+            done = run([sys.executable, "-c", script, target], timeout=900, env=environment, cancel=cancel)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise _CatalogError(f"part discovery failed: {error}") from error
     if done.returncode != 0:
