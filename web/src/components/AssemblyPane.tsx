@@ -12,13 +12,19 @@ interface Props {
   data: AssemblyData;
   /** The project's parts, in its order: the Parts tab lists those the assembly has instances of in this order. */
   parts: string[];
-  hidden: ReadonlySet<string>;
+  hiddenParts: ReadonlySet<string>;
+  hiddenInstances: ReadonlySet<string>;
+  soloPart: string | null;
+  soloInstance: string | null;
+  onSoloPart: (part: string) => void;
+  onSoloInstance: (id: string) => void;
   /** The focused instance-tree node and the last selected owning part, used for navigation and scrolling. */
   instance: string | null;
   marked: string | null;
   selectedPaths: ReadonlySet<string>;
   selectedParts: readonly string[];
   onVisibility: (leaves: string[], visible: boolean) => void;
+  onPartVisibility: (leaves: string[], visible: boolean) => void;
   onSelectInstance: (id: string, mode?: SelectionMode, range?: string[]) => void;
   onSelectPart: (part: string, mode?: SelectionMode, range?: string[]) => void;
   onHover: (id: string | null) => void;
@@ -29,9 +35,12 @@ const TABS = ["parts", "instances"] as const;
 
 /** An assembly's sidebar: its parts (every instance of each at once) or its instances as built. */
 export function AssemblyPane(props: Props) {
-  const { name, data, parts, hidden, instance, marked, selectedPaths, selectedParts, onVisibility, onSelectInstance, onSelectPart } = props;
+  const { name, data, parts, hiddenParts, hiddenInstances, instance, marked, selectedPaths, selectedParts, onVisibility, onPartVisibility, onSelectInstance, onSelectPart } = props;
   const { onHover, onOpen } = props;
+  const { soloPart, soloInstance, onSoloPart, onSoloInstance } = props;
   const [tab, setTab] = usePersistentChoice("cadiste.assembly-tab", TABS);
+  const hidden = tab === "parts" ? hiddenParts : hiddenInstances;
+  const showAll = tab === "parts" ? onPartVisibility : onVisibility;
   const root = data.scene.data.shapes;
   const leaves = useMemo(() => shapeLeaves(root), [root]);
   const hiddenHere = leaves.filter((leaf) => hidden.has(leaf.id)).length;
@@ -45,7 +54,7 @@ export function AssemblyPane(props: Props) {
           {leaves.length} instances{hiddenHere > 0 && ` · ${hiddenHere} hidden`}
         </span>
         {hiddenHere > 0 && (
-          <button className="link show-all" onClick={() => onVisibility(leaves.map((leaf) => leaf.id), true)}>
+          <button className="link show-all" onClick={() => showAll(leaves.map((leaf) => leaf.id), true)}>
             Show all
           </button>
         )}
@@ -67,17 +76,21 @@ export function AssemblyPane(props: Props) {
         <AssemblyParts
           data={data}
           parts={parts}
-          hidden={hidden}
+          hidden={hiddenParts}
+          solo={soloPart}
+          onSolo={onSoloPart}
           selectedParts={selectedParts}
           marked={marked}
-          onVisibility={onVisibility}
+          onVisibility={onPartVisibility}
           onSelect={onSelectPart}
           onOpen={onOpen}
         />
       ) : (
         <AssemblyTree
           root={root}
-          hidden={hidden}
+          hidden={hiddenInstances}
+          solo={soloInstance}
+          onSolo={onSoloInstance}
           selected={instance}
           selectedPaths={selectedPaths}
           onVisibility={onVisibility}
@@ -95,6 +108,8 @@ interface PartsProps {
   data: AssemblyData;
   parts: string[];
   hidden: ReadonlySet<string>;
+  solo: string | null;
+  onSolo: (part: string) => void;
   selectedParts: readonly string[];
   onVisibility: (leaves: string[], visible: boolean) => void;
   marked: string | null;
@@ -103,7 +118,7 @@ interface PartsProps {
 }
 
 /** The assembly's parts, each with its instances: hide or show them all, light them all, open the part. */
-function AssemblyParts({ data, parts, hidden, selectedParts, marked, onVisibility, onSelect, onOpen }: PartsProps) {
+function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marked, onVisibility, onSelect, onOpen }: PartsProps) {
   const [filter, setFilter] = useState("");
   const list = useRef<HTMLUListElement>(null);
   const anchor = useRef<string | null>(null);
@@ -162,6 +177,7 @@ function AssemblyParts({ data, parts, hidden, selectedParts, marked, onVisibilit
           const showing = leaves.filter((leaf) => !hidden.has(leaf)).length;
           const visible = showing > 0;
           const selected = selectedParts.includes(part);
+          const soloed = solo === part;
           return (
             <li key={part} role="presentation">
               <div
@@ -173,14 +189,26 @@ function AssemblyParts({ data, parts, hidden, selectedParts, marked, onVisibilit
                 onDoubleClick={() => onOpen(part)}
               >
                 <button
-                  className={showing === leaves.length ? "eye" : visible ? "eye partial" : "eye off"}
-                  title={visible ? `Hide its ${leaves.length} instance(s)` : `Show its ${leaves.length} instance(s)`}
+                  className={`${showing === leaves.length ? "eye" : visible ? "eye partial" : "eye off"}${solo !== null ? " overridden" : ""}`}
+                  title={`${visible ? `Hide its ${leaves.length} instance(s)` : `Show its ${leaves.length} instance(s)`}${solo !== null ? " (temporarily overridden by solo)" : ""}`}
                   onClick={(event) => {
                     event.stopPropagation();
                     onVisibility(leaves, !visible);
                   }}
                 >
                   <Icon name={visible ? "eye" : "eye-off"} />
+                </button>
+                <button
+                  className={soloed ? "eye solo active" : "eye solo"}
+                  aria-label={`Solo ${part}`}
+                  aria-pressed={soloed}
+                  title={soloed ? "Disable solo; restore eye settings" : `Solo ${part}: show only its instances`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSolo(part);
+                  }}
+                >
+                  <Icon name="solo" />
                 </button>
                 <span className={visible ? "title" : "title muted"}>{part}</span>
                 <span className="count">×{leaves.length}</span>

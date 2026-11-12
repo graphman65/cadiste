@@ -219,6 +219,10 @@ export function App() {
   // In a file's view, the part whose feature is selected.
   const [focusPart, setFocusPart] = useState<string | null>(null);
   const [hiddenInstances, setHiddenInstances] = useState<ReadonlySet<string>>(new Set());
+  // Each tab overrides only its own eyes; both visibility layers must allow a leaf.
+  const [hiddenParts, setHiddenParts] = useState<ReadonlySet<string>>(new Set());
+  const [soloPart, setSoloPart] = useState<string | null>(null);
+  const [soloInstance, setSoloInstance] = useState<string | null>(null);
   const [instance, setInstance] = useState<string | null>(null);
   // In an assembly's view, the part whose instances are all lit.
   const [litPart, setLitPart] = useState<string | null>(null);
@@ -274,6 +278,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    setHiddenParts(new Set());
+    setSoloPart(null);
+    setSoloInstance(null);
     if (target === null || (target.kind === "assembly" && target.name === "")) return;
     window.history.replaceState(null, "", hashOf(target));
     setSelected(null);
@@ -322,6 +329,28 @@ export function App() {
     () => (trace === null || index === null ? new Set<string>() : relatedTo(trace, index, selected)),
     [trace, index, selected],
   );
+  const effectiveHidden = useMemo(() => {
+    if (assemblyData === null || (soloPart === null && soloInstance === null && hiddenParts.size === 0)) return hiddenInstances;
+    const root = assemblyData.scene.data.shapes;
+    const leaves = shapeLeaves(root);
+    const partLeaves = soloPart === null ? null : new Set(leaves.filter((leaf) => target?.kind === "file"
+      ? leaf.name === soloPart : assemblyData.scene.part_of?.[leaf.id] === soloPart).map((leaf) => leaf.id));
+    const node = soloInstance === null ? undefined : findShape(root, soloInstance);
+    const instanceLeaves = node === undefined ? null : new Set(shapeLeaves(node).map((leaf) => leaf.id));
+    return new Set(leaves.filter((leaf) => {
+      // If a rebuild removed a soloed row, use that layer's eyes instead.
+      const partVisible = partLeaves !== null && partLeaves.size > 0 ? partLeaves.has(leaf.id) : !hiddenParts.has(leaf.id);
+      const instanceVisible = instanceLeaves !== null ? instanceLeaves.has(leaf.id) : !hiddenInstances.has(leaf.id);
+      return !partVisible || !instanceVisible;
+    }).map((leaf) => leaf.id));
+  }, [soloPart, soloInstance, assemblyData, target, hiddenParts, hiddenInstances]);
+  const toggleSoloPart = useCallback((part: string) => {
+    setSoloPart((current) => current === part ? null : part);
+  }, []);
+  const toggleSoloInstance = useCallback((id: string) => {
+    setSoloInstance((current) => current === id ? null : id);
+  }, []);
+
   const focus = useMemo(() => {
     if (target?.kind === "part" && trace !== null && index !== null) {
       const features = selection.filter((item): item is Extract<SelectionItem, { kind: "feature" }> => item.kind === "feature" && item.part === target.name);
@@ -346,7 +375,7 @@ export function App() {
     }
     if (assemblyData === null) return null;
     const root = assemblyData.scene.data.shapes;
-    const base = assemblyFocus(root, hiddenInstances, null);
+    const base = assemblyFocus(root, effectiveHidden, null);
     const lit = selection.flatMap((item) => {
       if (item.kind === "entity") return [item.path];
       if (item.kind === "instance") {
@@ -354,10 +383,10 @@ export function App() {
         return node === undefined ? [] : shapeLeaves(node).map((leaf) => leaf.id);
       }
       const inFile = target?.kind === "file" ? partInFile(assemblyData.scene.data, traces, item.part) : null;
-      return inFile === null ? [] : fileFocus(root, hiddenInstances, { ...inFile, selected: item.node }).lit;
+      return inFile === null ? [] : fileFocus(root, effectiveHidden, { ...inFile, selected: item.node }).lit;
     });
     return { ...base, lit: [...new Set(lit)] };
-  }, [target, trace, index, selection, assemblyData, traces, hiddenInstances]);
+  }, [target, trace, index, selection, assemblyData, traces, effectiveHidden]);
 
   // The target effect resets its selection, and a cold target may still be building. Restore only once its
   // scene is available; viewer-owned state then lands after the restored feature focus in the next commit.
@@ -370,6 +399,9 @@ export function App() {
     if (state?.status !== "ok") return;
     const saved = savedView.scene;
     setHiddenInstances(new Set(saved.hidden));
+    setHiddenParts(new Set());
+    setSoloPart(null);
+    setSoloInstance(null);
     setSelection(saved.selection);
     setSelected(saved.selected);
     setFocusPart(saved.focusPart);
@@ -459,6 +491,13 @@ export function App() {
       return next;
     });
   }, []);
+  const setPartVisibility = useCallback((leaves: string[], visible: boolean) => {
+    setHiddenParts((current) => {
+      const next = new Set(current);
+      leaves.forEach((leaf) => (visible ? next.delete(leaf) : next.add(leaf)));
+      return next;
+    });
+  }, []);
 
   const toggleIn = useCallback((part: string, id: string, open?: boolean) => {
     setCollapsedBy((all) => {
@@ -490,7 +529,7 @@ export function App() {
   // In a file's view, the parts its eyes leave shown, when some are hidden: the ones Export writes.
   const shownParts = fileParts.filter((part) => {
     const leaf = leafOf(part);
-    return leaf === null || !hiddenInstances.has(leaf);
+    return leaf === null || !effectiveHidden.has(leaf);
   });
   const exportShown = shownParts.length < fileParts.length ? { parts: shownParts, of: fileParts.length } : null;
 
@@ -636,7 +675,7 @@ export function App() {
     selection: simulation.enabled ? [] : selection,
     partShapes: Object.fromEntries(Object.entries(traces).flatMap(([part, load]) =>
       load.status === "ok" && load.shapes !== null ? [[part, load.shapes]] : [])),
-    hidden: [...hiddenInstances],
+    hidden: [...effectiveHidden],
   };
   const hub = useHub(tabState, handleHub);
 
@@ -889,15 +928,17 @@ export function App() {
                   selection={selection}
                   related={related}
                   collapsed={collapsedBy}
+                  solo={soloPart}
+                  onSolo={toggleSoloPart}
                   visible={(part) => {
                     const leaf = leafOf(part);
-                    return leaf === null || !hiddenInstances.has(leaf);
+                    return leaf === null || !hiddenParts.has(leaf);
                   }}
                   onSelect={selectIn}
                   onToggle={toggleIn}
                   onVisibility={(part, visible) => {
                     const leaf = leafOf(part);
-                    if (leaf !== null) setVisibility([leaf], visible);
+                    if (leaf !== null) setPartVisibility([leaf], visible);
                   }}
                   onHover={(part) => setHover(part === null ? null : leafOf(part))}
                   onOpen={(name) => setTarget({ kind: "part", name })}
@@ -908,12 +949,18 @@ export function App() {
                   name={target.name}
                   data={assemblyData}
                   parts={project?.parts ?? []}
-                  hidden={hiddenInstances}
+                  hiddenParts={hiddenParts}
+                  hiddenInstances={hiddenInstances}
+                  soloPart={soloPart}
+                  soloInstance={soloInstance}
+                  onSoloPart={toggleSoloPart}
+                  onSoloInstance={toggleSoloInstance}
                   instance={instance}
                   marked={markedPart}
                   selectedParts={selectedParts}
                   selectedPaths={new Set(selection.flatMap((item) => item.kind === "instance" ? [item.path] : []))}
                   onVisibility={setVisibility}
+                  onPartVisibility={setPartVisibility}
                   onSelectInstance={(id, mode = "replace", range) => {
                     setInstance(id);
                     setLitPart(null);
@@ -975,7 +1022,7 @@ export function App() {
             onClearSelection={clearSelection}
             viewScope={project === null ? null : JSON.stringify([project.root, project.target])}
             viewTarget={target}
-            sceneState={{ hidden: [...hiddenInstances], selection, selected, focusPart, instance, litPart }}
+            sceneState={{ hidden: [...effectiveHidden], selection, selected, focusPart, instance, litPart }}
             simulation={simulation}
             onRestoreView={(saved) => {
               setSavedView(saved);

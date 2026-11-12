@@ -904,6 +904,22 @@ body[data-theme] .cad-view {
   opacity: 0.45;
 }
 
+.eye.overridden,
+.eye.solo.active {
+  color: var(--intersect);
+}
+
+.eye.overridden {
+  opacity: 1;
+  outline: 1px dashed currentColor;
+  outline-offset: 1px;
+}
+
+.eye.solo.active {
+  background: var(--panel-2);
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+
 /* ---- assembly sidebar: parts / instances ---- */
 
 .assembly-pane {

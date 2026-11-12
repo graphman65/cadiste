@@ -17,6 +17,8 @@ interface Props {
   collapsed: Record<string, ReadonlySet<string>>;
   /** Whether each part shows in the 3D view. */
   visible: (part: string) => boolean;
+  solo: string | null;
+  onSolo: (part: string) => void;
   onSelect: (part: string, node: string, mode?: SelectionMode, range?: string[]) => void;
   onToggle: (part: string, node: string, open?: boolean) => void;
   onVisibility: (part: string, visible: boolean) => void;
@@ -30,6 +32,7 @@ const NO_NODES: ReadonlySet<string> = new Set();
 /** Every part of a file with its features, a group per part: a feature selected here is lit among the others. */
 export function FileFeatures(props: Props) {
   const { parts, traces, selected, selection, related, collapsed, visible, onSelect, onToggle, onVisibility, onHover, onOpen } = props;
+  const { solo, onSolo } = props;
   const [closed, toggleClosed] = usePersistentSet("cadiste.closed-file-parts");
   return (
     <div className="file-features">
@@ -38,6 +41,7 @@ export function FileFeatures(props: Props) {
         const trace = state?.status === "ok" ? state.data : null;
         const open = !closed.has(part);
         const shown = visible(part);
+        const soloed = solo === part;
         return (
           <section key={part} className="file-part">
             <div
@@ -54,11 +58,20 @@ export function FileFeatures(props: Props) {
                 {trace && <span className="part-status">{trace.ops.length} ops</span>}
               </button>
               <button
-                className={shown ? "eye" : "eye off"}
-                title={shown ? "Hide in the view" : "Show in the view"}
+                className={`${shown ? "eye" : "eye off"}${solo !== null ? " overridden" : ""}`}
+                title={`${shown ? "Hide in the view" : "Show in the view"}${solo !== null ? " (temporarily overridden by solo)" : ""}`}
                 onClick={() => onVisibility(part, !shown)}
               >
                 <Icon name={shown ? "eye" : "eye-off"} />
+              </button>
+              <button
+                className={soloed ? "eye solo active" : "eye solo"}
+                aria-label={`Solo ${part}`}
+                aria-pressed={soloed}
+                title={soloed ? "Disable solo; restore eye settings" : `Solo ${part}: show only this part`}
+                onClick={() => onSolo(part)}
+              >
+                <Icon name="solo" />
               </button>
               <button className="open-part" title={`Open ${part} on its own`} onClick={() => onOpen(part)}>
                 Open

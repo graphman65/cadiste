@@ -8,6 +8,8 @@ import { Icon } from "./Icon";
 interface Props {
   root: ShapeNode;
   hidden: ReadonlySet<string>;
+  solo: string | null;
+  onSolo: (id: string) => void;
   selected: string | null;
   selectedPaths: ReadonlySet<string>;
   onVisibility: (leaves: string[], visible: boolean) => void;
@@ -27,6 +29,7 @@ function ancestorIds(id: string): string[] {
 /** The assembly as built: groups and part instances, with visibility and selection driving the 3D view. */
 export function AssemblyTree(props: Props) {
   const { root, hidden, selected, selectedPaths, onVisibility, onSelect, onHover, openable, onOpen } = props;
+  const { solo, onSolo } = props;
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set([root.id]));
   const [filter, setFilter] = useState("");
   const list = useRef<HTMLDivElement>(null);
@@ -117,6 +120,7 @@ export function AssemblyTree(props: Props) {
           const shownCount = under.filter((id) => !hidden.has(id)).length;
           const visible = shownCount > 0;
           const open = matching !== null || expanded.has(node.id);
+          const soloed = solo === node.id;
           return (
             <div
               key={node.id}
@@ -140,14 +144,26 @@ export function AssemblyTree(props: Props) {
                 {group ? "▸" : ""}
               </span>
               <button
-                className={shownCount === under.length ? "eye" : visible ? "eye partial" : "eye off"}
-                title={visible ? "Hide" : "Show"}
+                className={`${shownCount === under.length ? "eye" : visible ? "eye partial" : "eye off"}${solo !== null ? " overridden" : ""}`}
+                title={`${visible ? "Hide" : "Show"}${solo !== null ? " (temporarily overridden by solo)" : ""}`}
                 onClick={(event) => {
                   event.stopPropagation();
                   onVisibility(under, !visible);
                 }}
               >
                 <Icon name={visible ? "eye" : "eye-off"} />
+              </button>
+              <button
+                className={soloed ? "eye solo active" : "eye solo"}
+                aria-label={`Solo ${node.name}`}
+                aria-pressed={soloed}
+                title={soloed ? "Disable solo; restore eye settings" : `Solo ${node.name}: show only this entry`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSolo(node.id);
+                }}
+              >
+                <Icon name="solo" />
               </button>
               <span className={visible ? "title" : "title muted"}>{node.name}</span>
               {group && <span className="count">{under.length}</span>}

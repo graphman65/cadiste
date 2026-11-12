@@ -33,6 +33,7 @@ export type IconName =
   | "close"
   | "eye"
   | "eye-off"
+  | "solo"
   | "links"
   | "faces"
   | "stack"
@@ -80,6 +81,7 @@ const PATHS: Record<IconName, string> = {
   close: "M4.5 4.5l7 7M11.5 4.5l-7 7",
   eye: "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8zM8 6a2 2 0 1 0 0 4 2 2 0 1 0 0-4",
   "eye-off": "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8zM2.5 2.5l11 11",
+  solo: "M5 2H2v3M11 2h3v3M14 11v3h-3M5 14H2v-3M5 5h6v6H5z",
   links: "M6.5 9.5l3-3M7 4.5l1.2-1.2a2.5 2.5 0 0 1 3.5 3.5L10.5 8M9 11.5l-1.2 1.2a2.5 2.5 0 0 1-3.5-3.5L5.5 8",
   faces: "M2.5 2.5h4.5v4.5H2.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5H2.5zM9 9h4.5v4.5H9z",
   stack: "M8 2l6 3-6 3-6-3zM2 8l6 3 6-3M2 11l6 3 6-3",

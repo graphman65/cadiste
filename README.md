@@ -116,6 +116,15 @@ Rebuild always builds again. One entry is kept per part; catalog discovery above
     group: all of its instances), the eye hides or shows it; clicking an instance in the view selects its row. The
     filter narrows the rows to matching instances.
 
+  The **Solo** icon beside each eye shows only that entry within its tab: every instance of a part, or an
+  instance/group's leaves. Parts and Instances have independent eye settings and one exclusive solo each.
+  Both layers must allow an instance: solo a part, then solo one of its instances; or solo a group, then hide
+  individual parts in the Parts tab. Click an active solo icon again to clear only that tab's solo.
+  Solo leaves eye values unchanged and editable, overriding only the eyes in its own tab; amber, dashed eye
+  outlines indicate that override without moving the layout. **Show all** resets only the active tab's eyes.
+  Solo also works for parts in **Folder contents** and clears when opening another target or restoring a saved
+  view. Exports follow the combined visibility.
+
   Parts owning selected faces, edges, vertices or instances are marked in both the Parts tab and the part list
   above, including when only one of a part's repeated instances is selected. Ctrl/Cmd-click additions and removals
   update both lists; clearing the selection clears their marks. The last marked part is scrolled into view, and
