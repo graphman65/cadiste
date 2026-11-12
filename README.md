@@ -21,6 +21,16 @@ mise run web-build  # build the frontend into src/cadiste/static
 mise run check      # ruff, pyright, pytest, tsc
 ```
 
+From this checkout, start the workspace with `make serve`, or use `make serve-reload` to restart the server
+automatically when files under `src/cadiste` change (including built frontend assets; caches are ignored).
+Both accept server options through `ARGS`, for example:
+
+```sh
+make serve-reload ARGS="--workspace-root $HOME/repos --port 8130"
+```
+
+Frontend source hot reload is still provided by `mise run web-dev`.
+
 ## View a model
 
 `cadiste serve module:callable --parts module:attribute` serves the viewer on <http://127.0.0.1:8123>. `--parts`

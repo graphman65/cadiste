@@ -20,7 +20,12 @@ mcp = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1.400"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+    "pyright>=1.1.400",
+    "watchfiles>=1,<2",
+]
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]
