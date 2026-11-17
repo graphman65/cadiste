@@ -18,18 +18,98 @@ the `build123d>=0.13.0,<0.14` pin.
 mise install        # python 3.14, uv, node 26
 mise run sync       # uv sync, npm ci in web/
 mise run web-build  # build the frontend into src/cadiste/static
+uv run playwright install chromium  # private agent screenshots; sync installs the screenshots extra
 mise run check      # ruff, pyright, pytest, tsc
 ```
 
 From this checkout, start the workspace with `make serve`, or use `make serve-reload` to restart the server
 automatically when files under `src/cadiste` change (including built frontend assets; caches are ignored).
-Both accept server options through `ARGS`, for example:
+On restart, the workspace reopens its previously running projects on the same ports. Both commands accept
+server options through `ARGS`, for example:
 
 ```sh
 make serve-reload ARGS="--workspace-root $HOME/repos --port 8130"
 ```
 
 Frontend source hot reload is still provided by `mise run web-dev`.
+
+## Create and load projects
+
+```sh
+cadiste serve --workspace-root ~/repos
+```
+
+With no model target, the web UI opens a project workspace. **Open sessions** lists running project servers
+with direct viewer links and restart/stop controls. **Available projects** automatically finds `cadiste.json`
+under the workspace, shows each profile's project name, and opens it in one click without browsing or registration.
+Discovery reads JSON only, never imports models, and caches results for 30 seconds. Hidden directories,
+`node_modules`, `__pycache__`, test/fixture directories (`test`, `tests`, `fixtures`, `__fixtures__`), and symlinks
+are skipped. Missing profile files are omitted even when present in recent history or cached discovery; existing
+malformed profiles still report their validation errors. Live sessions remain visible if their profile is removed.
+Session status refreshes independently every 2.5 seconds, including projects opened by another MCP connection.
+
+**Create or load a project** contains the secondary creation, manual profile-path/browse, and explicit configuration
+workflows. Creating a starter makes an editable build123d model, catalog, assembly and `cadiste.json` in a new
+directory; existing files are never overwritten. Opening a project executes its trusted Python on the server
+machine. Discovery, browsing and creation stay inside the configured workspace root; mutations require a local,
+same-origin connection.
+
+Each opened project runs in its own process, interpreter, working directory and cache. Its first opening gets
+an available port; project restarts and workspace reloads reuse that port, so existing browser tabs reconnect
+without changing URLs. MCP connections reopen their server sessions on the next tool call without restarting
+the MCP client. In-flight requests can fail during a reload and are not replayed; explicit viewer links require
+linking again after their server session is replaced.
+
+The workspace records open profiles and ports in `.cadiste-workspace/servers-*.json`, scoped to its launcher URL.
+Starting the same workspace again automatically executes those previously opened trusted projects. **Stop server**
+removes a project from automatic restoration; closing a browser tab does not. If a recorded port is occupied,
+the project reports a startup failure instead of switching ports or stopping the process using it.
+The workspace shows recent projects, startup errors/logs, and controls only servers it started.
+**Projects** in a model opens the same workflow; the launcher link returns to the workspace.
+
+Profiles are declarative version-1 JSON: `name`, `root`, `target`, optional `interpreter`, `args`, `parts`,
+`assemblies`, `simulations`, `trace_env`, `ros_command` (an argument list, default `["ros2"]`), `variants`,
+and `default_variant`. Targets use `module:attribute`; assembly/simulation names map to targets. Relative roots
+resolve beside the profile; relative interpreters resolve within the project root. No shell command is evaluated.
+
+```sh
+cadiste serve --profile ~/repos/my-project/cadiste.json
+```
+
+Project environments must already contain their modeling dependencies. The workspace reports missing dependencies
+and interpreter/startup failures rather than installing packages or substituting another project.
+
+### Model variants in one viewer
+
+Add variant overrides to a profile to expose a **Variant** selector in the toolbar:
+
+```json
+{
+  "variants": {
+    "adult": { "label": "Adult" },
+    "child": {
+      "label": "Child",
+      "target": "model.child:build_part",
+      "parts": "model.child:PARTS",
+      "assemblies": { "Controller": "model.child:build_scene" }
+    }
+  },
+  "default_variant": "adult"
+}
+```
+
+Each variant inherits the profile's build configuration. Overrides may set `label`, `target`, `args`, `parts`,
+`assemblies`, `simulations`, `trace_env`, `check_sets`, and `manufacturing`; supplied mappings replace, rather than merge with, the inherited
+mapping. All variants share the project root and interpreter. IDs use letters, digits, underscores or hyphens
+and start with a letter or digit. Without `default_variant`, the first declared variant is the default.
+Use `cadiste serve --profile cadiste.json --variant child` to choose another initial default.
+
+Switching variants keeps the same part, assembly or folder where available, otherwise opening that variant's
+first assembly or part. Selection is per tab, not shared server state. Hash links, retained builds and exports
+keep variant identity: API/MCP target names are qualified, for example `adult/Body` or `child/Controller`,
+while the viewer displays their local names. Variant factories build their own parametric geometry; Cadiste does
+not scale meshes. Changes to the profile configuration require restarting the project server.
+
 
 ## View a model
 
@@ -86,14 +166,15 @@ targets they have requested. Old geometry stays interactive while queued/buildin
 the status strip identifies stale geometry, connection state and expandable errors. Successful generations replace
 visited views automatically and clear selections tied to the previous geometry. Folder traces refresh separately
 and only map onto scenes from the same source fingerprint. Live simulation defers CAD replacements until returning
-to CAD. Failures are retried after the next source edit or an explicit
+to CAD; private capture mode does not subscribe. Failures are retried after the next source edit or an explicit
 rebuild, not continuously. This removes the on-demand CAD wait when warmup has completed; scene rendering itself
 still runs on the browser's main thread when switching targets.
 
 - **3D view**: three-cad-viewer (OCP CAD Viewer's renderer) on meshes from `ocp_tessellate`, in the app's colours,
   under the app's own toolbar: preset views, reset, orthographic/perspective, see-through, black edges, axes, XY
   grid (kept across reloads). The last button brings back three-cad-viewer's own toolbar and panels for clipping,
-  measuring, explode and zebra; its measurement panels are drawn as the app's cards. The selection drives the view:
+  measuring, explode and zebra; its measurement panels are drawn as the app's cards. The native viewer stays
+  hidden until the first scene renders, so its empty toolbar and panels do not flash during loading. The selection drives the view:
   - an operation lights the faces it made (the faces an inserted part brought in, for `insert`); a sketch it
     consumed shows in place, the part ghosted around it;
   - a sketch turns face-on (the preset view closest to its plane), the part drawn as edges only around it;
@@ -131,9 +212,11 @@ still runs on the browser's main thread when switching targets.
   as does a new build. three-cad-viewer's own explode button (in its toolbar) and slider drive the same state.
 - **Section** (beside explode): cuts the scene along a plane, the cut faces capped. The card at the bottom left takes
   the plane from the next click on a flat face (its normal from the face's mesh; the side the face looks out to goes)
-  or from XY, YZ or XZ through the scene's centre; its slider and millimetre field move the cut along the normal,
-  across the scene's extent, and flip cuts away the other side. Hover and picks go through the cut. The cut stays
-  across new builds until the card is closed; it is three-cad-viewer's clipping, so its own clip tab shows it too.
+  or from XY, YZ or XZ through the scene's centre. **Viewport** takes a plane through the camera's look-at point
+  parallel to the current viewport, cutting away the camera-facing side. It stays fixed when you orbit; click
+  **Viewport** again to realign it. The slider and millimetre field move the cut along the normal, across the scene's extent, and flip
+  cuts away the other side. Hover and picks go through the cut. The cut stays across new builds until the card is
+  closed; it is three-cad-viewer's clipping, so its own clip tab shows it too.
 - **Assembly**: not traced; it takes the sidebar below the part list, and the view the rest of the window (no
   right-hand panel). Two tabs, the one chosen kept across reloads:
   - **Parts**: the parts it has instances of, in the project's order, each with its count (×36): the eye hides or
@@ -159,8 +242,15 @@ still runs on the browser's main thread when switching targets.
   update both lists; clearing the selection clears their marks. The last marked part is scrolled into view, and
   the part list opens its folders. The head counts the hidden instances, with **Show all**. Each assembly is opened
   from its entry atop the part list (`#assembly=NAME`; `#assembly` opens the first).
-- **Sidebar**: the part list has it to itself until a part is open, then shares it with the part's feature tree.
-  Its width and the split are dragged and kept across reloads. Parts are in folders named after the package they
+  Opening a part from an assembly adds **Back to [assembly]** at the left of the view bar. It returns to that
+  assembly with its camera, visibility and selection restored; browsing another part keeps the same return path.
+- **Sidebar**: **Project parts** comes first, followed by **Assemblies** directly above the active target's
+  **Assembly contents**, **Part features**, or **Folder contents** section, with matching headings, counts and spacing.
+  Filters sit below their section titles; assembly shortcuts scroll independently on shorter windows.
+  Drag the separator below **Project parts** to resize its catalog without separating assembly navigation from
+  its contents. Sidebar width and catalog height are kept across reloads; smaller windows keep room for the active target.
+  Catalog rows stay within the sidebar when it is narrowed, rather than overlapping the model view.
+  Parts are in folders named after the package they
   are defined in (pipecrawler: `chassis`, `gears`, `omni_wheel`, ..., `electronics`), relative to the package all
   parts share: a part's class or function, or for a build lambda (`lambda p: SteeringModule(p)`) the first project
   class it calls. A package whose parts come from several files gets a level per file, with a file icon
@@ -195,19 +285,34 @@ still runs on the browser's main thread when switching targets.
   combined scene (not forced rebuilds of its individual traces). Each trace runs `cadiste export` in a fresh
   interpreter, so source edits show up, and a model's in-process memoisation (`functools.cache` on `build_part`)
   cannot hand back a part that was never built under the tracer. The view bar says when a trace came from the cache.
-- **Export** (top bar) downloads what is open as STEP, STL or BREP: a part, a folder's parts (a STEP keeps them
+- **Export** (top bar) downloads what is open as STEP, 3MF, STL or BREP: a part, a folder's parts (a STEP keeps them
   as one group of named parts, each in its own frame) or an assembly (a STEP keeps its tree: group and instance
-  names, placements, shapes shared between instances; pipecrawler's weighs 20 MB). A folder's export follows the
-  eyes: only the parts shown are written (the menu says how many of how many). An assembly's is always whole. It
-  builds the target again with `cadiste save`, not traced and in the server's environment, so the model's own part
-  cache may serve; nothing is cached. A failed build shows its traceback in the menu.
-  **Open in Bambu Studio** exports the same target as STEP and launches the local app on the machine
-  running `cadiste serve`, not on a remote browser's machine. The server searches its `PATH` for `bambustudio`,
-  `bambu-studio` or `BambuStudio`; a missing app or failed launch is reported in the menu. Each handoff gets a
-  separate file under `<cache-dir>/bambu-studio/`, retained for Bambu's later reloads (with `--no-cache`, only
+  names, placements and shared shapes). STEP remains exact CAD geometry, without slicer-specific wrappers.
+  **3MF** writes geometry only: one named millimetre mesh object per assembly leaf, with nested placements and
+  repeated instances recorded in the file; multiple solids belonging to one part stay together. No printer,
+  process or filament presets are embedded, so importing it does not replace your slicer's settings.
+  Bambu Studio's mesh importer may automatically enlarge tiny parts, reposition objects or offer to merge them:
+  check dimensions and placement before slicing. Downloading 3MF does not require Bambu Studio.
+  Folder and assembly exports
+  follow visibility: hidden instances, including individual copies of a repeated part, and empty groups are
+  omitted. The menu reports visible/total counts and disables CAD export when everything is hidden. It
+  exports the exact retained B-rep generation used by preflight, excluding construction sketches from part exports.
+  Source changes during export are rejected. Folder part allowlists build and retain only those named parts;
+  an unrelated broken part cannot block their export.
+  **Open in Bambu Studio** exports the same geometry-only 3MF and launches the local app on the machine
+  running `cadiste serve`, not on a remote browser's machine. The handoff searches the server's
+  `PATH` for `bambustudio`, `bambu-studio` or `BambuStudio`; export or launch failures appear in the menu.
+  Existing printer/process/filament settings remain in Bambu Studio; check scale and arrange the imported parts
+  before slicing. Each handoff gets a separate file under `<cache-dir>/bambu-studio/`, retained for Bambu's later reloads (with `--no-cache`, only
   until the server stops). Remove old handoff files when no longer needed. This opens the model; it does not
-  slice or print it. The action uses `POST /api/bambu-studio` with JSON `{"target": {...}, "parts": [...]}`;
-  omit `parts` for all parts, or pass the shown folder parts.
+  slice or print it. The action uses `POST /api/bambu-studio` with JSON `{"target": {...}, "hidden": [...]}`;
+  `hidden` contains exact viewer instance/group paths to exclude. Omitting it exports the whole target.
+  The optional folder-only `parts` allowlist cannot be combined with nonempty `hidden`.
+  Registered print orientations and groups are available in the menu, along with **Manufacturing preflight**:
+  exact bounds/counts, mesh closure, bed placement and explicitly non-slicer overhang/bridge estimates.
+  **Verify isolated native import** loads/saves a disposable Bambu project with separate HOME/XDG/datadir.
+  Its object count/dimension/placement evidence does not confirm import into your interactive Bambu window.
+  Gazebo bundles always contain the complete simulation; display visibility does not remove simulation links.
 
 `mise run web-dev` runs Vite with hot reload on <http://localhost:5173>, proxying `/api` to `cadiste serve`.
 
@@ -219,10 +324,77 @@ alone for an untraced one (an assembly); with `--match-parts module:attribute [-
 faces, edges and vertices, placed and numbered as the viewer has them, for `cadiste serve` to measure on
 (`POST /api/measure` with the file the build's response names in `X-Cadiste-Shapes`, and viewer paths).
 
-`cadiste save --output FILE [--format step|stl|brep] [--label NAME] [--each] module:callable [ARG ...]` builds a
-model without the tracer and writes it as a CAD file (`GET /api/export?format=&kind=part&name=` | `kind=file&path=`,
-with `part=` repeated to keep only those of the folder's parts | `kind=assembly&name=` serves it); `--label` names the
-shape (the STEP product), `--each` builds one shape per argument and groups them under it, as a folder's view does.
+`cadiste save --output FILE [--format step|3mf|stl|brep] [--label NAME] [--each] [--hidden PATH ...] module:callable [ARG ...]`
+builds a model without the tracer and writes it as a CAD file (`GET /api/export?format=&kind=part&name=` |
+`kind=file&path=` | `kind=assembly&name=` serves it). Repeat `hidden=` or CLI `--hidden PATH` to omit viewer
+instance/group paths; unknown paths and an all-hidden result fail rather than exporting the whole model.
+The folder-only repeated `part=` allowlist is a separate alternative. `--label` names the shape (the STEP product);
+`--each` builds one shape per argument and groups them under it, as a folder's view does.
+
+### CNCjs router cutting
+
+**Export → CNCjs · CNC router G-code** downloads compensated 2D profile toolpaths as `.nc` for manual
+loading into CNCjs. Enter every machining setting: cutter diameter, positive cut depth, maximum step-down
+and clearance Z in mm, cutting/plunge feeds in mm/min, and integer spindle RPM. No cutting defaults are
+assumed. The selected export group/orientation and visible-object filtering apply.
+
+The exporter accepts one horizontal stock part with a 2D outline and through holes.
+**Unsupported interior machining is omitted, not silently substituted:** supported profiles still export,
+while pockets, chamfers and holes that cannot safely fit the supplied cutter remain unmachined.
+The download status, cutting report and `.nc` header identify incomplete/profile-only exports and separate
+skipped pocket/hole counts. Each skipped hole has model-space bounds and a reason; recesses include side,
+depth, bounds and volume. A 7 mm cutter never enlarges a 3.4 mm bore or cuts a 9 mm blind nut pocket through.
+Through bores are derived from retained geometry throughout the stock depth, not just intersecting their
+top/bottom mouths: countersinks and opposing lead-ins can be wider than the actual bore.
+Sloping outer walls, mismatched outer stock outlines, multiple solids and an unsafe outer cutter path still
+fail rather than producing a no-op or silently projecting a 3D model. Select one part or hide other instances.
+Cutter radius compensation is generated in the file, holes precede the outer profile, and passes do not
+exceed the specified step-down. OCCT curve linearization uses 0.025 mm deflection; spline reverse-offset
+recovery permits a 0.025 mm boundary band. Spline recovery containment is proved with unit-height solid
+prisms, avoiding unstable near-coincident planar spline booleans without relaxing that boundary band.
+Emitted cutter/material clearance is checked with a combined 0.05 mm tolerance, not an unbounded area
+allowance. This is not general-purpose CAM.
+Curve traversal follows shared B-rep vertices rather than guessing direction from near-equal curve
+endpoints; endpoint uncertainty is reserved inside the same chordal error budget.
+
+Each closed contour stays down between depth passes: the next pass feeds down by at most the
+specified step-down from the preceding depth, without retracting and re-plunging through the hole.
+The cutter retracts to the supplied clearance after each contour, before travelling to another
+hole or the outer profile, and finishes at clearance. This is profile milling, not peck drilling;
+no chip-clearing retracts are generated between passes. Provide suitable tooling and chip evacuation.
+
+**Setup is manual:** exported X0/Y0 is the midpoint of the selected, oriented part's XY bounding box
+(before cutter compensation), not its center of mass or the CAD origin. Set G54 X0/Y0 there and
+**Z0 on the stock top**. The cutting report records that center as `model_center_xy_mm`;
+omitted pocket/hole bounds stay in original model coordinates. The CAD geometry is not moved.
+Cut depth must reach at least the part thickness;
+allow for the actual stock/spoilboard yourself. Check tool diameter, plunge capability, feeds, spindle RPM,
+workholding, clearance height and machine travel; simulate and inspect the complete file before running.
+No tabs, nesting, pockets, tool changes, machine-limit checks or workholding simulation are generated.
+Cadiste never connects to CNCjs, uploads to a controller, homes, sets work offsets or starts a machine.
+
+`POST /api/cncjs` accepts the same explicit `target`, optional `only` (folder part names), `hidden`
+(viewer paths), `group`, `orientation` and `expected_revision` selection controls as retained CAD exports,
+plus a required `machining` object:
+
+```json
+{
+  "target": {"kind": "part", "name": "Plate"},
+  "machining": {
+    "tool_diameter": 3, "cut_depth": 6, "step_down": 1, "safe_z": 5,
+    "feed_rate": 600, "plunge_rate": 120, "spindle_speed": 12000
+  }
+}
+```
+
+These numbers illustrate the API, not recommended machining settings. The response supplies the artifact
+download URL, SHA-256, build/source identity and cutting report; edits during export prevent publication.
+`cutting.partial_export`, `skipped_pocket_count`/`skipped_pockets` and
+`skipped_hole_count`/`skipped_holes` describe omitted machining. Partial is true if either count is nonzero.
+Recess sides are `top`, `bottom`, `both` or `internal`; all bounds use the oriented model's coordinates.
+Complete exports report both counts as `0`, both lists as `[]` and `partial_export` as `false`.
+MCP `export_cncjs(target, machining, only?, expected_revision?, group?, orientation?)` exposes the same
+download-only workflow without requiring a linked viewer.
 
 ## Gazebo with ROS 2
 
@@ -446,11 +618,21 @@ and [ros_gz_bridge topic mappings](https://github.com/gazebosim/ros_gz/tree/jazz
 
 ## Edit with a coding agent
 
-`cadiste mcp` is an MCP server on stdio that lets a coding agent (Claude Code, omp, Cursor, ...) inspect models
-and drive a viewer tab; the agent edits the model's source with its own tools. One `cadiste
-mcp` runs per agent session and forwards every call to the `cadiste serve` of the directory it runs in (found by
-the `serve.json` the server writes in its `--cache-dir`, from the working directory up; `--url` otherwise). It
-needs the `mcp` extra:
+`cadiste mcp` is an MCP server on stdio that lets a coding agent inspect models, verify changes and capture
+them in its own managed Chromium renderer. It never attaches to a user's browser for default captures.
+The agent edits Python source with its own tools. One `cadiste mcp` runs per agent session and forwards calls
+to the directory's `cadiste serve` (`serve.json` in `--cache-dir`, searched from the working directory upward;
+`--url` otherwise). Install the `mcp` and `screenshots` extras and run `python -m playwright install chromium`.
+Missing private-renderer dependencies produce an actionable error, never a fallback to the user's tab.
+Use `projects(action="list")`, then `projects(action="open", profile="guitar/cadiste.json")` or
+`projects(action="select", project_id="...")` when the connection starts at a workspace.
+Selection belongs to this MCP connection, not other agents or browser tabs. Every result includes endpoint and
+project identity. `projects(action="restart")` replaces only the selected workspace-owned child and reopens its
+MCP session; external servers are never stopped. `status` remains available on an empty workspace.
+Heartbeats distinguish inactive registrations from live MCP clients. The runtime panel identifies the exact
+client/code/session that needs reconnecting. For frontend development, set `CADISTE_BACKEND_URL` before
+`npm --prefix web run dev` to proxy the selected model server instead of port 8123.
+
 
 ```sh
 cd ../pipecrawler
@@ -466,6 +648,12 @@ claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
   consumers. `find_related_components(part=..., component=...)` finds code-evidenced callers, callees, and
   shared dependencies, including unbuilt sibling definitions. It does not guess mating relationships from names
   or geometric proximity. Unresolved/dynamic bindings are explicit.
+  Both parameter and related-component queries default to bounded summaries. `limit`, `offset`, `consumers`
+  and `section` select paginated evidence; each page reports totals, omissions and the next offset.
+  `edit_context(requests=[{"part":"Key","component":"code:model.py::Key","expressions":["pitch"],
+  "variants":["adult","child"]}], limit=10)` batches bounded source, observations and direct consumers.
+  Supported numeric expressions report active `min`/`max` branches and per-variant value differences.
+  Defaults never stand in for missing scoped runtime observations; unsupported code remains unresolved.
 - **Code identities and revisions.** Definitions have source-based identities such as
   `code:src/pipecrawler/parts/chassis/steering_module.py::NoseChamfer.lid_end_x`; construction occurrences have
   separate references so repeated calls do not collapse. Line numbers are locations, not identities. These
@@ -485,32 +673,86 @@ claude mcp add cadiste -- uv run --project ../cadiste --extra mcp cadiste mcp
   call stacks and captured source, with exact geometry as supporting evidence.
   Folder picks include their owning part and available part provenance. Missing or unverifiable context is
   reported explicitly rather than guessed. A snapshot describes the captured build, not necessarily current source.
+  Copy starts from the **C** key or toolbar gesture and keeps that target, build and selection while a small
+  **Copying…** toast appears without moving focus. **Cancel**/**Escape** discards the pending copy.
   Preparation loads any missing owning-part traces, measures picked B-rep geometry and validates its source
   mapping; it is not just formatting the viewer's labels. Snapshot lookup reuses the loaded catalog and
   retained builds without rediscovering or importing the live model. Build-identity, expiry and geometric
   correspondence checks remain enforced; copying never silently substitutes newer geometry. First-time
   owning-part trace builds can still take longer than copying already-loaded geometry.
+  Clipboard access requires a secure context (localhost or HTTPS) and browser permission. Only if access is
+  unavailable or refused does the **Selection snapshot** panel show the retained read-only text: use **Copy**
+  for a fresh permission gesture, or press **Ctrl+C** (**Cmd+C** on Mac). Retries reuse the same snapshot,
+  not another server request. **Close**/**Escape** discards retained text. Only a confirmed clipboard write
+  reports “Copied”; generation errors are reported separately.
 - **Multiple selection.** Click replaces the selection; Ctrl/Cmd-click toggles an item, and Shift-click adds
   items (a range in a feature tree). Features, assembly instances, and faces, edges and vertices can be selected
   together, including across parts in a folder. The toolbar shows the selection count and a clear action;
   Escape clears it. The copy button and **C** copy the entire selection. With nothing selected, **C** can copy
   what the pointer is on; the copy button captures the whole target and lists its members.
-- **Linking.** Copying a snapshot does not require or create an agent connection. The first live tool call
-  that needs a viewer shows a request in every open tab, with the agent's name and a code (`swift-orca`)
-  the agent also reports; **Link this tab** picks the tab, **Dismiss** fails the call. The link is kept by tab id,
-  which survives a reload (a duplicated browser tab takes a new one); the top bar shows the agents linked to the
-  tab, each with an unlink button. A call waits up to 60 s for the link. `show(view='assembly')` opens the first
-  assembly, `view='assembly:NAME'` another.
-- **Feedback.** `show(part=...)` builds the part again from the current source, opens it in the tab and answers with
-  how it differs from the build before (volume, bounding box, faces, operations added, removed or called with other
-  arguments: operations are matched by kind, mode and calling function, as line numbers move with edits) and
-  screenshots of the tab's 3D view (`iso` by default, any preset direction or `current`). A failed build answers
-  with its traceback.
+  App descriptions, source text, export status and errors support normal drag-selection and native
+  **Ctrl/Cmd+C**. While browser text is selected, plain **C** does not start a CAD snapshot.
+- **Private or linked views.** `show(part=...)` and `screenshot(target=...)` default to `viewer="agent"`.
+  Each agent has an isolated browser context with its own camera, visibility, selection and saved views.
+  `viewer="linked"` explicitly opts into the user's approved tab. Linking then shows a request in open tabs;
+  **Link this tab** selects one. Copying a snapshot never creates or requires a link.
+- **Build-bound feedback.** `show` returns a structured comparison plus images of the acknowledged `build_id`;
+  position/bounds and composite instance changes are reported as well as volume/operations. Capture rejects a
+  superseding navigation rather than returning another target's image. `screenshot(build_id=...)` can capture a
+  retained generation. Multi-view capture is one renderer transaction. Query `request_outcome(request_id=...)`
+  after a timeout before rebuilding or resending; bounded outcome journals retain completion evidence.
 - **Driving the tab.** `select(items=[...])` replaces the multi-selection (`[]` clears it) and answers with its
   captured context. Each item is a feature (`{"kind":"feature","part":"...","node":"o7"}`), an instance
   (`{"kind":"instance","path":"..."}`), or a face/edge/vertex (`{"kind":"entity","path":"..."}`).
   Also `highlight`, `set_view`, `set_visibility`, `screenshot`, `status`, `list_parts`, `feature_tree`, `describe`,
   and `measure`.
+- **Arrangements.** `show`/`screenshot` accept `arrangement` with selection, hidden paths, camera, fit
+  (`"all"`, `"visible"`, `"selected"`), section and explode. `saved_views` lists/creates/updates/deletes/restores
+  saved arrangements. `set_section`, `set_explode`, `set_view` and `set_visibility` accept `viewer="agent"` for
+  private inspection or `"linked"` for explicitly shared inspection.
+- **Headless verification.** `verify_targets(targets=[...], fresh=False, checks=[...])` builds explicit part,
+  folder or assembly targets and reports each result independently with structured diffs and source/build
+  identities. `expected_revision` rejects unavailable or mismatched captured source.
+  `suggest_affected_targets(changed_files=[...])` inspects retained dependency evidence without building.
+  Suggestions are conservative and explicitly incomplete, not proof that unlisted consumers are safe.
+  Pin `baseline(action="pin", targets=[{"kind":"assembly","name":"Main"}], name="Before edit")` before changing
+  source. Pins copy exact JSON/shapes independently of rolling-cache eviction and background warmup.
+  Supply the returned `id` as `baseline=` to `show`, `verify_targets`, or `compare_builds`.
+  `compare_builds(target=..., baseline=...)` returns before/after images at identical cameras, not two independently
+  fitted views. **Verify** in the toolbar pins the displayed build, runs named checks and opens side-by-side review.
+  List/release pins with `baseline(action="list")` and `baseline(action="release", id="...")`; release never deletes
+  ordinary cached generations. Pins live under `<cache-dir>/baselines` and last until explicitly released
+  (or server shutdown with `--no-cache`).
+- **Solid checks.** `check_geometry(target=..., pairs=[[path_a,path_b]], clearance=...)` checks only named whole
+  instances on the exact B-rep. It reports validity, overlap volume, minimum separation and witnesses.
+  Explicit `ignore` pairs exclude intentional contacts; bounded `contact` specifications instead assert their
+  allowed distance/overlap. Independent `samples` accept a path, translation (mm), rotation (degrees), and optional
+  world `origin` pivot. A coordinated sample supplies `poses:[{path,translation,rotation,origin?},...]` together.
+  Samples do not accumulate and are not continuous-motion proof; zero distance is not penetration depth.
+  Named `check_sets` add insertion/operating travel and trimmed-cylinder screw/bearing engagement.
+  Exact preserved-interface, placement and measurement assertions can compare against pinned shapes.
+  The UI checks selected pairs and reviews failure poses/witnesses without rewriting eye/solo state.
+- **Assembly source.** `describe_assembly(name=..., path=...)` pages through ownership and captured placement
+  evidence. The sidebar reports matching coverage and unmatched instances. Use
+  `cadiste.assembly.instance(shape, part="Bracket", label="left", location=...)` for explicit ownership of fresh
+  or repeated shapes; ordinary placement calls are captured when available. Anonymous geometry, ambiguous
+  topology and unavailable source remain explicit rather than being guessed from names.
+- **Simulation and exports.** `inspect_simulation` reads topology, transmissions, prerequisites and owned runtime
+  status without sending commands. ROS controls expose explicit launch/stop/relaunch, retained logs and
+  running-bundle mismatch; they never stop external processes or containers. `export_target` retains a
+  STEP/3MF/STL/BREP artifact with source evidence and a download URL; `open_bambu` explicitly hands off geometry-only 3MF.
+  Exports use the captured generation and reject edits during export; a launch acknowledgement is not an import or print.
+  `manufacturing_preflight` reports retained geometry without a rebuild; `export_target` accepts `group`,
+  `orientation`, and `preflight=False` to skip meshing/overhang analysis. `open_bambu(verify_import=True)`
+  adds isolated native load/save evidence without embedding printer/process/filament presets.
+- **Runtime identity.** The runtime panel and MCP `status` distinguish the running backend, on-disk source,
+  served frontend bundle and connected MCP generations. Follow the specific restart/rebuild/reconnect action;
+  refreshing a browser cannot compile edited frontend source.
+  `renderer_state(viewer="agent")` inspects lifecycle, camera, section, layered visibility, timings and errors,
+  even before a first successful render. Captures retain suspicious-empty diagnostics instead of silently retrying.
+  The normal browser exposes read-only `window.cadisteRenderer.inspect()`. The explicit development
+  `?harness=1` URL also exposes guarded capture transactions while retaining ordinary UI loading/source updates.
+  Application failures return structured MCP errors (`code`, `details`), distinct from transport failures.
 
 The workflow is the `cadiste` skill (`src/cadiste/skills/cadiste/SKILL.md`), served as `skill://cadiste/SKILL.md`
 with the MCP Skills extension and summed up in the server's instructions; a harness that loads skills from disk can
@@ -520,6 +762,57 @@ a function-call group, and viewer paths (`/Group/<part>/faces/faces_12`, face `f
 For example, follow the sleeve diameter from `SteeringModule.__init__` with `expression="tube_d"`, or inspect
 `NoseChamfer.lid_end_x` and find its consumers in both `SteeringModule` and `SteeringLid`. These are code-navigation
 tool calls, not temporary inspection scripts or viewer-only operations.
+
+
+### Mechanical and manufacturing profile configuration
+
+Add these fields to a version-1 `cadiste.json`; variant overrides replace each mapping.
+Targets and interface paths are explicit. Engagement faces are ordered shaft/screw, then receiving bore.
+
+```json
+{
+  "check_sets": {
+    "insert-key": {
+      "target": {"kind": "assembly", "name": "Main"},
+      "checks": [{
+        "kind": "insertion",
+        "pairs": [["/Main/Key", "/Main/Rail"]],
+        "clearance": 0.2,
+        "travel": {"steps": 21, "poses": [{
+          "path": "/Main/Key", "translation": [0, 0, 20], "rotation": [0, 0, 0]
+        }]}
+      }],
+      "assertions": [{"kind": "placement", "path": "/Main/Rail"}]
+    }
+  },
+  "manufacturing": {
+    "orientations": {"flat": {"rotation": [90, 0, 0], "on_bed": true}},
+    "groups": {"keys": ["/Main/Key"]},
+    "part_orientations": {"Key": "flat"},
+    "bed": {"size": [256, 256, 256], "origin": [0, 0, 0]}
+  }
+}
+```
+
+Run `verify_targets(targets=[{"kind":"assembly","name":"Main"}], check_sets=["insert-key"], baseline="...")`.
+Use `adult/insert-key` for a specific variant, or an unqualified name for each requested variant's own set.
+Assertions support `preserved` (`paths`, optional `frame:"local"`), `placement` (`path`), and `measurement`
+(`paths`, exact quantity `label`, `min`/`max` or `preserved:true`). Preserved/placement checks require a baseline.
+Engagement checks use `kind:"screw_engagement"` or `"bearing_engagement"`, two cylindrical face `paths`,
+`min_engagement`, and optional axis/radial tolerances; they do not certify threads, preload or strength.
+Travel/pose checks are bounded discrete samples, never a continuous swept-volume proof.
+
+Standalone CLI exports accept `cadiste save --rotation X Y Z --translation X Y Z --on-bed ...` in degrees/mm.
+Preflight bridge candidates use mesh normals and planar patch extent, not a slicer's layers/support percentage.
+
+### Browser regression verification
+
+After `npm --prefix web run build`, run `npm --prefix web run test:browser`.
+It starts an isolated fixture project and exercises actual loading, picks, independent solos, viewport section,
+sidebar sizing, assembly return, visibility-filtered downloads, baselines, and failure-pose witnesses in Chromium.
+Screenshots and structured evidence go to `.cache/browser-regression`. Install the `screenshots` extra and Chromium
+first; `test:browser:headed` uses a visible owned browser. Optional installed-slicer verification:
+`CADISTE_TEST_BAMBU=1 uv run --all-extras pytest tests/test_bambu_verify.py`.
 
 ## Trace a model
 
@@ -580,7 +873,7 @@ for record in trace.builders:
 | `export.py` | A trace as the viewer's JSON, with the source of the model files it points into, the result's volume and bounding box, and the scene: the part, every sketch, every sketch element in place. |
 | `mesh.py` | Shapes tessellated by `ocp_tessellate` into three-cad-viewer's format, with each object's viewer path and each leaf's faces, edges and vertices placed and numbered as the viewer has them. |
 | `measure.py` | Those faces, edges and vertices written next to a build's JSON and read back; exact measurements of the ones the viewer picked, and the faces an edge or vertex bounds. |
-| `server.py` | `cadiste serve`: the built frontend, the part list, one `cadiste export` subprocess per trace, one `cadiste mesh` per assembly view, through the cache; one `cadiste save` per CAD export; measurements on the last few builds' shapes, kept loaded; the hub's endpoints. |
+| `server.py` | HTTP/catalog/build services, exact retained-generation CAD exports, workflow endpoints and serialized exact measurements. |
 | `background.py` | Debounced source watching, current/visited/remaining target priorities, one background build worker and revision-bound SSE snapshots. |
 | `process.py` | Cancellable captured subprocesses and lock acquisition, so background work stops before temporary caches are removed. |
 | `hub.py` | Agent sessions and viewer tabs: link requests, each tab's event stream (Server-Sent Events) and state, requests to a tab and their replies. |
@@ -593,6 +886,9 @@ for record in trace.builders:
 | `source.py` | Captured project Python, line-independent definition references, and source-revision digests. |
 | `code_index.py` | Static Python definition, import, alias, parameter, call and dependency analysis over captured source. |
 | `components.py` | Source-linked construction hierarchy and component/parameter/relationship navigation used by MCP and snapshots. |
+| `baselines.py`, `verification.py`, `mechanical.py` | Durable pinned builds, explicit target verification, coordinated samples and exact interface/engagement assertions. |
+| `manufacturing.py`, `bambu_verify.py` | Retained print-oriented geometry, manufacturing preflight and isolated native slicer round-trip evidence. |
+| `dimensions.py` | Conservative bounded numeric dimension-driver analysis over captured source and scoped observations. |
 | `web/` | The React frontend (Vite, TypeScript, three-cad-viewer). |
 
 - **Builder entry is hooked through `_build_scope_context`, not `Builder.__enter__`.** `__enter__` makes the
