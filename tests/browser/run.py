@@ -291,14 +291,27 @@ def run(page, url, output):
     scenarios.append("suspicious-empty screenshot is diagnosed and retained without a retry")
 
     page.get_by_role("button", name="Export", exact=True).click()
-    page.get_by_role("checkbox", name="Verify native Bambu import/save in isolated settings").check()
+    export_dialog = page.get_by_role("dialog", name="Export", exact=True)
+    export_bounds = export_dialog.bounding_box()
     with page.expect_response("**/api/manufacturing/preflight") as response:
-        page.get_by_role("menuitem", name="Manufacturing preflight", exact=False).click()
+        export_dialog.get_by_role("button", name="Manufacturing preflight", exact=False).click()
     report = response.value.json()
     assert response.value.ok, report
     assert report["object_count"] == 1, report
     page.get_by_text("Manufacturing preflight complete.", exact=True).wait_for()
     assert_text_selection(page, page.get_by_text("Manufacturing preflight complete.", exact=True))
+    assert export_dialog.bounding_box() == export_bounds, "Preflight feedback shifted the export controls"
+    export_dialog.get_by_role("button", name="Export details").click()
+    evidence = export_dialog.locator(".export-details")
+    assert evidence.is_visible()
+    assert evidence.evaluate("e => e.scrollWidth <= e.clientWidth"), "Export evidence overflows horizontally"
+    export_dialog.get_by_role("button", name="Export details").click()
+    viewport = page.viewport_size
+    page.set_viewport_size({"width": 390, "height": 832})
+    narrow = export_dialog.bounding_box()
+    assert narrow["x"] >= 0 and narrow["x"] + narrow["width"] <= 390, "Export panel leaves the viewport"
+    assert narrow["y"] + narrow["height"] <= 832, "Export panel exceeds the viewport height"
+    page.set_viewport_size(viewport)
     scenarios.append("rendered status drag-selection, native clipboard copy and unclaimed plain C")
     with (
         page.expect_download() as download,
@@ -306,7 +319,7 @@ def run(page, url, output):
             lambda response: response.request.method == "POST" and urlparse(response.url).path == "/api/export"
         ) as response,
     ):
-        page.get_by_role("menuitem", name="3MF", exact=False).click()
+        export_dialog.get_by_role("button", name="3MF", exact=False).click()
     exported = response.value
     assert exported.ok
     assert set(exported.request.post_data_json.get("hidden", [])) == {path_b, path_peg}

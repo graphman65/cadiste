@@ -5,10 +5,10 @@ import { type CncjsMachining, type ExportFormat, fetchCncjsExport, fetchExport, 
 import { Icon } from "./Icon";
 
 const FORMATS: { format: ExportFormat; label: string; hint: string }[] = [
-  { format: "step", label: "STEP", hint: "Solids for any CAD tool; an assembly or folder keeps its parts, names and placements" },
-  { format: "3mf", label: "3MF", hint: "Geometry only, without filament presets; Bambu may rescale tiny parts or reposition objects" },
-  { format: "stl", label: "STL", hint: "One triangle mesh, for slicers and mesh tools" },
-  { format: "brep", label: "BREP", hint: "OpenCascade's own B-rep, exact, for build123d, CadQuery or FreeCAD" },
+  { format: "step", label: "STEP", hint: "CAD solids" },
+  { format: "3mf", label: "3MF", hint: "Print meshes" },
+  { format: "stl", label: "STL", hint: "Triangle mesh" },
+  { format: "brep", label: "BREP", hint: "OpenCascade solids" },
 ];
 
 const CUTTING_FIELDS: { key: keyof CncjsMachining; label: string }[] = [
@@ -205,6 +205,7 @@ export function ExportMenu({ target, title, shown, ready, simulation, manufactur
   const [group, setGroup] = useState("");
   const [orientation, setOrientation] = useState("");
   const [verifyImport, setVerifyImport] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
   const [cuttingValues, setCuttingValues] = useState<Partial<Record<keyof CncjsMachining, string>>>({});
   const root = useRef<HTMLDivElement>(null);
   const request = useRef(0);
@@ -215,6 +216,7 @@ export function ExportMenu({ target, title, shown, ready, simulation, manufactur
     setState({ status: "idle" });
     setGroup("");
     setOrientation("");
+    setShowDetails(false);
   }, [targetKey]);
 
   useEffect(() => {
@@ -261,7 +263,7 @@ export function ExportMenu({ target, title, shown, ready, simulation, manufactur
       if (id !== request.current) return;
       download(result.file, result.name);
       const report = manufacturingReport("preflight" in result ? result.preflight : undefined);
-      setState({ status: "complete", action: `${format.toUpperCase()} exported; browser download started.`, report });
+      setState({ status: "complete", action: `${format.toUpperCase()} download started.`, report });
     } catch (error) { fail(id, error); }
   };
 
@@ -323,11 +325,14 @@ export function ExportMenu({ target, title, shown, ready, simulation, manufactur
     } catch (error) { fail(id, error); }
   };
   const report = state.status === "complete" ? state.report : undefined;
+  const groups = Object.keys(manufacturing?.groups ?? {});
+  const orientations = Object.keys(manufacturing?.orientations ?? {});
+  const hasDetails = state.status === "complete" || state.status === "error";
   return (
     <div className="export" ref={root}>
       <button
         disabled={target === null}
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((shown) => !shown)}
         title={title ? `Export ${title} or open in an external application` : "Export what is open or open in an external application"}
@@ -335,100 +340,116 @@ export function ExportMenu({ target, title, shown, ready, simulation, manufactur
         {pending ? <span className="spinner" /> : <Icon name="download" />}Export
       </button>
       {open && (
-        <div className="export-menu" role="menu">
+        <div className="export-menu" role="dialog" aria-label="Export">
           <div className="export-title">
-            Export <strong>{title}</strong>
-            {shown && ` · ${shown.visible} of ${shown.of} visible ${shown.unit}`}
+            <strong>{title}</strong>
+            {shown && <span>{shown.visible} of {shown.of} {shown.unit} shown</span>}
           </div>
-          <div className="export-note" role="group" aria-label="Manufacturing options">
-            <label>Export group{" "}
-              <select aria-label="Export group" value={group} disabled={pending} onChange={(event) => { setGroup(event.target.value); setState({ status: "idle" }); }}>
-                <option value="">All shown objects</option>
-                {Object.keys(manufacturing?.groups ?? {}).map((name) => <option key={name} value={name}>{name}</option>)}
-              </select>
-            </label>{" "}
-            <label>Export orientation{" "}
-              <select aria-label="Export orientation" value={orientation} disabled={pending} onChange={(event) => { setOrientation(event.target.value); setState({ status: "idle" }); }}>
-                <option value="">Registered per-part / model pose</option>
-                {Object.keys(manufacturing?.orientations ?? {}).map((name) => <option key={name} value={name}>{name}</option>)}
-              </select>
-            </label>
-          </div>
-          <button role="menuitem" className="export-format" disabled={cadDisabled} onClick={preflight}>
-            <span className="export-label">Manufacturing preflight</span>
-            <span className="export-hint">Exact retained objects, dimensions, manifold mesh and bed placement; estimates are not slicer evidence</span>
-          </button>
+          {(groups.length > 0 || orientations.length > 0) && (
+            <div className="export-options" role="group" aria-label="Manufacturing options">
+              {groups.length > 0 && <label>Group
+                <select aria-label="Export group" value={group} disabled={pending} onChange={(event) => { setGroup(event.target.value); setState({ status: "idle" }); }}>
+                  <option value="">All shown objects</option>
+                  {groups.map((name) => <option key={name} value={name}>{name}</option>)}
+                </select>
+              </label>}
+              {orientations.length > 0 && <label>Orientation
+                <select aria-label="Export orientation" value={orientation} disabled={pending} onChange={(event) => { setOrientation(event.target.value); setState({ status: "idle" }); }}>
+                  <option value="">Per-part / model pose</option>
+                  {orientations.map((name) => <option key={name} value={name}>{name}</option>)}
+                </select>
+              </label>}
+            </div>
+          )}
           {FORMATS.map(({ format, label, hint }) => (
-            <button key={format} role="menuitem" className="export-format" disabled={cadDisabled} onClick={() => start(format)}>
+            <button key={format} className="export-format" disabled={cadDisabled} onClick={() => start(format)}>
               <span className="export-label">{label}</span>
               <span className="export-hint">{hint}</span>
             </button>
           ))}
-          <details className="export-cncjs">
-            <summary>CNCjs · CNC router G-code</summary>
-            <form onSubmit={(event) => { event.preventDefault(); void cncjs(); }}>
-              <div className="export-hint">One flat stock part; supported outer and through-hole profiles only. Pockets and unsupported holes are explicitly omitted and reported, not machined. Enter every machining setting; no defaults are supplied.</div>
-              <div className="export-cutting-fields">
-                {CUTTING_FIELDS.map(({ key, label }) => (
-                  <label key={key}>{label}
-                    <input type="number" name={key} aria-label={label} required min="0" step={key === "spindle_speed" ? "1" : "any"}
-                      value={cuttingValues[key] ?? ""} disabled={pending}
-                      onChange={(event) => { setCuttingValues((values) => ({ ...values, [key]: event.target.value })); setState({ status: "idle" }); }} />
-                  </label>
-                ))}
+          <div className="export-section">
+            <button className="export-format" disabled={cadDisabled} onClick={launch}>
+              <span className="export-label">Open in Bambu Studio</span>
+              <Icon name="links" />
+            </button>
+            <details className="export-advanced">
+              <summary>Bambu options</summary>
+              <div className="export-advanced-body">
+                <label className="export-checkbox"><input type="checkbox" checked={verifyImport} disabled={pending} onChange={(event) => setVerifyImport(event.target.checked)} /> Verify isolated native import</label>
+                <p className="export-hint">Geometry only; keeps slicer presets. Verification uses a separate Bambu session, not your open window. Check scale and placement before slicing.</p>
               </div>
-              <div className="export-hint">Set work X0/Y0 at the part's XY bounding-box center and Z0 on stock top. Check workholding and tabs (not generated), clearance, and simulate before manual loading in CNCjs. No machine connection or automatic run.</div>
-              <button type="submit" disabled={cadDisabled || !cuttingValid}>Download CNC router G-code (.nc)</button>
-            </form>
-          </details>
-          <div className="export-note">
-            <label><input type="checkbox" checked={verifyImport} disabled={pending} onChange={(event) => setVerifyImport(event.target.checked)} /> Verify native Bambu import/save in isolated settings</label>
+            </details>
           </div>
-          <button role="menuitem" className="export-format" disabled={cadDisabled} onClick={launch}>
-            <span className="export-label">Open in Bambu Studio</span>
-            <span className="export-hint">Geometry only; preserves filament presets. Launching alone never confirms import.</span>
-          </button>
-          {simulation && (
-            <>
-              <button role="menuitem" className="export-format" disabled={pending} onClick={gazebo}>
-                <span className="export-label">Full simulation · Gazebo + ROS 2 bundle</span>
-                <span className="export-hint">All simulation links, collision geometry, meshes, world and ROS 2 launch file; CAD visibility is not applied</span>
+          <div className="export-section">
+            <button className="export-format" disabled={cadDisabled} onClick={preflight}>
+              <span className="export-label">Manufacturing preflight</span>
+            </button>
+            <details className="export-cncjs export-advanced">
+              <summary>CNCjs · CNC router G-code</summary>
+              <form className="export-advanced-body" onSubmit={(event) => { event.preventDefault(); void cncjs(); }}>
+                <p className="export-hint">One flat stock part. Outer and through-hole profiles only; pockets and unsupported holes are skipped and reported.</p>
+                <div className="export-cutting-fields">
+                  {CUTTING_FIELDS.map(({ key, label }) => (
+                    <label key={key}>{label}
+                      <input type="number" name={key} aria-label={label} required min="0" step={key === "spindle_speed" ? "1" : "any"}
+                        value={cuttingValues[key] ?? ""} disabled={pending}
+                        onChange={(event) => { setCuttingValues((values) => ({ ...values, [key]: event.target.value })); setState({ status: "idle" }); }} />
+                    </label>
+                  ))}
+                </div>
+                <button type="submit" disabled={cadDisabled || !cuttingValid}>Download CNC router G-code (.nc)</button>
+              </form>
+            </details>
+            {simulation && (
+              <button className="export-format" disabled={pending} onClick={gazebo}>
+                <span className="export-label">Gazebo + ROS 2</span>
+                <span className="export-hint">Full simulation</span>
               </button>
-              <div className="export-note">Launch, prerequisites, retained logs and explicit relaunch are in ROS 2 Controls.</div>
-            </>
-          )}
-          <div className="export-note" role="status" aria-live="polite" style={{ height: 220, overflow: "auto" }}>
-            {shown && empty && <div className="export-error">No visible {shown.unit}: show some to export CAD.</div>}
-            {!ready && <div>Wait for the current target's scene to finish loading.</div>}
-            {state.status === "idle" && <div>Geometry-only exports use retained build evidence. Choose a group/orientation or run preflight.</div>}
-            {state.status === "pending" && <div>{state.action}</div>}
-            {state.status === "error" && <div className="export-error">{state.error}{state.log && <pre>{state.log}</pre>}</div>}
-            {state.status === "complete" && (
-              <>
-                <div>{state.action}</div>
-                {state.launched !== undefined && <div>Application launch: {state.launched ? "started" : "not started"}. GUI import: not confirmed.</div>}
-                {state.launched !== undefined && <div>Isolated native import: {state.imported?.import_confirmed ? "counts and dimensions confirmed" : state.imported?.status ?? "not requested"}.</div>}
-                {state.imported && <div>
-                  {state.imported.placement_match !== undefined && <div>Placement: {state.imported.placement_match ? "preserved" : "changed by native import"}.</div>}
-                  {state.imported.reason && <div>{state.imported.reason}</div>}
-                  {state.imported.action && <div>{state.imported.action}</div>}
-                  {state.imported.log && <details><summary>Native import log</summary><pre>{state.imported.log}</pre></details>}
-                </div>}
-              </>
-            )}
-            {report && (
-              <>
-                <div>{report.object_count} objects · {report.solid_count} solids · {report.bounds_mm.dimensions.map((n) => n.toFixed(3)).join(" × ")} mm</div>
-                <div>Build: {report.build_id ?? "unavailable"} · source: {report.source_revision ?? "unavailable"}</div>
-                <div>Non-slicer geometric estimates; no filament presets supplied.</div>
-                {report.objects.map((object) => <div key={object.path}>
-                  <strong>{object.path}</strong>: mesh {object.mesh.closed_oriented_manifold ? "closed/manifold" : "needs attention"}; bed {object.bed_placement.within_registered_bed === null ? "envelope not registered" : object.bed_placement.within_registered_bed ? "fits envelope" : "outside envelope"}; Z=0 {object.bed_placement.on_z0 ? "contact" : object.bed_placement.below_z0 ? "below bed" : "above bed"}; overhang {object.mesh.overhang.area_mm2.toFixed(2)} mm²; bridge candidate extent {object.mesh.bridge_candidates.max_xy_patch_extent_mm.toFixed(2)} mm.
-                </div>)}
-                {report.warnings.map((warning) => <div key={warning}>{warning}</div>)}
-                <details><summary>Evidence limits</summary>{report.limitations.map((limit) => <div key={limit}>{limit}</div>)}</details>
-              </>
             )}
           </div>
+          <div className="export-feedback">
+            <div role="status" aria-live="polite">
+              {empty ? <span className="export-error">Show an object to export.</span> : !ready ? <span>Loading geometry…</span> : null}
+              {state.status === "pending" && <span>{state.action}</span>}
+              {state.status === "error" && <span className="export-error">{state.error}</span>}
+              {state.status === "complete" && <span>
+                {state.launched === undefined ? state.action : `${state.launched ? "Bambu Studio launched." : "Bambu Studio not launched."} ${state.imported?.import_confirmed ? "Isolated import verified." : "Import not confirmed."}`}
+              </span>}
+            </div>
+            <button className="export-details-toggle" aria-label="Export details" aria-expanded={showDetails}
+              disabled={!hasDetails && !showDetails} onClick={() => setShowDetails((value) => !value)}>
+              Details
+            </button>
+          </div>
+          {showDetails && (
+            <div className="export-details">
+              {state.status === "complete" && !report && <p>{state.action}</p>}
+              {state.status === "error" && <p className="export-error">{state.error}</p>}
+              {state.status === "error" && state.log && <pre>{state.log}</pre>}
+              {state.status === "complete" && state.imported && <div>
+                {state.imported.placement_match !== undefined && <div>Placement: {state.imported.placement_match ? "preserved" : "changed by native import"}.</div>}
+                {state.imported.reason && <p>{state.imported.reason}</p>}
+                {state.imported.action && <p>{state.imported.action}</p>}
+                {state.imported.log && <details><summary>Native import log</summary><pre>{state.imported.log}</pre></details>}
+              </div>}
+              {report && <>
+                <div>{report.object_count} objects · {report.solid_count} solids · {report.bounds_mm.dimensions.map((n) => Number(n.toFixed(3))).join(" × ")} mm</div>
+                {report.warnings.length > 0 && <ul>{report.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+                <p>Geometric estimates only, not slicer results.</p>
+                {report.objects.map((object) => <div className="export-object" key={object.path}>
+                  <strong>{object.path}</strong>
+                  <div>Mesh: {object.mesh.closed_oriented_manifold ? "closed/manifold" : "needs attention"}</div>
+                  <div>Bed: {object.bed_placement.within_registered_bed === null ? "not registered" : object.bed_placement.within_registered_bed ? "fits" : "outside envelope"} · {object.bed_placement.on_z0 ? "Z=0 contact" : object.bed_placement.below_z0 ? "below bed" : "above bed"}</div>
+                  <div>Overhang: {object.mesh.overhang.area_mm2.toFixed(2)} mm² · bridge extent: {object.mesh.bridge_candidates.max_xy_patch_extent_mm.toFixed(2)} mm</div>
+                </div>)}
+                <details><summary>Build and evidence limits</summary>
+                  <div>Build: {report.build_id ?? "unavailable"}</div>
+                  <div>Source: {report.source_revision ?? "unavailable"}</div>
+                  {report.limitations.map((limit) => <p key={limit}>{limit}</p>)}
+                </details>
+              </>}
+            </div>
+          )}
         </div>
       )}
     </div>

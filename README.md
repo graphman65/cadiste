@@ -308,10 +308,12 @@ still runs on the browser's main thread when switching targets.
   slice or print it. The action uses `POST /api/bambu-studio` with JSON `{"target": {...}, "hidden": [...]}`;
   `hidden` contains exact viewer instance/group paths to exclude. Omitting it exports the whole target.
   The optional folder-only `parts` allowlist cannot be combined with nonempty `hidden`.
-  Registered print orientations and groups are available in the menu, along with **Manufacturing preflight**:
-  exact bounds/counts, mesh closure, bed placement and explicitly non-slicer overhang/bridge estimates.
-  **Verify isolated native import** loads/saves a disposable Bambu project with separate HOME/XDG/datadir.
-  Its object count/dimension/placement evidence does not confirm import into your interactive Bambu window.
+  The compact export panel shows group and orientation selectors only when registered options exist.
+  **Manufacturing preflight** checks exact bounds/counts, mesh closure, bed placement and non-slicer
+  overhang/bridge estimates. **Details** reveals the report, warnings and build provenance without moving
+  the export actions when a request completes.
+  Under **Bambu options**, **Verify isolated native import** loads/saves a disposable project with separate
+  HOME/XDG/datadir. Its object count/dimension/placement evidence does not confirm import into your open Bambu window.
   Gazebo bundles always contain the complete simulation; display visibility does not remove simulation links.
 
 `mise run web-dev` runs Vite with hot reload on <http://localhost:5173>, proxying `/api` to `cadiste serve`.
