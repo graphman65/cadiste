@@ -13,6 +13,10 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
+# Local CAD/browser caches and slicer reports
+/.cache/
+/result.json
+
 # Web frontend: dependencies, and the build `cadiste serve` serves (mise run web-build)
 web/node_modules/
 src/cadiste/static/
