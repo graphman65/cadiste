@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Load, Target } from "../App";
 import type { AssemblyData, Project, TraceData } from "../types";
@@ -9,8 +9,10 @@ interface Props {
   parts: string[];
   /** Part name -> its folder, level by level; a part without one is listed at the top. */
   folders: Project["folders"];
-  /** The project's assemblies, by name, listed first. */
+  /** The project's assemblies, by name, below the part catalog. */
   assemblies: string[];
+  /** Visible catalog namespace; names and folder paths remain fully qualified internally. */
+  variant: string | null;
   target: Target | null;
   traces: Record<string, Load<TraceData>>;
   assemblyLoads: Record<string, Load<AssemblyData>>;
@@ -18,6 +20,8 @@ interface Props {
   files: Record<string, Load<AssemblyData>>;
   /** Parts owning the current composite selection. Reveal the last one's row and folders. */
   marked: readonly string[];
+  /** Resize handle between project parts and assembly navigation. */
+  divider?: ReactNode;
   onSelect: (target: Target) => void;
 }
 
@@ -32,11 +36,13 @@ interface Folder {
 }
 
 /** The folder tree, folders and parts in the order the project lists them. */
-function folderTree(parts: string[], folders: Project["folders"]): Folder {
-  const root: Folder = { path: "", name: "", file: false, folders: [], parts: [] };
+function folderTree(parts: string[], folders: Project["folders"], variant: string | null): Folder {
+  const root: Folder = { path: variant ?? "", name: "", file: false, folders: [], parts: [] };
   for (const part of parts) {
     let at = root;
-    for (const { name, file } of folders[part] ?? []) {
+    const steps = folders[part] ?? [];
+    // The synthetic namespace is not a visible folder, but remains in every real folder's path.
+    for (const { name, file } of variant !== null && steps[0]?.name === variant ? steps.slice(1) : steps) {
       const path = at.path ? `${at.path}/${name}` : name;
       let next = at.folders.find((folder) => folder.path === path);
       if (next === undefined) {
@@ -69,12 +75,13 @@ const FOLDER_INDENT = 6;
 const PART_INDENT = 26;
 
 export function PartList(props: Props) {
-  const { parts, folders, assemblies, target, traces, assemblyLoads, files, marked, onSelect } = props;
+  const { parts, folders, assemblies, variant, target, traces, assemblyLoads, files, marked, divider, onSelect } = props;
   const [filter, setFilter] = useState("");
   const [closed, toggleClosed] = usePersistentSet("cadiste.closed-folders");
   const needle = filter.trim().toLowerCase();
-  const shown = useMemo(() => parts.filter((part) => part.toLowerCase().includes(needle)), [parts, needle]);
-  const tree = useMemo(() => folderTree(shown, folders), [shown, folders]);
+  const shown = useMemo(() => parts.filter((part) =>
+    (variant === null ? part : part.slice(variant.length + 1)).toLowerCase().includes(needle)), [parts, needle, variant]);
+  const tree = useMemo(() => folderTree(shown, folders, variant), [shown, folders, variant]);
   const list = useRef<HTMLUListElement>(null);
   // The marked part still to scroll to: once the folders opened for it have rendered its row.
   const reveal = useRef<string | null>(null);
@@ -87,7 +94,7 @@ export function PartList(props: Props) {
     let path = "";
     for (const { name } of folders[part] ?? []) {
       path = path ? `${path}/${name}` : name;
-      if (closed.has(path)) toggleClosed(path);
+      if (path !== variant && closed.has(path)) toggleClosed(path);
     }
   }, [marked]);
 
@@ -110,7 +117,7 @@ export function PartList(props: Props) {
           data-part={part}
           onClick={() => onSelect({ kind: "part", name: part })}
         >
-          <span className="part-name">{part}</span>
+          <span className="part-name">{variant === null ? part : part.slice(variant.length + 1)}</span>
           <Status state={state} done={state?.status === "ok" ? `${state.data.ops.length} ops` : ""} />
         </button>
       </li>
@@ -164,27 +171,44 @@ export function PartList(props: Props) {
   ];
 
   return (
-    <nav className="parts">
-      {assemblies.map((name) => (
-        <button
-          key={name}
-          className={target?.kind === "assembly" && target.name === name ? "part assembly selected" : "part assembly"}
-          onClick={() => onSelect({ kind: "assembly", name })}
-        >
-          <Icon name="assembly" />
-          <span className="part-name">{name}</span>
-          <Status state={assemblyLoads[name]} done="" />
-        </button>
-      ))}
-      <input
-        className="filter"
-        placeholder={`Filter ${parts.length} parts`}
-        value={filter}
-        onChange={(event) => setFilter(event.target.value)}
-      />
-      <ul className="part-tree" ref={list}>
-        {renderEntries(tree, 0)}
-      </ul>
-    </nav>
+    <>
+      <nav className="parts" aria-label="Project parts">
+        <header className="sidebar-section-header">
+          <h2>Project parts</h2>
+          <span className="sidebar-section-count">{needle ? `${shown.length}/${parts.length}` : parts.length}</span>
+        </header>
+        <input
+          className="filter"
+          placeholder={`Filter ${parts.length} parts`}
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+        />
+        <ul className="part-tree" ref={list}>
+          {renderEntries(tree, 0)}
+        </ul>
+      </nav>
+      {divider}
+      {assemblies.length > 0 && (
+        <nav className="assembly-shortcuts" aria-label="Assemblies">
+          <header className="sidebar-section-header">
+            <h2>Assemblies</h2>
+            <span className="sidebar-section-count">{assemblies.length}</span>
+          </header>
+          <div className="assembly-shortcut-list">
+            {assemblies.map((name) => (
+              <button
+                key={name}
+                className={target?.kind === "assembly" && target.name === name ? "part assembly selected" : "part assembly"}
+                onClick={() => onSelect({ kind: "assembly", name })}
+              >
+                <Icon name="assembly" />
+                <span className="part-name">{variant === null ? name : name.slice(variant.length + 1)}</span>
+                <Status state={assemblyLoads[name]} done="" />
+              </button>
+            ))}
+          </div>
+        </nav>
+      )}
+    </>
   );
 }

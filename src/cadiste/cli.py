@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import shlex
 import sys
 import time
@@ -15,11 +16,13 @@ from typing import TYPE_CHECKING, Any
 from build123d import export_brep, export_step, export_stl
 from build123d.topology import Compound, Shape
 
+from .assembly import capture_placements, instance, match_parts
 from .export import assembly_scene, export_trace
 from .mesh import Leaf
 from .project import load as _load
 from .project import part_definitions
-from .provenance import OriginPath, Provenance, unlocated_key
+from .provenance import OriginPath, Provenance
+from .three_mf import export_3mf
 from .trace import Trace, tracing
 from .tree import feature_tree, op_label, render
 
@@ -109,18 +112,17 @@ def cmd_export(args: argparse.Namespace) -> None:
 def _build_untraced(target: str, args: list[str], each: bool, label: str | None) -> tuple[Shape, float]:
     build: Callable[..., Any] = _load(target)
     start = time.perf_counter()
-    if each:
-        # One shape per argument, labelled with it, grouped like an assembly: a file's parts side by side.
-        children = []
-        for name in args:
-            child = build(name)
-            if not isinstance(child, Shape):
-                raise SystemExit(f"{target}({name!r}) returned {type(child).__name__}, not a build123d shape")
-            child.label = name
-            children.append(child)
-        result: Any = Compound(label=label or "Parts", children=children)
-    else:
-        result = build(*args)
+    with capture_placements(root=Path.cwd()):
+        if each:
+            children = []
+            for name in args:
+                child = build(name)
+                if not isinstance(child, Shape):
+                    raise SystemExit(f"{target}({name!r}) returned {type(child).__name__}, not a build123d shape")
+                children.append(instance(child, part=name, label=name))
+            result: Any = Compound(label=label or "Parts", children=children)
+        else:
+            result = build(*args)
     elapsed = time.perf_counter() - start
     if not isinstance(result, Shape):
         raise SystemExit(f"{target} returned {type(result).__name__}, not a build123d shape")
@@ -130,40 +132,104 @@ def _build_untraced(target: str, args: list[str], each: bool, label: str | None)
 def cmd_mesh(args: argparse.Namespace) -> None:
     with contextlib.redirect_stdout(sys.stderr):
         result, elapsed = _build_untraced(args.target, args.args, args.each, args.label)
-        scene, leaves = assembly_scene(result)
+        scene, leaves = assembly_scene(result, root=Path.cwd())
         if args.match_parts:
-            scene["part_of"] = _instance_parts(leaves, args.match_parts, args.part_build or args.target)
+            build: Callable[..., Any] = _load(args.part_build or args.target)
+            match_parts(scene, leaves, {name: build(name) for name in part_definitions(args.match_parts)})
         _write_shapes(leaves, args.shapes)
-    _write_json({"scene": scene, "build_seconds": elapsed}, args.output)
+    _write_json(
+        {
+            "scene": scene,
+            "build_seconds": elapsed,
+            "sources": scene["sources"],
+            "source_revision": scene["source_revision"],
+        },
+        args.output,
+    )
 
 
-def _instance_parts(leaves: list[Leaf], parts_target: str, build_target: str) -> dict[str, str]:
-    """Leaf path -> the part it is an instance of. An assembly places moved copies of its parts, which keep their
-    topology: a leaf whose first face is a part's, wherever placed, is that part's. Building the parts again costs
-    nothing when the model memoises them (pipecrawler's ``build_part``), which is also what makes them match; a
-    model that builds its parts anew for the assembly leaves its instances unmatched."""
-    build: Callable[..., Any] = _load(build_target)
-    owners: dict[Any, str] = {}
-    for name in part_definitions(parts_target):
-        part = build(name)
-        faces = part.faces() if isinstance(part, Shape) else []
-        if faces:
-            owners.setdefault(unlocated_key(faces[0].wrapped), name)
-    matched: dict[str, str] = {}
-    for leaf in leaves:
-        owner = owners.get(unlocated_key(leaf.faces[0])) if leaf.faces else None
-        if owner is not None:
-            matched[leaf.path] = owner
-    return matched
-
-
-_WRITERS: dict[str, Callable[[Shape, Path], bool]] = {"step": export_step, "stl": export_stl, "brep": export_brep}
+_WRITERS: dict[str, Callable[[Shape, Path], bool]] = {
+    "step": export_step, "3mf": export_3mf, "stl": export_stl, "brep": export_brep,
+}
 """What ``cadiste save`` writes: STEP keeps an assembly's tree (names, colours, placements); STL is one mesh."""
+
+
+def _exclude_hidden(result: Shape, hidden: list[str] | None) -> Shape:
+    """Prune by the viewer converter's names, before changing any sibling identities.
+
+    Only affected compounds are rebuilt; retained leaves keep their original topology
+    and local placements. Updating children alone drops a compound's own location,
+    so restore it after rebuilding its actual OCCT geometry (not just its tree).
+    """
+    if not hidden:
+        return result
+    from ocp_tessellate.convert import to_ocpgroup
+
+    group, _ = to_ocpgroup(
+        result, names=[result.label or type(result).__name__], colors=[None], alphas=[None]
+    )
+    paths: dict[str, Any] = {}
+
+    def index(node: Any, parent: str = "") -> None:
+        path = f"{parent}/{node.name}"
+        paths[path] = node
+        for child in getattr(node, "objects", []):
+            index(child, path)
+
+    index(group)
+    excluded = set(hidden)
+    if unknown := excluded - paths.keys():
+        raise ValueError(f"unknown hidden viewer paths: {', '.join(sorted(unknown))}")
+
+    def prune(shape: Shape, node: Any, path: str) -> Shape | None:
+        if path in excluded:
+            return None
+        if not any(key.startswith(path + "/") for key in excluded):
+            return shape
+        children = list(shape.children)
+        if not children:
+            # A standalone shape is wrapped in the converter's scene root group.
+            nodes = getattr(node, "objects", [])
+            if nodes:
+                if len(nodes) != 1:
+                    if any(key.startswith(path + "/") for key in excluded):
+                        raise ValueError(f"cannot map hidden viewer paths within {path!r} to CAD geometry")
+                elif prune(shape, nodes[0], f"{path}/{nodes[0].name}") is None:
+                    return None
+            return shape
+        nodes = getattr(node, "objects", [])
+        if len(children) != len(nodes):
+            raise ValueError(f"cannot map viewer children of {path!r} to CAD geometry")
+        kept = [
+            child
+            for shape_child, child_node in zip(children, nodes, strict=True)
+            if (child := prune(shape_child, child_node, f"{path}/{child_node.name}")) is not None
+        ]
+        if not kept:
+            return None
+        # A changed descendant also requires rebuilding all ancestor compounds.
+        location = shape.location
+        shape.children = kept
+        shape.location = location
+        return shape
+
+    filtered = prune(result, group, f"/{group.name}")
+    if filtered is None:
+        raise ValueError("nothing to export: all geometry is hidden")
+    return filtered
 
 
 def cmd_save(args: argparse.Namespace) -> None:
     with contextlib.redirect_stdout(sys.stderr):
         result, _ = _build_untraced(args.target, args.args, args.each, args.label)
+        try:
+            result = _exclude_hidden(result, args.hidden)
+            if args.rotation is not None or args.translation is not None or args.on_bed:
+                from .manufacturing import orient_geometry
+
+                result = orient_geometry(result, args.rotation, args.translation, on_bed=args.on_bed)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
         if args.label and not args.each:
             result.label = args.label
         if not _WRITERS[args.format](result, args.output):
@@ -260,9 +326,76 @@ def _ros_command(value: str) -> tuple[str, ...]:
 
 def cmd_serve(args: argparse.Namespace) -> None:
     from .cache import TraceCache
+    from .profiles import Profile
     from .project import source_roots
     from .server import Project, serve
 
+    profile = None
+    profile_path: Path | None = None
+    variant = getattr(args, "variant", None)
+    if args.profile is not None:
+        if args.target is not None or args.parts or args.assembly or args.simulation or args.trace_env or args.args:
+            raise SystemExit("--profile cannot be combined with model configuration flags")
+        profile_path = Path(args.profile).expanduser().resolve()
+        profile = Profile.load(profile_path)
+        if variant is not None and variant not in profile.variants:
+            raise SystemExit(f"unknown variant {variant!r}; --variant requires a declared profile variant")
+        data = profile.to_dict()
+        interpreter = data.get("interpreter") or sys.executable
+        if Path(interpreter).absolute() != Path(sys.executable).absolute():
+            command = [
+                interpreter,
+                "-m",
+                "cadiste",
+                "serve",
+                "--profile",
+                str(profile_path),
+                "--host",
+                args.host,
+                "--port",
+                str(args.port),
+                "--cache-dir",
+                str(args.cache_dir),
+            ]
+            for flag, value in (
+                ("--workspace-root", args.workspace_root),
+                ("--workspace-url", args.workspace_url),
+                ("--ready-file", args.ready_file),
+                ("--ready-token", args.ready_token),
+                ("--variant", variant),
+            ):
+                if value is not None:
+                    command += [flag, str(value)]
+            if args.no_cache:
+                command.append("--no-cache")
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                filter(
+                    None,
+                    [
+                        str(Path(__file__).resolve().parents[1]),
+                        environment.get("PYTHONPATH", ""),
+                    ],
+                )
+            )
+            os.execve(interpreter, command, environment)
+        os.chdir(data["root"])
+        args.target, args.args, args.parts = data["target"], data.get("args", []), data.get("parts")
+        args.ros_command = tuple(data.get("ros_command", ["ros2"]))
+        args.assembly = [f"{name}={target}" for name, target in data.get("assemblies", {}).items()]
+        args.simulation = [f"{name}={target}" for name, target in data.get("simulations", {}).items()]
+        args.trace_env = [f"{key}={value}" for key, value in data.get("trace_env", {}).items()]
+        sys.path[:0] = [str(Path.cwd()), str(Path.cwd() / "src")]
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            filter(
+                None,
+                [
+                    str(Path.cwd()),
+                    str(Path.cwd() / "src"),
+                    os.environ.get("PYTHONPATH", ""),
+                ],
+            )
+        )
     environment = _environment(args.trace_env)
     assemblies = _assemblies(args.assembly)
     simulations = _assemblies(args.simulation)
@@ -270,19 +403,69 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if unknown:
         raise SystemExit(f"simulation names must match --assembly names; unknown: {', '.join(sorted(unknown))}")
     cache = None
-    if not args.no_cache:
-        targets = [args.target, *([args.parts] if args.parts else []), *assemblies.values()]
-        salt = json.dumps({"target": args.target, "args": args.args, "env": environment}, sort_keys=True)
-        cache = TraceCache(args.cache_dir.resolve(), source_roots(targets), salt)
-    project = Project(
-        args.target, tuple(args.args), None, assemblies, environment,
-        parts_target=args.parts, simulations=simulations,
-    )
-    project.catalog(refresh=True)
-    # The lockfile goes where `cadiste mcp` looks for it, with or without a cache.
+    project = None
+    if args.target:
+        if variant is not None and (profile is None or not profile.variants):
+            raise SystemExit("--variant requires a profile with declared variants")
+        project = Project(
+            args.target,
+            tuple(args.args),
+            None,
+            assemblies,
+            environment,
+            parts_target=args.parts,
+            simulations=simulations,
+            check_sets=profile.check_sets if profile is not None else None,
+            manufacturing=profile.manufacturing if profile is not None else None,
+            profile_path=str(profile_path) if profile_path is not None else None,
+        )
+        if profile is not None and profile.variants:
+            variants = {}
+            for identifier in profile.variants:
+                effective = profile.effective_variant(identifier)
+                variants[identifier] = Project(
+                    effective.target,
+                    effective.args,
+                    None,
+                    effective.assemblies,
+                    effective.trace_env,
+                    parts_target=effective.parts,
+                    simulations=effective.simulations,
+                    check_sets=effective.check_sets,
+                    manufacturing=effective.manufacturing,
+                    profile_path=str(profile_path) if profile_path is not None else None,
+                )
+            project = Project(
+                profile.target,
+                profile.args,
+                None,
+                variants=variants,
+                variant_labels={
+                    identifier: overrides.get("label", identifier)
+                    for identifier, overrides in profile.variants.items()
+                },
+                default_variant=variant or profile.default_variant,
+                profile_path=str(profile_path) if profile_path is not None else None,
+            )
+        if not args.no_cache:
+            salt = json.dumps(project.build_bindings(), sort_keys=True)
+            cache = TraceCache(args.cache_dir.resolve(), source_roots(project.source_targets()), salt)
+        project.catalog(refresh=True)
+    elif args.parts or assemblies or simulations or environment or args.args:
+        raise SystemExit("model configuration requires a target or --profile")
+    elif variant is not None:
+        raise SystemExit("--variant requires a profile with declared variants")
     serve(
-        project, args.host, args.port, cache, lockfile=args.cache_dir.resolve() / "serve.json",
+        project,
+        args.host,
+        args.port,
+        cache,
+        lockfile=args.cache_dir.resolve() / "serve.json",
         ros_command=args.ros_command,
+        workspace_root=args.workspace_root,
+        workspace_url=args.workspace_url,
+        ready_file=args.ready_file,
+        ready_token=args.ready_token,
     )
 
 
@@ -335,7 +518,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     mesh.set_defaults(run=cmd_mesh)
 
-    save = commands.add_parser("save", help="build a model (not traced) and write it as a CAD file: STEP, STL or BREP")
+    save = commands.add_parser("save", help="build a model (not traced) and write STEP, 3MF, STL or BREP")
     save.add_argument("target", help="module:callable returning the shape (a part or an assembly)")
     save.add_argument("args", nargs="*", help="string arguments passed to the callable")
     save.add_argument("--output", type=Path, required=True, help="file to write")
@@ -346,6 +529,17 @@ def main(argv: list[str] | None = None) -> None:
         help="call the target once per argument and group the shapes, each labelled with its argument",
     )
     save.add_argument("--label", help="name of the shape written (of the group made with --each)")
+    save.add_argument(
+        "--hidden", action="append", default=None, metavar="PATH",
+        help="exclude an exact viewer instance/group path (repeatable); unknown paths and empty exports fail",
+    )
+    save.add_argument(
+        "--rotation", nargs=3, type=float, metavar=("X", "Y", "Z"), help="fixed world XYZ rotation in degrees"
+    )
+    save.add_argument(
+        "--translation", nargs=3, type=float, metavar=("X", "Y", "Z"), help="world translation in millimetres"
+    )
+    save.add_argument("--on-bed", action="store_true", help="place the rotated geometry's lowest point at Z=0")
     save.set_defaults(run=cmd_save)
 
     gazebo = commands.add_parser("gazebo", help="export an articulated Simulation for ROS 2 Jazzy / Gazebo Harmonic")
@@ -369,8 +563,8 @@ def main(argv: list[str] | None = None) -> None:
     scene.add_argument("args", nargs="*", help="string arguments passed to the callable")
     scene.set_defaults(run=cmd_simulation_scene)
 
-    serve = commands.add_parser("serve", help="serve the viewer; every request traces a fresh build")
-    serve.add_argument("target", help="module:callable returning the shape")
+    serve = commands.add_parser("serve", help="serve a model or open the project workspace")
+    serve.add_argument("target", nargs="?", help="module:callable; omit to open the project workspace")
     serve.add_argument("args", nargs="*", help="string arguments passed to the callable (without --parts)")
     serve.add_argument(
         "--parts",
@@ -415,6 +609,16 @@ def main(argv: list[str] | None = None) -> None:
         help="where traces are kept between requests and restarts (default: .cache/cadiste)",
     )
     serve.add_argument("--no-cache", action="store_true", help="trace every request anew")
+    serve.add_argument("--profile", type=Path, help="load a declarative cadiste.json project profile")
+    serve.add_argument("--variant", metavar="ID", help="default variant of a declarative variant profile")
+    serve.add_argument(
+        "--workspace-root",
+        type=Path,
+        help="directory in which projects may be created/loaded (default: parent directory)",
+    )
+    serve.add_argument("--workspace-url", help=argparse.SUPPRESS)
+    serve.add_argument("--ready-file", type=Path, help=argparse.SUPPRESS)
+    serve.add_argument("--ready-token", help=argparse.SUPPRESS)
     serve.set_defaults(run=cmd_serve)
 
     mcp = commands.add_parser(

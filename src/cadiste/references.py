@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 from . import context
+from .assembly import describe_assembly
 
 if TYPE_CHECKING:
     from .components import CodeModel
@@ -178,6 +179,7 @@ class Snapshot:
                 lines += ["Captured feature tree:", context.feature_tree(built)]
             else:
                 lines += self._members(built)
+                lines += self._placement_lines(built, built["scene"]["data"]["shapes"])
         for index, item in enumerate(items, 1):
             if item["kind"] == "feature":
                 part, node = item["part"], item["node"]
@@ -209,7 +211,7 @@ class Snapshot:
                         f"Viewer bounds (mesh context, not exact B-rep): {json.dumps(bounds)}"
                         if bounds
                         else "Instance geometry unavailable: this build retained no instance bounds.",
-                        "Instance placement source unavailable: composite views are built without tracing.",
+                        "Owning-part construction source and instance placement source are separate evidence.",
                     ]
                     if chain:
                         owners = {
@@ -340,6 +342,12 @@ class Snapshot:
             owner = context.owning_part(built, leaf["id"], set(self.project.names))
             ownership = owner or "unavailable (no unambiguous part mapping)"
             lines += [f"- {leaf['name']}; viewer path {leaf['id']}; owning part: {ownership}"]
+        coverage = built["scene"].get("ownership")
+        if coverage:
+            lines += [
+                f"Ownership coverage: {coverage['matched']}/{coverage['total']} matched ({coverage['status']}).",
+                coverage["explanation"],
+            ]
         return lines
 
     def _entity_context(
@@ -359,6 +367,10 @@ class Snapshot:
             return ["Owning part/provenance unavailable: this viewer leaf is not in the captured build."]
         part = target["name"] if target["kind"] == "part" else context.owning_part(built, leaf, set(self.project.names))
         lines = [f"Owning part: {part or 'unavailable (no unambiguous part mapping)'}"]
+        if target["kind"] != "part":
+            chain = context.shape_chain(built["scene"]["data"]["shapes"], leaf)
+            if chain:
+                lines += self._placement_lines(built, chain[-1])
         if part is None or part not in traces:
             return [*lines, "Creating feature/source unavailable: no pinned owning-part trace was loaded."]
         trace, trace_build = traces[part]
@@ -451,4 +463,32 @@ class Snapshot:
                     f"- {node['id']}; parent {parent}; local translation {json.dumps(translation)}; "
                     f"quaternion {json.dumps(quaternion)}"
                 ]
+                construction = built["scene"].get("construction", {}).get(node["id"])
+                if construction:
+                    lines += [
+                        f"Assembly construction source (not owning-part definition): {construction.get('reference')}",
+                        f"Captured assembly construction call: {construction.get('code') or 'unavailable'}",
+                        f"Construction call site: {json.dumps(construction.get('site'))}",
+                        f"Construction arguments: {json.dumps(construction.get('arguments', []), ensure_ascii=False)}",
+                    ]
+            evidence = describe_assembly(built, member["id"])["instances"][0]
+            placement = evidence["placement"]
+            if placement:
+                lines += [
+                    f"Instance placement source: {placement.get('reference') or 'unavailable reference'}",
+                    f"Placement owner definition (not owning-part definition): {placement.get('definition')}",
+                    f"Placement call site: {json.dumps(placement.get('site'))}",
+                    f"Captured placement call: {placement.get('code') or 'unavailable'}",
+                    f"Captured placement arguments: {json.dumps(placement.get('arguments', []), ensure_ascii=False)}",
+                    "Written placement arguments: "
+                    f"{json.dumps(placement.get('call_arguments', []), ensure_ascii=False)}",
+                    f"Placement source revision: {placement.get('source_revision') or 'unavailable'}",
+                ]
+                source = built["scene"].get("sources", {}).get((placement.get("site") or {}).get("file"))
+                site = placement.get("site") or {}
+                if source and site.get("line"):
+                    excerpt = source.splitlines()[site["line"] - 1 : site.get("end_line", site["line"])]
+                    lines += ["Captured placement source excerpt:", "```python", *excerpt, "```"]
+            else:
+                lines += [f"Instance placement source unavailable: {evidence['placement_unavailable']}"]
         return lines

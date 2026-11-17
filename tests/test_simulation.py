@@ -62,9 +62,7 @@ def test_mass_override_full_tensor_and_com_are_link_local_si(tmp_path: Path):
     assert float(tensor.findtext("ixy", "")) == pytest.approx((ixx - iyy) / 2)
     assert float(tensor.findtext("izz", "")) == pytest.approx(2 * (0.01**2 + 0.02**2) / 12)
     assert _floats(model.findtext("link/pose")) == pytest.approx([0.1, 0.2, 0.3, 0, 0, 0])
-    assert _floats(model.findtext("link/visual/pose")) == pytest.approx(
-        [0.007, -0.011, 0.023, 0, 0, math.pi / 4]
-    )
+    assert _floats(model.findtext("link/visual/pose")) == pytest.approx([0.007, -0.011, 0.023, 0, 0, math.pi / 4])
     assert model.findtext("link/collision/pose") == model.findtext("link/visual/pose")
 
 
@@ -128,12 +126,23 @@ def test_primitives_joint_frames_passive_springs_and_environment(tmp_path: Path)
     )
     body = replace(base.links[0], collisions=collisions)
     passive = Joint(
-        "spring", "wheel", "arm", pose=Location((40, 10, 0)), axis=(0, 2, 0),
-        lower=-0.4, upper=0.7, spring_stiffness=0.8, spring_reference=-0.1,
+        "spring",
+        "wheel",
+        "arm",
+        pose=Location((40, 10, 0)),
+        axis=(0, 2, 0),
+        lower=-0.4,
+        upper=0.7,
+        spring_stiffness=0.8,
+        spring_reference=-0.1,
     )
     environment = Link("pipe", Box(200, 100, 100), pose=Location((0, 0, -60)))
-    robot = replace(base, links=(body, base.links[1], Link("arm", Box(5, 5, 5))),
-                    joints=(*base.joints, passive), environment=(environment,))
+    robot = replace(
+        base,
+        links=(body, base.links[1], Link("arm", Box(5, 5, 5))),
+        joints=(*base.joints, passive),
+        environment=(environment,),
+    )
     launch = write_bundle(robot, tmp_path)
     model = _model(tmp_path)
     assert launch == tmp_path / "sim.launch.py"
@@ -169,29 +178,46 @@ def test_primitives_joint_frames_passive_springs_and_environment(tmp_path: Path)
     assert {bridge["gz_topic_name"] for bridge in bridges} >= {"/world/cadiste/clock", "/crawler/joint_states"}
 
 
-@pytest.mark.parametrize("change,match", [
-    (lambda robot: replace(robot, name="../escape"), "simulation name"),
-    (lambda robot: replace(robot, links=(robot.links[0], robot.links[0])), "duplicate link"),
-    (lambda robot: replace(robot, joints=()), "connected"),
-    (lambda robot: replace(robot, joints=(*robot.joints, Joint("back", "wheel", "body", kind="fixed"))), "acyclic"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], parent="missing"),)), "distinct robot links"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], axis=(0, 0, 0)),)), "axis"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], effort=math.nan),)), "effort"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity=0),)), "velocity"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity_gain=0),)), "gain"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity_integral_gain=-1),)), "gain"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], kind="revolute"),)), "lower and upper"),
-    (lambda robot: replace(robot, joints=(replace(robot.joints[0], kind="revolute", lower=1, upper=2),)), "CAD zero"),
-    (lambda robot: replace(robot, links=(replace(robot.links[0], mass=-1), robot.links[1])), "mass"),
-    (lambda robot: replace(robot, links=(replace(robot.links[0], density=math.inf), robot.links[1])), "density"),
-    (lambda robot: replace(robot, links=(replace(robot.links[0], shape=Rectangle(10, 10)), robot.links[1])), "solid"),
-    (lambda robot: replace(
-        robot, links=(replace(robot.links[0], collisions=(Collision("sphere", (0,)),)), robot.links[1]),
-    ), "dimension"),
-    (lambda robot: replace(
-        robot, links=(replace(robot.links[0], collisions=(Collision("mesh"),)), robot.links[1]),
-    ), "mesh requires"),
-])
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        (lambda robot: replace(robot, name="../escape"), "simulation name"),
+        (lambda robot: replace(robot, links=(robot.links[0], robot.links[0])), "duplicate link"),
+        (lambda robot: replace(robot, joints=()), "connected"),
+        (lambda robot: replace(robot, joints=(*robot.joints, Joint("back", "wheel", "body", kind="fixed"))), "acyclic"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], parent="missing"),)), "distinct robot links"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], axis=(0, 0, 0)),)), "axis"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], effort=math.nan),)), "effort"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity=0),)), "velocity"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity_gain=0),)), "gain"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], velocity_integral_gain=-1),)), "gain"),
+        (lambda robot: replace(robot, joints=(replace(robot.joints[0], kind="revolute"),)), "lower and upper"),
+        (
+            lambda robot: replace(robot, joints=(replace(robot.joints[0], kind="revolute", lower=1, upper=2),)),
+            "CAD zero",
+        ),
+        (lambda robot: replace(robot, links=(replace(robot.links[0], mass=-1), robot.links[1])), "mass"),
+        (lambda robot: replace(robot, links=(replace(robot.links[0], density=math.inf), robot.links[1])), "density"),
+        (
+            lambda robot: replace(robot, links=(replace(robot.links[0], shape=Rectangle(10, 10)), robot.links[1])),
+            "solid",
+        ),
+        (
+            lambda robot: replace(
+                robot,
+                links=(replace(robot.links[0], collisions=(Collision("sphere", (0,)),)), robot.links[1]),
+            ),
+            "dimension",
+        ),
+        (
+            lambda robot: replace(
+                robot,
+                links=(replace(robot.links[0], collisions=(Collision("mesh"),)), robot.links[1]),
+            ),
+            "mesh requires",
+        ),
+    ],
+)
 def test_invalid_physics_and_topology_do_not_write(tmp_path: Path, change, match: str):
     output = tmp_path / "not_created"
     with pytest.raises(ValueError, match=match):
@@ -202,7 +228,7 @@ def test_invalid_physics_and_topology_do_not_write(tmp_path: Path, change, match
 def test_cli_factory_arguments_wrong_type_and_simulation_name_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    source = '''
+    source = """
 from build123d import Box
 from cadiste.simulation import Link, Simulation
 
@@ -211,7 +237,7 @@ def build(name):
 
 def wrong():
     return Box(10, 10, 10)
-'''
+"""
     (tmp_path / "cadiste_simulation_test_model.py").write_text(source)
     monkeypatch.syspath_prepend(str(tmp_path))
     main(["gazebo", "--output", str(tmp_path / "bundle"), "cadiste_simulation_test_model:build", "rover"])
@@ -220,9 +246,16 @@ def wrong():
         main(["gazebo", "--output", str(tmp_path / "wrong"), "cadiste_simulation_test_model:wrong"])
     assert not (tmp_path / "wrong").exists()
     with pytest.raises(SystemExit):
-        main(["serve", "cadiste_simulation_test_model:wrong", "--assembly", "Robot=example:build",
-              "--simulation", "Other=example:simulation"])
-
+        main(
+            [
+                "serve",
+                "cadiste_simulation_test_model:wrong",
+                "--assembly",
+                "Robot=example:build",
+                "--simulation",
+                "Other=example:simulation",
+            ]
+        )
 
 
 @pytest.mark.parametrize("ratio", [0.4, -0.4, 1.0, -1.0])
@@ -235,7 +268,7 @@ def test_motor_metadata_and_native_relay_keep_output_physics_units(tmp_path: Pat
     assert controls == control_config(robot)
     assert controls["transmissions"] == [{"name": "motor", "joint": "drive", "ratio": ratio}]
     assert controls["feedback"]["joints"] == ["drive"]
-    command, = controls["commands"]
+    (command,) = controls["commands"]
     assert command["joint"] == "motor"
     assert command["topic"] == "/crawler/motors/motor/cmd_vel"
     assert command["velocity_limit"] == pytest.approx(12.0 / abs(ratio))
@@ -273,10 +306,17 @@ def _geared_robot() -> Simulation:
     return replace(
         robot,
         links=(replace(robot.links[0], pose=Location((100, -40, 70), (17, 23, 31))), robot.links[1]),
-        visuals=(DrivenVisual(
-            "idler", "body", "drive", shape, Location((120, -10, 90), (30, -20, 45)),
-            axis=(0, 1, 0), multiplier=-1.875,
-        ),),
+        visuals=(
+            DrivenVisual(
+                "idler",
+                "body",
+                "drive",
+                shape,
+                Location((120, -10, 90), (30, -20, 45)),
+                axis=(0, 1, 0),
+                multiplier=-1.875,
+            ),
+        ),
     )
 
 
@@ -284,7 +324,8 @@ def _sdf_location(text: str | None) -> Location:
     values = _floats(text)
     return Location(
         (values[0] * 1000, values[1] * 1000, values[2] * 1000),
-        (math.degrees(values[3]), math.degrees(values[4]), math.degrees(values[5])), Extrinsic.XYZ,
+        (math.degrees(values[3]), math.degrees(values[4]), math.degrees(values[5])),
+        Extrinsic.XYZ,
     )
 
 
@@ -298,7 +339,7 @@ def _assert_pose(actual: Location, expected: Location) -> None:
 
 def test_driven_visuals_have_no_physics_and_preserve_leaf_geometry_and_measured_bindings(tmp_path: Path):
     robot = _geared_robot()
-    visual, = robot.visuals
+    (visual,) = robot.visuals
     write_bundle(robot, tmp_path)
     model = _model(tmp_path)
     assert {link.get("name") for link in model.findall("link")} == {"body", "wheel"}
@@ -329,7 +370,8 @@ def test_driven_visuals_have_no_physics_and_preserve_leaf_geometry_and_measured_
         count = struct.unpack_from("<I", data, 80)[0]
         vertices = [
             Vector(*struct.unpack_from("<3f", data, 84 + triangle * 50 + 12 + vertex * 12))
-            for triangle in range(count) for vertex in range(3)
+            for triangle in range(count)
+            for vertex in range(3)
         ]
         # Exported STL is leaf-local, not an already-placed CAD shape.
         local_bounds = shape.located(Location()).bounding_box()
@@ -356,33 +398,51 @@ def test_driven_visuals_have_no_physics_and_preserve_leaf_geometry_and_measured_
     assert len({item["path"] for item in scene["links"].values()}) == 3
 
 
-@pytest.mark.parametrize("change,match", [
-    (lambda r: replace(r, transmissions=(Transmission("motor", "drive", 0),)), "nonzero"),
-    (lambda r: replace(r, transmissions=(Transmission("motor", "drive", math.nan),)), "ratio"),
-    (lambda r: replace(r, transmissions=(Transmission("motor", "drive", math.inf),)), "ratio"),
-    (lambda r: replace(r, transmissions=(Transmission("motor", "missing", 1),)), "actuated"),
-    (lambda r: replace(r, transmissions=(Transmission("body", "drive", 1),)), "duplicate"),
-    (lambda r: replace(r, transmissions=(Transmission("a", "drive", 1), Transmission("b", "drive", -1))), "multiple"),
-    (lambda r: replace(r, joints=(replace(r.joints[0], actuated=False),),
-                       transmissions=(Transmission("motor", "drive", 1),)), "actuated"),
-    (lambda r: replace(r, transmissions=(Transmission("idler", "drive", 1),)), "duplicate"),
-    (lambda r: replace(r, environment=(Link("scenery", Box(5, 5, 5)),),
-                       visuals=(replace(r.visuals[0], name="scenery"),)), "duplicate"),
-    (lambda r: replace(r, environment=(Link("scenery", Box(5, 5, 5)),),
-                       visuals=(replace(r.visuals[0], parent="scenery"),)), "parent"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], name="drive"),)), "duplicate"),
-    (lambda r: replace(r, visuals=(r.visuals[0], r.visuals[0])), "duplicate"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], parent="missing"),)), "parent"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], joint="missing"),)), "source joint"),
-    (lambda r: replace(r, joints=(replace(r.joints[0], kind="fixed", actuated=False),)), "source joint"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 0, 0)),)), "unit vector"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 2, 0)),)), "unit vector"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 1)),)), "unit vector"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(math.nan, 1, 0)),)), "unit vector"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], multiplier=math.inf),)), "multiplier"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], pose=None),)), "Location"),
-    (lambda r: replace(r, visuals=(replace(r.visuals[0], shape=None),)), "nonempty shape"),
-])
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        (lambda r: replace(r, transmissions=(Transmission("motor", "drive", 0),)), "nonzero"),
+        (lambda r: replace(r, transmissions=(Transmission("motor", "drive", math.nan),)), "ratio"),
+        (lambda r: replace(r, transmissions=(Transmission("motor", "drive", math.inf),)), "ratio"),
+        (lambda r: replace(r, transmissions=(Transmission("motor", "missing", 1),)), "actuated"),
+        (lambda r: replace(r, transmissions=(Transmission("body", "drive", 1),)), "duplicate"),
+        (
+            lambda r: replace(r, transmissions=(Transmission("a", "drive", 1), Transmission("b", "drive", -1))),
+            "multiple",
+        ),
+        (
+            lambda r: replace(
+                r, joints=(replace(r.joints[0], actuated=False),), transmissions=(Transmission("motor", "drive", 1),)
+            ),
+            "actuated",
+        ),
+        (lambda r: replace(r, transmissions=(Transmission("idler", "drive", 1),)), "duplicate"),
+        (
+            lambda r: replace(
+                r, environment=(Link("scenery", Box(5, 5, 5)),), visuals=(replace(r.visuals[0], name="scenery"),)
+            ),
+            "duplicate",
+        ),
+        (
+            lambda r: replace(
+                r, environment=(Link("scenery", Box(5, 5, 5)),), visuals=(replace(r.visuals[0], parent="scenery"),)
+            ),
+            "parent",
+        ),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], name="drive"),)), "duplicate"),
+        (lambda r: replace(r, visuals=(r.visuals[0], r.visuals[0])), "duplicate"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], parent="missing"),)), "parent"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], joint="missing"),)), "source joint"),
+        (lambda r: replace(r, joints=(replace(r.joints[0], kind="fixed", actuated=False),)), "source joint"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 0, 0)),)), "unit vector"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 2, 0)),)), "unit vector"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(0, 1)),)), "unit vector"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], axis=(math.nan, 1, 0)),)), "unit vector"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], multiplier=math.inf),)), "multiplier"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], pose=None),)), "Location"),
+        (lambda r: replace(r, visuals=(replace(r.visuals[0], shape=None),)), "nonempty shape"),
+    ],
+)
 def test_invalid_transmission_and_visual_bindings_fail_before_export(tmp_path: Path, change, match: str):
     output = tmp_path / "not_created"
     with pytest.raises(ValueError, match=match):
@@ -404,28 +464,38 @@ def test_ordinary_project_has_clean_empty_ideal_schema_without_native_prerequisi
 def test_mixed_transmitted_and_direct_actuators_keep_independent_public_topics(tmp_path: Path):
     robot = _robot()
     robot = replace(
-        robot, links=(*robot.links, Link("arm", Box(4, 5, 6))),
+        robot,
+        links=(*robot.links, Link("arm", Box(4, 5, 6))),
         joints=(*robot.joints, Joint("steer", "body", "arm", kind="continuous", actuated=True)),
         transmissions=(Transmission("drive_motor", "drive", -0.4),),
     )
     write_bundle(robot, tmp_path)
     config = control_config(robot)
     assert [(item["joint"], item["topic"]) for item in config["commands"]] == [
-        ("drive_motor", "/crawler/motors/drive_motor/cmd_vel"), ("steer", "/crawler/joints/steer/cmd_vel"),
+        ("drive_motor", "/crawler/motors/drive_motor/cmd_vel"),
+        ("steer", "/crawler/joints/steer/cmd_vel"),
     ]
     assert config["feedback"]["joints"] == ["drive", "steer"]
     bridges = json.loads((tmp_path / "bridge.yaml").read_text())
     assert {item["ros_topic_name"] for item in bridges if item["direction"] == "ROS_TO_GZ"} == {
-        "/crawler/motors/drive_motor/cmd_vel", "/crawler/joints/steer/cmd_vel",
+        "/crawler/motors/drive_motor/cmd_vel",
+        "/crawler/joints/steer/cmd_vel",
     }
 
 
 @pytest.mark.parametrize("animated_only", [False, True])
 def test_ideal_bundle_reports_missing_native_runtime_before_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, animated_only: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    animated_only: bool,
 ):
-    robot = _geared_robot() if animated_only else replace(
-        _robot(), transmissions=(Transmission("motor", "drive", -0.4),),
+    robot = (
+        _geared_robot()
+        if animated_only
+        else replace(
+            _robot(),
+            transmissions=(Transmission("motor", "drive", -0.4),),
+        )
     )
     write_bundle(robot, tmp_path)
     # ROS discovery is independent of the plugin prerequisite under test.
@@ -435,3 +505,40 @@ def test_ideal_bundle_reports_missing_native_runtime_before_launch(
     with pytest.raises(RuntimeError, match="IdealTransmission Gazebo plugin is unavailable"):
         launch_bundle(tmp_path, gui=False)
     assert not (tmp_path / "gazebo.log").exists()
+
+
+def test_control_metadata_exposes_physical_topology_and_environment_without_export(tmp_path: Path):
+    base = _robot()
+    joint = replace(
+        base.joints[0],
+        kind="revolute",
+        axis=(0, 2, 0),
+        lower=-0.5,
+        upper=0.7,
+        pose=Location((40, 0, 0), (0, 0, 30)),
+        effort=2.5,
+        velocity=3.0,
+    )
+    robot = replace(
+        base,
+        joints=(joint,),
+        transmissions=(Transmission("motor", "drive", -0.5),),
+        environment=(Link("pipe", Box(100, 100, 100), pose=Location((0, 0, -60))),),
+    )
+    config = control_config(robot)
+    topology = config["topology"]
+    assert {item["name"]: item["owner"] for item in topology["links"]} == {"body": "robot", "wheel": "robot"}
+    (physical,) = topology["joints"]
+    assert physical["parent"] == "body" and physical["child"] == "wheel"
+    assert physical["axis"] == [0, 1, 0] and physical["axis_frame"] == "joint"
+    assert physical["pose"]["position"] == pytest.approx([0.04, 0, 0])
+    assert physical["lower"] == -0.5 and physical["upper"] == 0.7
+    assert physical["effort"] == 2.5 and physical["velocity"] == 3.0
+    assert config["commands"][0]["joint"] == "motor"
+    assert config["commands"][0]["velocity_limit"] == 6.0
+    (environment,) = topology["environment"]
+    assert environment["name"] == "pipe" and environment["static"] is True
+    assert environment["owner"] == "environment"
+    assert environment["pose"]["position"] == pytest.approx([0, 0, -0.06])
+    assert "pipe" not in config["feedback"]["links"]
+    assert not list(tmp_path.iterdir())

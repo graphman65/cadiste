@@ -265,15 +265,10 @@ def leaves(node: Json) -> list[Json]:
 
 
 def owning_part(built: Json, path: str, parts: set[str]) -> str | None:
-    """Resolve only explicit instance ownership or a unique known part in its ancestor chain."""
-    chain = shape_chain(built["scene"]["data"]["shapes"], path)
-    if chain is None:
-        return None
-    explicit = built["scene"].get("part_of", {}).get(path)
-    if explicit:
-        return explicit
-    known = {node["name"] for node in chain if node["name"] in parts}
-    return next(iter(known)) if len(known) == 1 else None
+    """Resolve only captured instance ownership, never an instance's display name."""
+    from .assembly import owning_part as resolve
+
+    return resolve(built["scene"], path, parts)
 
 
 def pick_path(path: str) -> tuple[str, str, int] | None:
@@ -339,11 +334,208 @@ def _number(before: float, after: float, unit: str) -> str:
     return f"{before:.2f} → {after:.2f} {unit}{percent}"
 
 
+def _close(before: Any, after: Any) -> bool:
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        return abs(before - after) <= 1e-9 * max(1.0, abs(before), abs(after))
+    if isinstance(before, (list, tuple)) and isinstance(after, (list, tuple)):
+        return len(before) == len(after) and all(_close(a, b) for a, b in zip(before, after, strict=True))
+    if isinstance(before, dict) and isinstance(after, dict):
+        return before.keys() == after.keys() and all(_close(before[key], after[key]) for key in before)
+    return before == after
+
+
+def _bounds(built: Json) -> Json | None:
+    exact = built.get("result", {}).get("bbox")
+    if exact is not None:
+        return {"min": exact["min"], "max": exact["max"], "basis": "exact B-rep", "unit": "mm"}
+    box = built.get("scene", {}).get("data", {}).get("shapes", {}).get("bb")
+    if box and all(f"{axis}{end}" in box for axis in "xyz" for end in ("min", "max")):
+        return {
+            "min": [box[f"{axis}min"] for axis in "xyz"],
+            "max": [box[f"{axis}max"] for axis in "xyz"],
+            "basis": "viewer mesh bounds",
+            "unit": "mm",
+        }
+    return None
+
+
+def _multiply_quaternions(a: list[float], b: list[float]) -> list[float]:
+    x, y, z, w = a
+    u, v, s, t = b
+    return [
+        w * u + x * t + y * s - z * v,
+        w * v - x * s + y * t + z * u,
+        w * s + x * v - y * u + z * t,
+        w * t - x * u - y * v - z * s,
+    ]
+
+
+def _placement(chain: list[Any]) -> Json:
+    translation, rotation = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+    for point, quaternion in chain:
+        # Scene quaternions use (x,y,z,w). Rotate each local offset into its parent's frame.
+        vector = _multiply_quaternions(
+            _multiply_quaternions(rotation, [*point, 0.0]),
+            [-rotation[0], -rotation[1], -rotation[2], rotation[3]],
+        )
+        translation = [a + b for a, b in zip(translation, vector[:3], strict=True)]
+        rotation = _multiply_quaternions(rotation, quaternion)
+    # q and -q represent the same orientation.
+    if next((v for v in reversed(rotation) if abs(v) > 1e-12), 1.0) < 0:
+        rotation = [-value for value in rotation]
+    return {"translation": translation, "quaternion": rotation}
+
+
+def _instances(built: Json) -> dict[str, Json]:
+    root = built.get("scene", {}).get("data", {}).get("shapes")
+    instances: dict[str, Json] = {}
+    if root is None:
+        return instances
+    owners = built.get("scene", {}).get("part_of", {})
+
+    def walk(node: Json, chain: list[Any]) -> None:
+        locations = [*chain, node["loc"]] if node.get("loc") is not None else chain
+        if "parts" in node:
+            for child in node["parts"]:
+                walk(child, locations)
+        else:
+            path = node["id"]
+            instances[path] = {
+                "path": path,
+                "name": node.get("name"),
+                "part": owners.get(path),
+                "transform": _placement(locations),
+                "locations": locations,
+            }
+
+    walk(root, [])
+    return instances
+
+
+def structured_diff(before: Json | None, after: Json) -> Json:
+    """Observed geometry/placement changes, separate from source revision and build identity.
+
+    This is a summary of captured bounds, metrics, operations and scene placements, not a proof of geometric
+    equality: equal volumes and bounds do not imply equal shapes.
+    """
+    new_bounds = _bounds(after)
+    if before is None:
+        return {"available": False, "reason": "no earlier build", "bounds": {"before": None, "after": new_bounds}}
+    old_bounds = _bounds(before)
+    bounds: Json = {"before": old_bounds, "after": new_bounds, "changed": not _close(old_bounds, new_bounds)}
+    if old_bounds is not None and new_bounds is not None:
+        low = [b - a for a, b in zip(old_bounds["min"], new_bounds["min"], strict=True)]
+        high = [b - a for a, b in zip(old_bounds["max"], new_bounds["max"], strict=True)]
+        bounds.update(delta_min=low, delta_max=high, translation=low if _close(low, high) else None)
+    old_instances, new_instances = _instances(before), _instances(after)
+    added = [new_instances[path] for path in sorted(new_instances.keys() - old_instances.keys())]
+    removed = [old_instances[path] for path in sorted(old_instances.keys() - new_instances.keys())]
+    changed = []
+    for path in sorted(old_instances.keys() & new_instances.keys()):
+        old, new = old_instances[path], new_instances[path]
+        transform_changed = not _close(old["transform"], new["transform"])
+        owner_changed = old["part"] != new["part"]
+        if transform_changed or owner_changed:
+            changed.append(
+                {
+                    "path": path,
+                    "before": old,
+                    "after": new,
+                    "transform_changed": transform_changed,
+                    "part_changed": owner_changed,
+                    "translation_delta": [
+                        b - a
+                        for a, b in zip(
+                            old["transform"]["translation"],
+                            new["transform"]["translation"],
+                            strict=True,
+                        )
+                    ],
+                }
+            )
+    origin = None
+    if "result" in before and "result" in after and len(old_instances) == len(new_instances) == 1:
+        old_origin = next(iter(old_instances.values()))["transform"]["translation"]
+        new_origin = next(iter(new_instances.values()))["transform"]["translation"]
+        origin = {
+            "before": old_origin,
+            "after": new_origin,
+            "changed": not _close(old_origin, new_origin),
+            "delta": [b - a for a, b in zip(old_origin, new_origin, strict=True)],
+            "basis": "recorded scene placement",
+        }
+    metrics = {
+        key: {"before": before.get("result", {}).get(key), "after": after.get("result", {}).get(key)}
+        for key in ("volume", "faces", "attributed")
+        if key in before.get("result", {}) or key in after.get("result", {})
+    }
+    operations = []
+    a = [_signature(before, op) for op in before.get("ops", [])]
+    b = [_signature(after, op) for op in after.get("ops", [])]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2), strict=True):
+                arguments = _changes(before["ops"][i], after["ops"][j])
+                if arguments:
+                    operations.append({"kind": "changed", "before": i, "after": j, "arguments": arguments})
+        else:
+            operations.extend({"kind": "removed", "before": i} for i in range(i1, i2))
+            operations.extend({"kind": "added", "after": j} for j in range(j1, j2))
+    return {
+        "available": True,
+        "changed": bool(
+            bounds["changed"]
+            or added
+            or removed
+            or changed
+            or operations
+            or any(not _close(value["before"], value["after"]) for value in metrics.values())
+        ),
+        "scope": "captured metrics, bounds, operation arguments and scene placement; not geometric equality",
+        "bounds": bounds,
+        "origin": origin,
+        "metrics": metrics,
+        "operations": operations,
+        "instances": {"added": added, "removed": removed, "changed": changed},
+    }
+
+
+def _spatial_lines(diff: Json) -> list[str]:
+    lines = []
+    bounds = diff["bounds"]
+    old, new = bounds["before"], bounds["after"]
+    if old is not None and new is not None:
+        lines.append(
+            f"absolute bounds ({new['basis']}): {_vec(old['min'])} to {_vec(old['max'])} → "
+            f"{_vec(new['min'])} to {_vec(new['max'])} mm"
+        )
+        translation = bounds.get("translation")
+        if translation is not None and not _close(translation, [0, 0, 0]):
+            lines.append(f"bounds translation: {_vec(translation)} mm (size unchanged)")
+    origin = diff.get("origin")
+    if origin is not None and origin["changed"]:
+        lines.append(f"part origin: {_vec(origin['before'])} → {_vec(origin['after'])} mm")
+    for instance in diff["instances"]["added"]:
+        lines.append(f"+ instance {instance['path']}")
+    for instance in diff["instances"]["removed"]:
+        lines.append(f"- instance {instance['path']}")
+    for instance in diff["instances"]["changed"]:
+        lines.append(
+            f"~ instance {instance['path']}: translation delta {_vec(instance['translation_delta'])} mm; "
+            f"transform {instance['before']['transform']} → {instance['after']['transform']}"
+        )
+        if instance["part_changed"]:
+            lines.append(f"  owning part: {instance['before']['part']} → {instance['after']['part']}")
+    return lines
+
+
 def compare(before: Json | None, after: Json) -> str:
-    """How a part's new build differs from the previous one: size, faces, and the operations added, removed or
-    called differently."""
+    """Captured bounds, placement and operation changes, retaining the readable operation comparison."""
     if before is None:
         return "No earlier build of this part to compare with."
+    diff = structured_diff(before, after)
+    if "result" not in before or "result" not in after:
+        return "\n".join(_spatial_lines(diff)) or "No captured instance placement or bounds changes."
     lines = []
     old, new = before["result"], after["result"]
     if "volume" in old and "volume" in new:
@@ -358,6 +550,7 @@ def compare(before: Json | None, after: Json) -> str:
             )
         ]
         lines.append("bounding box: " + "; ".join(size))
+    lines.extend(_spatial_lines(diff))
     lines.append(f"faces: {old['faces']} → {new['faces']}, traced {old['attributed']} → {new['attributed']}")
     a = [_signature(before, op) for op in before["ops"]]
     b = [_signature(after, op) for op in after["ops"]]

@@ -32,6 +32,11 @@ body {
   margin: 0;
 }
 
+/* The viewer stylesheet disables selection on body; app text keeps native selection and copying. */
+#root {
+  user-select: text;
+}
+
 button {
   font: inherit;
   color: inherit;
@@ -46,7 +51,7 @@ button:hover:not(:disabled) {
   border-color: var(--muted);
 }
 
-button:disabled {
+button:disabled, button[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
 }
@@ -116,6 +121,25 @@ pre {
   letter-spacing: 0.04em;
 }
 
+.variant-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.variant-selector select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  max-width: 180px;
+}
+
 .project {
   color: var(--muted);
   min-width: 0;
@@ -155,21 +179,113 @@ pre {
 }
 
 .parts-pane {
-  display: flex;
-  flex-direction: column;
-  flex: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  flex: 0 1 auto;
+  max-height: calc(100% - 220px);
   min-height: 0;
 }
 
 .parts-pane.full {
   flex: 1;
+  max-height: none;
+}
+
+.parts-pane > .splitter-y {
+  grid-row: 2;
+}
+
+.assembly-shortcuts {
+  grid-row: 3;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.assembly-shortcut-list {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: min(20vh, 180px);
+  overflow-y: auto;
 }
 
 .parts {
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.sidebar-section-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 12px;
+}
+
+.sidebar-section-header h2 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sidebar-section-count {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-section-context {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 12px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sidebar-section-context span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-section-meta {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.sidebar-section-meta .part-status {
+  flex: 1;
+}
+
+.sidebar .filter {
+  margin: 6px 12px 8px;
 }
 
 /* ---- splitters ---- */
@@ -178,6 +294,7 @@ pre {
   flex: none;
   z-index: 20;
   touch-action: none;
+  user-select: none;
 }
 
 .splitter-y {
@@ -240,6 +357,16 @@ pre {
   white-space: nowrap;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+}
+
+.view-back {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 2px 6px;
+  color: var(--accent);
 }
 
 .view-bar-icon {
@@ -312,10 +439,6 @@ body[data-theme] .cad-view {
 /* Its hover readout: shown by the hover card instead. */
 .cad-view .tcv_status_line {
   display: none !important;
-}
-
-.cad-view.unrendered {
-  visibility: hidden;
 }
 
 /* Its measurement panels (properties, distance, angle: the tools' readouts of a selection), as the app's cards. */
@@ -933,21 +1056,6 @@ body[data-theme] .cad-view {
   flex-direction: column;
 }
 
-.assembly-pane-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 10px 5px;
-}
-
-.assembly-pane-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 .show-all {
   font-size: 11px;
@@ -1021,6 +1129,10 @@ body[data-theme] .cad-view {
   inset: 0;
   /* Contain the native viewer's high-z-index navigation beneath app controls and build overlays. */
   z-index: 0;
+}
+
+.cad-view canvas {
+  user-select: none;
 }
 
 .view-overlay {
@@ -1333,9 +1445,9 @@ body[data-theme] .cad-view {
 }
 
 .part.assembly {
-  padding: 7px 12px;
-  font-weight: 600;
-  border-bottom: 1px solid var(--border);
+  flex: none;
+  padding: 6px 12px;
+  font-weight: 500;
 }
 
 .part-name {
@@ -1882,6 +1994,60 @@ body[data-theme] .cad-view {
   border-color: var(--subtract);
 }
 
+.snapshot-copy-toast {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-color: var(--border);
+  color: var(--muted);
+  font-family: inherit;
+  pointer-events: auto;
+}
+
+.snapshot-copy-toast .icon-button {
+  padding: 2px;
+}
+
+.snapshot-copy {
+  position: fixed;
+  z-index: 100;
+  top: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100dvh - 80px);
+  overflow: auto;
+}
+
+.snapshot-copy p {
+  margin: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.snapshot-copy p[role="alert"] {
+  color: var(--subtract);
+}
+
+.snapshot-copy textarea {
+  width: 100%;
+  min-height: 180px;
+  height: min(360px, 45vh);
+  flex: none;
+  resize: vertical;
+  padding: 8px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: 12px var(--mono);
+}
+
+.snapshot-copy textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ---- export ---- */
 
 .export {
@@ -1904,12 +2070,54 @@ body[data-theme] .cad-view {
   flex-direction: column;
   gap: 2px;
   width: 340px;
+  max-width: calc(100vw - 24px);
   padding: 8px;
   background: rgb(34 37 42 / 0.97);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 8px 28px rgb(0 0 0 / 0.5);
   backdrop-filter: blur(4px);
+}
+
+.export-menu > * {
+  flex-shrink: 0;
+}
+
+.export-cncjs {
+  padding: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.export-cncjs summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.export-cncjs form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.export-cutting-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.export-cutting-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.export-cutting-fields input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .export-title {
@@ -2182,8 +2390,7 @@ body[data-theme] .cad-view {
   font-variant-numeric: tabular-nums;
 }
 
-.simulation-feedback h3,
-.simulation-scene-tree h3 {
+.simulation-feedback h3 {
   margin: 0 0 8px;
   font-size: 13px;
 }
@@ -2270,3 +2477,78 @@ body[data-theme] .cad-view {
   font-size: 12px;
   pointer-events: none;
 }
+
+.runtime-info, .project-launcher { position: relative; font-size: 12px; }
+.runtime-info > summary, .project-launcher > summary, .solid-check > summary { cursor: pointer; padding: 5px 8px; }
+.runtime-info.stale > summary { color: var(--intersect); font-weight: bold; }
+.runtime-info-panel, .topbar .project-launcher > :not(summary) {
+  position: absolute; top: 100%; right: 0; z-index: 90;
+  width: min(640px, 90vw); max-height: 80vh; overflow: auto;
+  padding: 14px; background: var(--panel); border: 1px solid var(--border);
+  box-shadow: 0 6px 22px #0005; border-radius: 5px; color: var(--fg);
+}
+.runtime-info-panel p[role=alert] { color: var(--intersect); }
+.runtime-info-panel dl { margin: 0; }
+.runtime-info-panel dt { margin-top: 9px; font-weight: bold; }
+.runtime-info-panel dd { margin: 3px 0; overflow-wrap: anywhere; }
+.workspace-launcher { max-width: 1000px; margin: auto; padding: 24px; }
+.project-workspace { padding: 16px; max-width: 960px; margin: 0 auto; overflow: auto; }
+.workspace-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.workspace-header h1 { margin: 0; }
+.workspace-header button { flex-shrink: 0; }
+.workspace-root { color: var(--muted); overflow-wrap: anywhere; }
+.workspace-sections { display: grid; gap: 20px; }
+.workspace-sections h2 { margin: 0 0 12px; font-size: 16px; }
+.workspace-projects { list-style: none; margin: 0; padding: 0; }
+.workspace-projects > li { padding: 12px 0; border-top: 1px solid var(--border); }
+.workspace-profile-path { display: block; margin-top: 4px; color: var(--muted); overflow-wrap: anywhere; }
+.workspace-project-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.workspace-open-viewer {
+  display: inline-block;
+  width: 110px;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent-bg);
+  color: var(--fg);
+  font: inherit;
+  text-align: center;
+  text-decoration: none;
+}
+.workspace-open-viewer:hover { border-color: var(--muted); }
+.workspace-output { margin-top: 10px; }
+.workspace-output summary, .workspace-tools summary { cursor: pointer; }
+.workspace-output pre, .workspace-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+.workspace-error { color: var(--subtract); }
+.workspace-trust { margin: 0; color: var(--muted); }
+.workspace-tools > .workspace-sections { margin-top: 16px; }
+.solid-check { position: absolute; right: 12px; top: 12px; z-index: 30; }
+.solid-check > summary { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+.solid-check .measure-panel { position: static; width: 320px; max-height: 65vh; overflow: auto; margin-top: 5px; }
+
+.workflow-tools { position: relative; font-size: 12px; }
+.workflow-tools > summary { cursor: pointer; padding: 5px 8px; }
+.workflow-tools-panel {
+  position: absolute; top: 100%; right: 0; z-index: 90;
+  width: min(420px, 90vw); max-height: 80vh; overflow: auto;
+  padding: 12px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 5px; color: var(--fg);
+}
+.workflow-tools-panel fieldset { margin: 0 0 10px; border: 1px solid var(--border); }
+.workflow-tools-panel label { display: block; margin: 8px 0; }
+.workflow-tools-panel select, .workflow-tools-panel input:not([type=checkbox]) { max-width: 100%; }
+.workflow-tools-panel button { margin: 3px; }
+.workflow-message { min-height: 2.5em; overflow-wrap: anywhere; color: var(--muted); }
+.workflow-report {
+  position: absolute; left: 12px; top: 12px; z-index: 28;
+  width: min(520px, calc(100% - 24px)); max-height: calc(100% - 24px);
+  overflow: auto; padding: 12px; background: var(--panel); border: 1px solid var(--border);
+}
+.workflow-report pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.baseline-review {
+  position: absolute; inset: 48px 16px 16px; z-index: 35; overflow: auto;
+  padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 5px;
+}
+.baseline-review .readout-head { display: flex; justify-content: space-between; gap: 12px; }
+.baseline-review figcaption { overflow-wrap: anywhere; font-size: 11px; }
+.export-menu { max-height: calc(100vh - 80px); overflow-y: auto; }

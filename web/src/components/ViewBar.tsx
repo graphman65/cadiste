@@ -7,12 +7,16 @@ import { Icon, type IconName } from "./Icon";
 interface Props {
   target: Target;
   project: Project | null;
+  /** Display-only namespace; the target and catalog keep their complete identities. */
+  variant: string | null;
+  /** Return to the assembly a part was opened from. */
+  navigation?: ReactNode;
   /** What the build says about it (counts, build time), on the right. */
   children?: ReactNode;
 }
 
 /** Atop the 3D view: what is open, its kind (icon and word) and name, after the folders it is in. */
-export function ViewBar({ target, project, children }: Props) {
+export function ViewBar({ target, project, variant, navigation, children }: Props) {
   let icon: IconName;
   let kind: string;
   let folders: string[];
@@ -39,8 +43,13 @@ export function ViewBar({ target, project, children }: Props) {
     folders = segments.slice(0, -1);
     name = segments[segments.length - 1];
   }
+  if (variant !== null) {
+    if (folders[0] === variant) folders = folders.slice(1);
+    if (name.startsWith(`${variant}/`)) name = name.slice(variant.length + 1);
+  }
   return (
     <div className="view-bar">
+      {navigation}
       <Icon name={icon} className={`view-bar-icon kind-${icon}`} />
       <span className="view-bar-kind">{kind}</span>
       <span className="view-bar-path" title={[...folders, name].join(" / ")}>

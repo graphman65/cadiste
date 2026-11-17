@@ -18,6 +18,33 @@ function invalidSetpoint(value: string, command: SimulationCommand): string | nu
 
 type Outcome = { error?: string; result: SimulationCommandResult };
 
+type RuntimeStatus = {
+  status: "not_started" | "launched" | "stopped" | "failed" | "exited";
+  owned: boolean;
+  pid: number | null;
+  exit_code: number | null;
+  active: { bundle_id: string; config_id: string; source_fingerprint: string; directory: string } | null;
+  current: { config_id: string | null; source_fingerprint: string } | null;
+  mismatch: { source: boolean; config: boolean | null } | null;
+  prerequisites: { ros2: string | null; status: string; detail: string };
+  logs: { path: string | null; text: string; truncated: boolean };
+  error: string | null;
+  inspection_error: string | null;
+};
+
+async function runtimeRequest(target: SimulationTarget, signal?: AbortSignal, action?: "start" | "stop" | "relaunch"): Promise<RuntimeStatus> {
+  const response = await fetch(action === undefined
+    ? `/api/simulation/runtime?${new URLSearchParams({ ...target })}`
+    : "/api/simulation/runtime", action === undefined ? { signal } : {
+    method: "POST", signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, action, gui: true }),
+  });
+  const body = await response.json() as RuntimeStatus & { error?: string };
+  if (!response.ok && body.status !== "failed") throw new Error(body.error ?? `Runtime request failed (${response.status})`);
+  return body;
+}
+
 /** Explicit commands and separately labelled, measured ROS feedback. Closing the panel stops neither. */
 export function SimulationControls({ target, live, onEnableLive, onDisableLive }: {
   target: SimulationTarget;
@@ -35,6 +62,9 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [pending, setPending] = useState(0);
   const [stopPending, setStopPending] = useState(false);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [runtimePending, setRuntimePending] = useState(false);
   const generation = useRef(0);
   const mounted = useRef(true);
   const pendingCount = useRef(0);
@@ -81,6 +111,43 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
     };
   }, [revision, target.name]);
 
+  useEffect(() => {
+    setRuntime(null);
+    setRuntimeError(null);
+    if (!open) return;
+    const controller = new AbortController();
+    let active = true;
+    let fetching = false;
+    const refresh = async () => {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const status = await runtimeRequest({ kind: "assembly", name: target.name }, controller.signal);
+        if (active) { setRuntime(status); setRuntimeError(null); }
+      } catch (error: unknown) {
+        if (active && !controller.signal.aborted) setRuntimeError(error instanceof Error ? error.message : String(error));
+      } finally { fetching = false; }
+    };
+    void refresh();
+    const timer = setInterval(() => { void refresh(); }, 5000);
+    return () => { active = false; controller.abort(); clearInterval(timer); };
+  }, [open, revision, target.name]);
+
+  const runtimeAction = async (action: "start" | "stop" | "relaunch") => {
+    if (runtimePending) return;
+    const current = generation.current;
+    setRuntimePending(true);
+    setRuntimeError(null);
+    try {
+      const status = await runtimeRequest({ kind: "assembly", name: target.name }, undefined, action);
+      if (mounted.current && generation.current === current) setRuntime(status);
+    } catch (error: unknown) {
+      if (mounted.current && generation.current === current) setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (mounted.current) setRuntimePending(false);
+    }
+  };
+
   const publish = (command: { values: Record<string, number> } | { stop_all: true }) => {
     if (config === null || stopQueued.current) return;
     const stoppingAll = "stop_all" in command;
@@ -123,6 +190,7 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
 
   const availability = loading ? "loading" : loadError !== null ? "error" : "cad";
   const displayStatus = live.enabled ? live.status : availability;
+  const staleBundle = runtime?.mismatch?.source === true || runtime?.mismatch?.config === true;
 
   return (
     <div className="simulation-controls">
@@ -180,6 +248,35 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
           </div>
           <div className="simulation-controls-body">
             <div className="muted">Assembly: {target.name}</div>
+            <section className="simulation-runtime" aria-label="Simulation runtime lifecycle">
+              <h3>Gazebo launcher</h3>
+              <p role="status">{runtimePending ? "Applying explicit runtime action…" : runtime === null ? "Loading launcher status…" : `Launcher: ${runtime.status}${runtime.pid === null ? "" : ` · PID ${runtime.pid}`}`}</p>
+              <p className="muted">A launched process is not measured live feedback. External processes and containers are never stopped here.</p>
+              {runtime !== null && <>
+                <p>{runtime.prerequisites.detail}</p>
+                <div className="simulation-controls-actions">
+                  <button disabled={runtimePending || (runtime.owned && runtime.exit_code === null) || runtime.prerequisites.ros2 === null} onClick={() => void runtimeAction("start")}>Launch Gazebo</button>
+                  <button disabled={runtimePending || !runtime.owned || runtime.exit_code !== null} onClick={() => void runtimeAction("stop")}>Stop owned launcher</button>
+                  <button disabled={runtimePending || runtime.active === null || runtime.prerequisites.ros2 === null} onClick={() => void runtimeAction("relaunch")}>Rebuild bundle and relaunch</button>
+                </div>
+                {staleBundle && <p className="simulation-controls-error" role="alert">Stale simulation bundle: CAD source or controls changed. The running bundle was not updated. Explicitly rebuild and relaunch, then reload controls.</p>}
+                {runtime.active !== null && <details>
+                  <summary>Active bundle and source identity</summary>
+                  <p>Bundle: <code>{runtime.active.bundle_id}</code><br />Directory: <code>{runtime.active.directory}</code></p>
+                  <p>Bundle config: <code>{runtime.active.config_id}</code><br />Current config: <code>{runtime.current?.config_id ?? "unavailable"}</code></p>
+                  <p>Bundle source fingerprint: <code>{runtime.active.source_fingerprint}</code><br />Current source fingerprint: <code>{runtime.current?.source_fingerprint ?? "unavailable"}</code></p>
+                  <p className="muted">Source fingerprints track conservative project changes; they are not geometry build IDs or captured source revisions.</p>
+                </details>}
+                {runtime.error !== null && <p className="simulation-controls-error" role="alert">{runtime.error}</p>}
+                {runtime.inspection_error !== null && <p className="simulation-controls-error" role="alert">Current source inspection failed: {runtime.inspection_error}</p>}
+                <details>
+                  <summary>Retained launcher logs{runtime.logs.truncated ? " (tail)" : ""}</summary>
+                  {runtime.logs.path !== null && <p><code>{runtime.logs.path}</code></p>}
+                  <pre>{runtime.logs.text || "No launcher output recorded."}</pre>
+                </details>
+              </>}
+              {runtimeError !== null && <p className="simulation-controls-error" role="alert">{runtimeError}</p>}
+            </section>
             {loading && <p role="status"><span className="spinner" /> Loading controls…</p>}
             {loadError !== null && <div className="simulation-controls-error" role="alert">{loadError}</div>}
             {live.enabled && (
@@ -217,6 +314,18 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
             {config !== null && (
               <>
                 <p className="simulation-controls-model">Model: <strong>{config.model}</strong></p>
+                <details>
+                  <summary>Declared joint topology and environment</summary>
+                  <p>Model-relative zero-pose positions are metres; rotations use xyzw quaternions. Axes are normalized in each joint frame. These are CAD declarations, not measurements.</p>
+                  <p>Robot links: {config.topology.links.map((link) => link.name).join(", ")}</p>
+                  <ul>{config.topology.joints.map((joint) => <li key={joint.name}>
+                    <strong>{joint.name}</strong>: {joint.parent} → {joint.child} · {joint.kind} · {joint.actuated ? "actuated" : "passive"}
+                    <br />Axis: {joint.axis.join(", ")} · Position limits: {joint.kind === "revolute" ? `${joint.lower} … ${joint.upper} rad` : joint.kind === "continuous" ? "continuous" : "fixed"}
+                    <br />Zero pose: {joint.pose.position.join(", ")} m; quaternion: {joint.pose.quaternion.join(", ")}
+                    <br />Output velocity: ±{joint.velocity} rad/s · effort: {joint.effort} N·m
+                  </li>)}</ul>
+                  <p>Static environment (not robot links): {config.topology.environment.map((link) => link.name).join(", ") || "none declared"}</p>
+                </details>
                 <p className="muted">Velocity setpoints below are commands, not measured state. Editing does not send a command.</p>
                 {config.commands.length === 0 && <p>No velocity commands are configured for this simulation.</p>}
                 {config.commands.map((command, index) => {
@@ -285,7 +394,7 @@ export function SimulationControls({ target, live, onEnableLive, onDisableLive }
                         <button
                           className="primary"
                           aria-label={`Send ${command.joint} setpoint`}
-                          disabled={invalid !== null || pending > 0}
+                          disabled={invalid !== null || pending > 0 || staleBundle}
                           onClick={() => {
                             if (invalidSetpoint(value, command) === null) publish({ values: { [command.joint]: Number(value) } });
                           }}

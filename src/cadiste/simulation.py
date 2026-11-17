@@ -309,8 +309,11 @@ def _validate(simulation: Simulation) -> dict[str, tuple[float, tuple[float, ...
         _number(visual.multiplier, f"driven visual {visual.name!r} multiplier")
         shape = visual.shape
         if (
-            not isinstance(shape, Shape) or not shape or shape.wrapped.IsNull()
-            or not shape.faces() or not shape.is_valid
+            not isinstance(shape, Shape)
+            or not shape
+            or shape.wrapped.IsNull()
+            or not shape.faces()
+            or not shape.is_valid
         ):
             raise ValueError(f"driven visual {visual.name!r} requires a valid nonempty shape")
     return properties
@@ -344,8 +347,13 @@ def _mesh(parent: ET.Element, shape: Shape, directory: Path, filename: str) -> N
 
 
 def _visuals(
-    link: ET.Element, shape: Shape, directory: Path, prefix: str,
-    *, pivot: Location | None = None, binding: ET.Element | None = None,
+    link: ET.Element,
+    shape: Shape,
+    directory: Path,
+    prefix: str,
+    *,
+    pivot: Location | None = None,
+    binding: ET.Element | None = None,
 ) -> None:
     index = 0
 
@@ -538,21 +546,60 @@ def _control_config(simulation: Simulation) -> dict:
         ratio = abs(transmission.ratio) if transmission else 1.0
         category = "motors" if transmission else "joints"
         topic = f"/{simulation.name}/{category}/{name}/cmd_vel"
-        commands.append({
-            "joint": name, "topic": topic,
-            "type": "std_msgs/msg/Float64", "units": "rad/s",
-            "effort_limit": joint.effort * ratio,
-            "velocity_limit": joint.velocity / ratio,
-            "example": f"ros2 topic pub --once {topic} std_msgs/msg/Float64 '{{data: 1.0}}'",
-        })
+        commands.append(
+            {
+                "joint": name,
+                "topic": topic,
+                "type": "std_msgs/msg/Float64",
+                "units": "rad/s",
+                "effort_limit": joint.effort * ratio,
+                "velocity_limit": joint.velocity / ratio,
+                "example": f"ros2 topic pub --once {topic} std_msgs/msg/Float64 '{{data: 1.0}}'",
+            }
+        )
     return {
-        "model": simulation.name, "commands": commands,
+        "model": simulation.name,
+        "commands": commands,
         "transmissions": [
-            {"name": item.name, "joint": item.joint, "ratio": item.ratio}
-            for item in simulation.transmissions
+            {"name": item.name, "joint": item.joint, "ratio": item.ratio} for item in simulation.transmissions
         ],
-        "joint_states": f"/{simulation.name}/joint_states", "tf": "/tf", "clock": "/clock",
-        "launch": "ros2 launch ./sim.launch.py", "runtime": "ROS 2 Jazzy / Gazebo Harmonic",
+        "topology": {
+            "links": [
+                {"name": link.name, "owner": "robot", "pose": _pose_data(link.pose, 0.001)} for link in simulation.links
+            ],
+            "joints": [
+                {
+                    "name": joint.name,
+                    "parent": joint.parent,
+                    "child": joint.child,
+                    "kind": joint.kind,
+                    "pose": _pose_data(joint.pose, 0.001),
+                    "axis": [float(value) / math.hypot(*joint.axis) for value in joint.axis],
+                    "axis_frame": "joint",
+                    "actuated": joint.actuated,
+                    "lower": joint.lower,
+                    "upper": joint.upper,
+                    "effort": joint.effort,
+                    "velocity": joint.velocity,
+                    "damping": joint.damping,
+                    "friction": joint.friction,
+                    "spring_stiffness": joint.spring_stiffness,
+                    "spring_reference": joint.spring_reference,
+                    "velocity_gain": joint.velocity_gain,
+                    "velocity_integral_gain": joint.velocity_integral_gain,
+                }
+                for joint in simulation.joints
+            ],
+            "environment": [
+                {"name": link.name, "owner": "environment", "static": True, "pose": _pose_data(link.pose, 0.001)}
+                for link in simulation.environment
+            ],
+        },
+        "joint_states": f"/{simulation.name}/joint_states",
+        "tf": "/tf",
+        "clock": "/clock",
+        "launch": "ros2 launch ./sim.launch.py",
+        "runtime": "ROS 2 Jazzy / Gazebo Harmonic",
         "feedback": {
             "world_frame": "cadiste",
             "model_frame": simulation.name,
@@ -563,8 +610,10 @@ def _control_config(simulation: Simulation) -> dict:
             "joints": [joint.name for joint in simulation.joints],
             "visuals": {
                 visual.name: {
-                    "parent": visual.parent, "joint": visual.joint,
-                    "multiplier": visual.multiplier, "axis": list(visual.axis),
+                    "parent": visual.parent,
+                    "joint": visual.joint,
+                    "multiplier": visual.multiplier,
+                    "axis": list(visual.axis),
                     "pose": _pose_data(links[visual.parent].pose.inverse() * visual.pose, 0.001),
                 }
                 for visual in simulation.visuals
@@ -588,16 +637,23 @@ def simulation_scene(simulation: Simulation) -> dict:
     _validate(simulation)
     robot_label = f"Robot ({simulation.name})"
     groups = [
-        Compound(label=robot_label, children=[
-            Compound(label=link.name, children=[link.shape]).moved(link.pose)
-            for link in (*simulation.links, *simulation.visuals)
-        ]),
+        Compound(
+            label=robot_label,
+            children=[
+                Compound(label=link.name, children=[link.shape]).moved(link.pose)
+                for link in (*simulation.links, *simulation.visuals)
+            ],
+        ),
     ]
     if simulation.environment:
-        groups.append(Compound(label="Environment", children=[
-            Compound(label=link.name, children=[link.shape]).moved(link.pose)
-            for link in simulation.environment
-        ]))
+        groups.append(
+            Compound(
+                label="Environment",
+                children=[
+                    Compound(label=link.name, children=[link.shape]).moved(link.pose) for link in simulation.environment
+                ],
+            )
+        )
     assembly = Compound(label=f"{simulation.name} scene", children=groups)
     scene = tessellate([SceneObject(assembly.label, assembly)])
     robot = next(node for node in scene.data["shapes"]["parts"] if node["name"] == robot_label)
@@ -626,7 +682,10 @@ def write_bundle(simulation: Simulation, output: Path) -> Path:
         _joint(model, joint, simulation.name)
     if simulation.transmissions or simulation.visuals:
         ideal = ET.SubElement(
-            model, "plugin", name="cadiste::IdealTransmission", filename="cadiste-ideal-transmission-system",
+            model,
+            "plugin",
+            name="cadiste::IdealTransmission",
+            filename="cadiste-ideal-transmission-system",
         )
         joints = {joint.name: joint for joint in simulation.joints}
         links = {link.name: link for link in simulation.links}
@@ -663,7 +722,9 @@ def write_bundle(simulation: Simulation, output: Path) -> Path:
     _text(physics, "real_time_factor", 1)
     _text(world, "gravity", "0 0 -9.81")
     for system, filename in (
-        ("Physics", "physics"), ("UserCommands", "user-commands"), ("SceneBroadcaster", "scene-broadcaster")
+        ("Physics", "physics"),
+        ("UserCommands", "user-commands"),
+        ("SceneBroadcaster", "scene-broadcaster"),
     ):
         _plugin(world, system, filename)
     light = ET.SubElement(world, "light", name="sun", type="directional")
@@ -695,25 +756,38 @@ def write_bundle(simulation: Simulation, output: Path) -> Path:
     _xml(output / "world.sdf", world_sdf)
     bridges = [
         {
-            "ros_topic_name": "/clock", "gz_topic_name": "/world/cadiste/clock",
-            "ros_type_name": "rosgraph_msgs/msg/Clock", "gz_type_name": "gz.msgs.Clock", "direction": "GZ_TO_ROS",
+            "ros_topic_name": "/clock",
+            "gz_topic_name": "/world/cadiste/clock",
+            "ros_type_name": "rosgraph_msgs/msg/Clock",
+            "gz_type_name": "gz.msgs.Clock",
+            "direction": "GZ_TO_ROS",
         },
         {
             "ros_topic_name": f"/{simulation.name}/joint_states",
             "gz_topic_name": f"/{simulation.name}/joint_states",
-            "ros_type_name": "sensor_msgs/msg/JointState", "gz_type_name": "gz.msgs.Model", "direction": "GZ_TO_ROS",
+            "ros_type_name": "sensor_msgs/msg/JointState",
+            "gz_type_name": "gz.msgs.Model",
+            "direction": "GZ_TO_ROS",
         },
         {
-            "ros_topic_name": "/tf", "gz_topic_name": f"/model/{simulation.name}/pose",
-            "ros_type_name": "tf2_msgs/msg/TFMessage", "gz_type_name": "gz.msgs.Pose_V", "direction": "GZ_TO_ROS",
+            "ros_topic_name": "/tf",
+            "gz_topic_name": f"/model/{simulation.name}/pose",
+            "ros_type_name": "tf2_msgs/msg/TFMessage",
+            "gz_type_name": "gz.msgs.Pose_V",
+            "direction": "GZ_TO_ROS",
         },
     ]
     controls = _control_config(simulation)
     for command in controls["commands"]:
-        bridges.append({
-            "ros_topic_name": command["topic"], "gz_topic_name": command["topic"],
-            "ros_type_name": command["type"], "gz_type_name": "gz.msgs.Double", "direction": "ROS_TO_GZ",
-        })
+        bridges.append(
+            {
+                "ros_topic_name": command["topic"],
+                "gz_topic_name": command["topic"],
+                "ros_type_name": command["type"],
+                "gz_type_name": "gz.msgs.Double",
+                "direction": "ROS_TO_GZ",
+            }
+        )
     (output / "bridge.yaml").write_text(json.dumps(bridges, indent=2) + "\n")
     (output / "control.json").write_text(json.dumps(controls, indent=2) + "\n")
     launch = output / "sim.launch.py"
@@ -756,5 +830,8 @@ def launch_bundle(output: Path, *, gui: bool = True) -> subprocess.Popen[bytes]:
             )
     with (output / "gazebo.log").open("ab") as log:
         return subprocess.Popen(
-            [ros2, "launch", str(launch), f"gui:={str(gui).lower()}"], stdout=log, stderr=subprocess.STDOUT
+            [ros2, "launch", str(launch), f"gui:={str(gui).lower()}"],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )

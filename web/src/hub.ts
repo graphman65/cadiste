@@ -63,7 +63,7 @@ export interface Hub {
  * The tab's link to the hub: the sessions it lists, its state pushed as it changes (and on every connection), the
  * calls of linked sessions handed to `handle` and answered with what it resolves to (or the error it throws).
  */
-export function useHub(state: TabState, handle: (request: HubRequest) => Promise<unknown>): Hub {
+export function useHub(state: TabState, handle: (request: HubRequest) => Promise<unknown>, enabled = true): Hub {
   const [tab, setTab] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const handler = useRef(handle);
@@ -73,12 +73,13 @@ export function useHub(state: TabState, handle: (request: HubRequest) => Promise
   latest.current = stateJson;
 
   useEffect(() => {
+    if (!enabled) return;
     let live = true;
     void claimTabId().then((id) => live && setTab(id));
     return () => {
       live = false;
     };
-  }, []);
+  }, [enabled]);
 
   const pushState = useCallback(
     (id: string, json: string) =>

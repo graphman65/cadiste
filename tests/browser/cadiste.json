@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "name": "Browser regression fixture",
+  "root": ".",
+  "target": "model:build",
+  "parts": "model:PARTS",
+  "args": [],
+  "assemblies": {"Fixture": "model:assembly"},
+  "simulations": {},
+  "trace_env": {},
+  "check_sets": {
+    "witness-review": {
+      "target": {"kind": "assembly", "name": "Fixture"},
+      "checks": [{
+        "pairs": [["/Browser fixture/block-a", "/Browser fixture/block-b"]],
+        "clearance": 20,
+        "samples": [
+          {"name": "shift-two", "poses": [{"path": "/Browser fixture/block-a", "translation": [2, 0, 0], "rotation": [0, 0, 0]}]},
+          {"name": "turn-and-shift-five", "poses": [{"path": "/Browser fixture/block-a", "translation": [5, 0, 0], "rotation": [0, 0, 90]}]}
+        ]
+      }]
+    }
+  }
+}

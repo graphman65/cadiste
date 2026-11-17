@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import textwrap
 
 import pytest
@@ -160,7 +161,11 @@ def test_related_siblings_use_shared_code_not_parameter_spelling(index: SourceIn
         for entry in result[key]
     )
     shared = next(entry for entry in result["shared_parameters"] if entry["reference"] == lid)
-    assert code_ref("fixture/params.py", "Params.module_w") in shared["shared"]
+    evidence = index.related(code_ref("fixture/module.py", "SteeringModule"), section="evidence", limit=100)
+    assert any(
+        entry.get("shared") == code_ref("fixture/params.py", "Params.module_w") and entry["reference"] == lid
+        for entry in evidence["evidence"]
+    )
     assert shared["evidence"]
 
 
@@ -246,7 +251,7 @@ def test_property_cycles_and_dynamic_values_are_explicit():
     )
     result = index.follow_parameter(code_ref("model.py", "build"), "p.a")
     assert result["cycles"]
-    cycle = result["cycles"][0]
+    cycle = result["cycles"][0]["path"]
     assert set(cycle) == {code_ref("model.py", "Params.a"), code_ref("model.py", "Params.b")}
     dynamic = index.follow_parameter(code_ref("model.py", "build"), "dynamic")
     assert dynamic["unresolved"]
@@ -441,3 +446,151 @@ def test_control_flow_binders_do_not_leak_outer_same_named_parameters():
     )
     assert index.resolve("model.py", "build", "p.width") == []
     assert index.resolve("model.py", "context", "p.width") == []
+
+
+def _all_pages(query, section: str):
+    records = []
+    offset = 0
+    while True:
+        result = query(section=section, limit=100, offset=offset)
+        page = result["pages"][section]
+        assert page["returned"] == len(result[section])
+        assert page["omitted"] == page["total"] - page["returned"]
+        records.extend(result[section])
+        if page["next_offset"] is None:
+            assert len(records) == page["total"]
+            return records
+        assert page["next_offset"] > offset
+        offset = page["next_offset"]
+
+
+def test_large_parameter_fanout_is_bounded_and_complete_evidence_is_pageable():
+    source = "BASE = 3\ndef consume(value):\n    return value\ndef build():\n"
+    source += "".join("    consume(BASE)\n" for _ in range(2332))
+    index = SourceIndex({"fanout.py": source})
+    owner = code_ref("fanout.py", "build")
+    consumer = code_ref("fanout.py", "consume")
+    def query(**kwargs):
+        return index.follow_parameter(owner, "BASE", **kwargs)
+    result = query()
+    assert result["origins"][0]["expression"] == "3"
+    assert "source" not in result["origins"][0]
+    assert len(json.dumps(result)) < 40000
+    assert result["pages"]["consumers"] == {
+        "total": 4664,
+        "offset": 0,
+        "limit": 20,
+        "returned": 20,
+        "omitted": 4644,
+        "next_offset": 20,
+    }
+    def filtered(**kwargs):
+        return query(consumers=[consumer], **kwargs)
+    consumers = _all_pages(filtered, "consumers")
+    assert len(consumers) == 2332
+    assert {entry["reference"] for entry in consumers} == {consumer}
+    assert len({entry["line"] for entry in consumers}) == 2332
+    assert query(consumers=[])["pages"]["consumers"]["total"] == 0
+    evidence = _all_pages(filtered, "evidence")
+    calls = [entry for entry in evidence if entry["section"] == "consumers"]
+    assert len(calls) == 2332
+    assert all(entry["call"]["arguments"][0]["expression"] == "BASE" for entry in calls)
+    assert all(entry["source_revision"] == index.revision for entry in [result])
+
+
+def test_derived_parameter_uses_direct_consumers_not_every_base_dimension_use():
+    index = SourceIndex(
+        {
+            "model.py": "BASE = 3\nDERIVED = BASE * 2\ndef build():\n    return DERIVED\n"
+            + "".join(f"def sibling_{i}():\n    return BASE\n" for i in range(100))
+        }
+    )
+    result = index.follow_parameter(code_ref("model.py", "build"), "DERIVED")
+    assert _references(result["dependencies"]) == {code_ref("model.py", "BASE")}
+    assert _references(result["consumers"]) == {code_ref("model.py", "build")}
+    assert result["pages"]["consumers"]["total"] == 1
+
+
+def test_related_large_sibling_fanout_is_bounded_filtered_and_pageable(monkeypatch):
+    source = "BASE = 3\ndef chosen():\n    return BASE\n"
+    source += "".join(f"def sibling_{i:04d}():\n    return BASE\n" for i in range(1922))
+    index = SourceIndex({"fanout.py": source})
+    owner = code_ref("fanout.py", "chosen")
+    original = index._closure
+    closure_calls = []
+
+    def capture(references):
+        closure_calls.append(references)
+        return original(references)
+
+    monkeypatch.setattr(index, "_closure", capture)
+    result = index.related(owner)
+    assert len(closure_calls) == 1
+    assert result["pages"]["shared_parameters"]["total"] == 1922
+    assert result["pages"]["shared_parameters"]["omitted"] == 1902
+    assert len(json.dumps(result)) < 40000
+    selected = code_ref("fanout.py", "sibling_1921")
+    filtered = index.related(owner, consumers=selected)
+    assert _references(filtered["shared_parameters"]) == {selected}
+    assert filtered["pages"]["shared_parameters"]["total"] == 1
+    all_matches = _all_pages(lambda **kwargs: index.related(owner, **kwargs), "shared_parameters")
+    assert len(all_matches) == len(_references(all_matches)) == 1922
+    evidence = _all_pages(lambda **kwargs: index.related(owner, consumers=[selected], **kwargs), "evidence")
+    shared = [entry for entry in evidence if entry["section"] == "shared_parameters"]
+    assert len(shared) == 1 and shared[0]["shared"] == code_ref("fanout.py", "BASE")
+
+
+def test_unresolved_boundaries_and_long_evidence_are_not_silently_lost():
+    expression = " + ".join("external()" for _ in range(40))
+    index = SourceIndex({"model.py": f"WIDTH = {expression}\ndef build():\n    return WIDTH\n"})
+    owner = code_ref("model.py", "build")
+    result = index.follow_parameter(owner, "WIDTH", limit=2)
+    assert result["origins"][0]["expression_omitted_characters"] > 0
+    assert result["pages"]["unresolved"]["total"] == 40
+    assert result["pages"]["unresolved"]["omitted"] == 38
+    boundaries = _all_pages(lambda **kwargs: index.follow_parameter(owner, "WIDTH", **kwargs), "unresolved")
+    assert len(boundaries) == 40
+    evidence = _all_pages(lambda **kwargs: index.follow_parameter(owner, "WIDTH", **kwargs), "evidence")
+    declaration = next(entry["declaration"] for entry in evidence if "declaration" in entry)
+    assert declaration["expression"] == expression
+    assert sum(entry["section"] == "unresolved" for entry in evidence) == 40
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": True},
+        {"offset": -1},
+        {"offset": 1.5},
+        {"consumers": [3]},
+        {"section": "everything"},
+    ],
+)
+def test_bounded_queries_reject_invalid_options(options):
+    index = SourceIndex({"model.py": "def build(width=3):\n    return width\n"})
+    reference = code_ref("model.py", "build")
+    with pytest.raises(ValueError):
+        index.follow_parameter(reference, "width", **options)
+    with pytest.raises(ValueError):
+        index.related(reference, **options)
+
+
+def test_selected_consumer_and_caller_pages_do_not_expand_dependency_subgraphs(monkeypatch):
+    index = SourceIndex(
+        {
+            "model.py": "BASE = 3\nDERIVED = BASE * 2\ndef helper():\n    return DERIVED\n"
+            "def build():\n    return helper()\n"
+        }
+    )
+
+    def forbidden(_references):
+        raise AssertionError("this section does not need a transitive dependency closure")
+
+    monkeypatch.setattr(index, "_closure", forbidden)
+    helper = code_ref("model.py", "helper")
+    consumers = index.follow_parameter(helper, "DERIVED", section="consumers")
+    assert consumers["pages"]["consumers"]["total"] == 1
+    callers = index.related(helper, section="callers")
+    assert _references(callers["callers"]) == {code_ref("model.py", "build")}

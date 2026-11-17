@@ -15,8 +15,10 @@ interface Props {
   onVisibility: (leaves: string[], visible: boolean) => void;
   onSelect: (id: string, mode?: SelectionMode, range?: string[]) => void;
   onHover: (id: string | null) => void;
-  /** Rows named like a part (a file's parts are) can open it: a button, or a double-click. */
+  /** Evidence-backed owning parts can be opened by button or double-click. */
   openable: ReadonlySet<string>;
+  /** Evidence-backed ownership; labels alone must never open an unrelated part. */
+  partOf?: Readonly<Record<string, string>>;
   onOpen: (part: string) => void;
 }
 
@@ -28,7 +30,7 @@ function ancestorIds(id: string): string[] {
 
 /** The assembly as built: groups and part instances, with visibility and selection driving the 3D view. */
 export function AssemblyTree(props: Props) {
-  const { root, hidden, selected, selectedPaths, onVisibility, onSelect, onHover, openable, onOpen } = props;
+  const { root, hidden, selected, selectedPaths, onVisibility, onSelect, onHover, openable, onOpen, partOf } = props;
   const { solo, onSolo } = props;
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set([root.id]));
   const [filter, setFilter] = useState("");
@@ -120,6 +122,7 @@ export function AssemblyTree(props: Props) {
           const shownCount = under.filter((id) => !hidden.has(id)).length;
           const visible = shownCount > 0;
           const open = matching !== null || expanded.has(node.id);
+          const owner = partOf?.[node.id];
           const soloed = solo === node.id;
           return (
             <div
@@ -132,7 +135,7 @@ export function AssemblyTree(props: Props) {
               style={{ paddingLeft: 8 + depth * 16 }}
               onMouseEnter={() => onHover(node.id)}
               onClick={(event) => { list.current?.focus(); choose(node.id, event); }}
-              onDoubleClick={() => (group ? toggle(node.id) : openable.has(node.name) && onOpen(node.name))}
+              onDoubleClick={() => (group ? toggle(node.id) : owner !== undefined && openable.has(owner) && onOpen(owner))}
             >
               <span
                 className={group ? `caret ${open ? "open" : ""}` : "caret none"}
@@ -167,13 +170,14 @@ export function AssemblyTree(props: Props) {
               </button>
               <span className={visible ? "title" : "title muted"}>{node.name}</span>
               {group && <span className="count">{under.length}</span>}
-              {!group && openable.has(node.name) && (
+              {!group && <span className="count" title={owner ? `Owning part: ${owner}` : "No unique ownership evidence"}>{owner ?? "unmatched"}</span>}
+              {!group && owner !== undefined && openable.has(owner) && (
                 <button
                   className="open-part"
-                  title={`Open ${node.name}: its features, sketches and source`}
+                  title={`Open ${owner}: its features, sketches and source`}
                   onClick={(event) => {
                     event.stopPropagation();
-                    onOpen(node.name);
+                    onOpen(owner);
                   }}
                 >
                   Open

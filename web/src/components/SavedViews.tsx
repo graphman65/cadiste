@@ -27,7 +27,7 @@ export interface SavedViewState {
   measuring: boolean;
 }
 
-interface SavedView {
+export interface SavedView {
   id: string;
   name: string;
   state: SavedViewState;
@@ -37,7 +37,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const tuple = (value: unknown, size: number) => Array.isArray(value) && value.length === size && value.every(finite);
 
-function validState(value: unknown): value is SavedViewState {
+export function validState(value: unknown): value is SavedViewState {
   if (!record(value)) return false;
   const { target, scene, camera, settings, states, section, explode, measuring } = value;
   if (!record(target) || !(
@@ -62,7 +62,7 @@ function validState(value: unknown): value is SavedViewState {
   return (explode === null || (finite(explode) && explode >= 0 && explode <= 1)) && typeof measuring === "boolean";
 }
 
-function readViews(scope: string): SavedView[] {
+export function readViews(scope: string): SavedView[] {
   const views: SavedView[] = [];
   const legacyKeys: string[] = [];
   try {
@@ -116,13 +116,44 @@ function readViews(scope: string): SavedView[] {
   return views;
 }
 
+export function writeViews(scope: string, views: SavedView[]): void {
+  window.localStorage.setItem(`cadiste.saved-views.v2:${scope}`, JSON.stringify({ version: 2, views }));
+  window.dispatchEvent(new CustomEvent("cadiste-saved-views", { detail: scope }));
+}
+
+/** MCP and the menu share the same persisted records and validation. */
+export function editSavedViews(scope: string, params: { action: string; id?: string; name?: string; state?: SavedViewState },
+  capture: () => SavedViewState | null): { views: SavedView[]; restored?: SavedViewState } {
+  const views = readViews(scope);
+  if (params.action === "list") return { views };
+  const found = views.find((view) => view.id === params.id);
+  if (params.action !== "create" && found === undefined) throw new Error("Saved view id was not found");
+  if (params.action === "restore") return { views, restored: found!.state };
+  if (params.action === "delete") {
+    const next = views.filter((view) => view.id !== params.id);
+    writeViews(scope, next);
+    return { views: next };
+  }
+  if (params.action !== "create" && params.action !== "update") throw new Error("Unknown saved view action");
+  const name = (params.name ?? found?.name ?? "").trim();
+  if (!name) throw new Error("A saved view needs a name");
+  if (views.some((view) => view.id !== found?.id && view.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+    throw new Error("A saved view with that name already exists");
+  }
+  const state = params.state ?? (params.action === "create" ? capture() : found?.state);
+  if (!validState(state)) throw new Error("Saved view state is invalid or the renderer is not ready");
+  const saved = { id: found?.id ?? crypto.getRandomValues(new Uint32Array(4)).join("-"), name, state };
+  const next = found === undefined ? [...views, saved] : views.map((view) => view.id === saved.id ? saved : view);
+  writeViews(scope, next);
+  return { views: next };
+}
+
 /** Remounted by project: the same list is available from every part, assembly and folder. */
 export function SavedViews({ scope, capture, restore }: {
   scope: string;
   capture: () => SavedViewState | null;
   restore: (state: SavedViewState) => void;
 }) {
-  const storageKey = `cadiste.saved-views.v2:${scope}`;
   const [views, setViews] = useState(() => readViews(scope));
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -131,6 +162,16 @@ export function SavedViews({ scope, capture, restore }: {
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const input = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const reload = () => setViews(readViews(scope));
+    window.addEventListener("cadiste-saved-views", reload);
+    window.addEventListener("storage", reload);
+    return () => {
+      window.removeEventListener("cadiste-saved-views", reload);
+      window.removeEventListener("storage", reload);
+    };
+  }, [scope]);
 
   useEffect(() => {
     if (!open) return;
@@ -155,7 +196,7 @@ export function SavedViews({ scope, capture, restore }: {
 
   const persist = (next: SavedView[]) => {
     try {
-      window.localStorage.setItem(storageKey, JSON.stringify({ version: 2, views: next }));
+      writeViews(scope, next);
       setViews(next);
       setError(null);
       return true;

@@ -8,6 +8,7 @@ from a matching attribute name, nor import a model to discover a dynamic value.
 from __future__ import annotations
 
 import ast
+import itertools
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -767,14 +768,8 @@ class SourceIndex:
         unresolved: list[dict[str, Any]] = []
         completed: set[str] = set()
 
-        def expand(reference: str, trail: list[str]) -> None:
-            if reference in trail:
-                cycle = [*trail[trail.index(reference) :], reference]
-                if cycle not in cycles:
-                    cycles.append(cycle)
-                return
-            if reference in completed or reference not in self._symbols:
-                return
+        def expand(reference: str) -> list[str]:
+            targets: list[str] = []
             symbol = self._symbols[reference]
             if symbol.variants and any(s.conditional for s in [symbol, *symbol.variants]):
                 unresolved.append(
@@ -828,15 +823,143 @@ class SourceIndex:
                 for target in use["targets"]:
                     if target not in self._symbols:
                         continue
-                    dependencies.setdefault(target, {**self.definition(target), "evidence": []})["evidence"].append(use)
-                    expand(target, [*trail, reference])
-            completed.add(reference)
+                    dependencies.setdefault(target, {"reference": target, "evidence": []})["evidence"].append(use)
+                    targets.append(target)
+            return targets
 
-        for reference in sorted(references):
-            expand(reference, [])
+        # Explicit DFS preserves cycle boundaries without recursion limits or path copying.
+        for root in sorted(references):
+            if root in completed or root not in self._symbols:
+                continue
+            trail = [root]
+            active = {root: 0}
+            stack = [iter(expand(root))]
+            while stack:
+                target = next(stack[-1], None)
+                if target is None:
+                    stack.pop()
+                    finished = trail.pop()
+                    active.pop(finished)
+                    completed.add(finished)
+                elif target in active:
+                    cycle = [*trail[active[target] :], target]
+                    if cycle not in cycles:
+                        cycles.append(cycle)
+                elif target not in completed:
+                    active[target] = len(trail)
+                    trail.append(target)
+                    stack.append(iter(expand(target)))
         return list(dependencies.values()), cycles, unresolved
 
-    def follow_parameter(self, reference: str, expression: str) -> dict[str, Any]:
+    @staticmethod
+    def query_options(limit: int, offset: int, consumers: str | list[str] | None) -> set[str] | None:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if consumers is None:
+            return None
+        values = [consumers] if isinstance(consumers, str) else consumers
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("consumers must be a source reference or a list of source references")
+        return set(values)
+
+    @staticmethod
+    def _compact(record: dict[str, Any]) -> dict[str, Any]:
+        """One evidence example, no source bodies; all elisions are individually counted."""
+        result: dict[str, Any] = {}
+        for key, value in record.items():
+            if (key == "source" and "qualified" in record) or key in {
+                "calls",
+                "parameters",
+                "initializers",
+                "bindings",
+                "consumer_calls",
+            }:
+                if value:
+                    result[key + "_total"] = len(value)
+                    result[key + "_omitted"] = len(value)
+            elif isinstance(value, list):
+                count = 20 if key == "path" else 1
+                result[key] = [SourceIndex._compact(item) if isinstance(item, dict) else item for item in value[:count]]
+                if len(value) > count:
+                    result[key + "_total"] = len(value)
+                    result[key + "_omitted"] = len(value) - count
+            elif isinstance(value, str) and len(value) > 240:
+                result[key] = value[:240]
+                result[key + "_characters"] = len(value)
+                result[key + "_omitted_characters"] = len(value) - 240
+            else:
+                result[key] = value
+        return result
+
+    @staticmethod
+    def page(records, *, limit: int, offset: int, render=None) -> tuple[list[Any], dict[str, Any]]:
+        """Count a stable stream without constructing records outside the requested page."""
+        selected = []
+        total = 0
+        for record in records:
+            if offset <= total < offset + limit:
+                selected.append(render(record) if render else record)
+            total += 1
+        returned = len(selected)
+        return selected, {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "returned": returned,
+            "omitted": total - returned,
+            "next_offset": offset + returned if offset + returned < total else None,
+        }
+
+    def _answer_sections(self, sections, section: str, limit: int, offset: int) -> dict[str, Any]:
+        if section != "summary" and section not in sections:
+            raise ValueError("section must be summary or one of: " + ", ".join(sections))
+        answer: dict[str, Any] = {"section": section, "pages": {}, "available_sections": list(sections)}
+        for name, records in sections.items():
+            # Evidence expansion is opt-in; defaults never serialize entire declarations or call subgraphs.
+            if section != name and (section != "summary" or name == "evidence"):
+                continue
+            values, page = self.page(
+                records(), limit=limit, offset=offset, render=None if name == "evidence" else self._compact
+            )
+            answer[name] = values
+            answer["pages"][name] = page
+        return answer
+
+    def _consumer_records(self, roots: set[str], consumers: set[str] | None):
+        # Direct consumers only: following a derived dimension must not fan out to every use of its bases.
+        for use in self._usages():
+            common = roots.intersection(use["targets"])
+            if not common:
+                continue
+            if consumers is None or use["owner"] in consumers:
+                yield {**use, "reference": use["owner"], "dependencies": sorted(common)}
+            for call in use.get("consumer_calls", []):
+                for target in call["targets"]:
+                    if consumers is None or target in consumers:
+                        yield {
+                            "reference": target,
+                            "file": call["file"],
+                            "line": call["line"],
+                            "expression": use["expression"],
+                            "argument": call["argument"],
+                            "dependencies": sorted(common),
+                            "evidence": [call],
+                            "value_semantics": "static call argument, not an observed runtime value",
+                        }
+
+    def follow_parameter(
+        self,
+        reference: str,
+        expression: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        consumers: str | list[str] | None = None,
+        section: str = "summary",
+    ) -> dict[str, Any]:
+        consumer_filter = self.query_options(limit, offset, consumers)
         file, scope = self._owner(reference)
         try:
             node = ast.parse(expression, mode="eval").body
@@ -850,7 +973,11 @@ class SourceIndex:
         symbol = self._symbols[reference]
         if expression.strip() in {symbol.qualified, symbol.qualified.rsplit(".", 1)[-1]}:
             roots = {reference}
-        dependencies, cycles, unresolved = self._closure(roots)
+        dependencies, cycles, unresolved = (
+            self._closure(roots)
+            if section in {"summary", "dependencies", "cycles", "unresolved", "evidence"}
+            else ([], [], [])
+        )
         unresolved.extend(
             {**use, "reason": "multiple statically possible base bindings"}
             for use in uses
@@ -867,99 +994,270 @@ class SourceIndex:
             )
         elif len(refs) > 1:
             unresolved.append(
-                {"expression": expression, "targets": sorted(refs), "reason": "multiple statically possible bindings"}
+                {
+                    "expression": expression,
+                    "targets": sorted(refs),
+                    "reason": "multiple statically possible bindings",
+                }
             )
-        reachable = roots | {entry["reference"] for entry in dependencies}
-        consumers = [
-            {**use, "reference": use["owner"], "dependencies": sorted(reachable.intersection(use["targets"]))}
-            for use in self._usages()
-            if reachable.intersection(use["targets"])
-        ]
-        for use in list(consumers):
-            for call in use.get("consumer_calls", []):
-                consumers.extend(
-                    {
-                        "reference": target,
-                        "file": call["file"],
-                        "line": call["line"],
-                        "expression": use["expression"],
-                        "argument": call["argument"],
-                        "dependencies": use["dependencies"],
-                        "evidence": [call],
-                        "value_semantics": "static call argument, not an observed runtime value",
+
+        def origins():
+            for ref in sorted(roots):
+                if ref in self._symbols:
+                    yield {
+                        **self.definitions[ref],
+                        "evidence": [{"file": file, "owner": scope, "expression": expression}],
                     }
-                    for target in call["targets"]
-                )
+
+        def dependency_records():
+            for entry in dependencies:
+                yield {**self.definitions[entry["reference"]], "evidence": entry["evidence"]}
+
+        def declarations(ref: str, name: str):
+            yield {
+                "section": name,
+                "reference": ref,
+                "declaration": {
+                    key: value
+                    for key, value in self.definitions[ref].items()
+                    if key not in {"source", "calls", "parameters", "initializers", "bindings"}
+                },
+            }
+            for initializer in self.definitions[ref].get("initializers", []):
+                yield {"section": name, "reference": ref, "initializer": initializer}
+            for binding in self.definitions[ref].get("bindings", []):
+                yield {"section": name, "reference": ref, "binding": binding}
+
+        def evidence():
+            for origin in origins():
+                yield from declarations(origin["reference"], "origins")
+                yield {
+                    "section": "origins",
+                    "reference": origin["reference"],
+                    **origin["evidence"][0],
+                }
+            for entry in dependencies:
+                yield from declarations(entry["reference"], "dependencies")
+                for use in entry["evidence"]:
+                    yield {"section": "dependencies", "reference": entry["reference"], **use}
+            for use in self._consumer_records(roots, consumer_filter):
+                calls = use.get("evidence") or use.get("consumer_calls") or [None]
+                for call in calls:
+                    yield {
+                        "section": "consumers",
+                        **{key: value for key, value in use.items() if key not in {"evidence", "consumer_calls"}},
+                        **({"call": call} if call else {}),
+                    }
+            for boundary in unresolved:
+                yield {"section": "unresolved", **boundary}
+            for index, cycle in enumerate(cycles):
+                for start, end in itertools.pairwise(cycle):
+                    yield {"section": "cycles", "cycle": index, "from": start, "to": end}
+
+        sections = {
+            "origins": origins,
+            "dependencies": dependency_records,
+            "consumers": lambda: self._consumer_records(roots, consumer_filter),
+            "cycles": lambda: ({"path": cycle} for cycle in cycles),
+            "unresolved": lambda: iter(unresolved),
+            "evidence": evidence,
+        }
+        answer = self._answer_sections(sections, section, limit, offset)
         return {
             "reference": reference,
             "expression": expression,
             "source_revision": self.revision,
-            "origins": [
-                {**self.definition(ref), "evidence": [{"file": file, "owner": scope, "expression": expression}]}
-                for ref in sorted(roots)
-                if ref in self._symbols
-            ],
-            "dependencies": dependencies,
-            "consumers": consumers,
-            "cycles": cycles,
-            "unresolved": unresolved,
+            "consumer_scope": "direct uses of the queried origins, not all uses of transitive base dimensions",
+            "consumers_filter": sorted(consumer_filter) if consumer_filter is not None else None,
             "value_semantics": "Declared defaults and expressions are captured code, not runtime overrides.",
+            **answer,
         }
 
-    def related(self, reference: str) -> dict[str, Any]:
+    def dimension_drivers(
+        self,
+        reference: str,
+        expression: str,
+        *,
+        observed: dict[tuple[str, str], dict[str, Any]] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Resolve bounded arithmetic evidence using this index, never a competing source graph."""
+        from .dimensions import DimensionAnalysis
+
+        return DimensionAnalysis(self, observed).analyze(reference, expression, limit)
+
+    def _related_records(self, reference: str, consumers: set[str] | None):
         self.definition(reference)
-        prefix = self._symbols[reference].qualified + "."
-        file = self._symbols[reference].file
+        symbol = self._symbols[reference]
+        prefix = symbol.qualified + "."
         own = {
             ref
-            for ref, symbol in self._symbols.items()
-            if ref == reference or (symbol.file == file and symbol.qualified.startswith(prefix))
+            for ref, candidate in self._symbols.items()
+            if ref == reference or (candidate.file == symbol.file and candidate.qualified.startswith(prefix))
         }
-        calls = [self._call(f, owner, node) for f, owner, node in self._calls]
-        callers = [
-            {"reference": call["owner"], "evidence": [call]}
-            for call in calls
-            if own.intersection(call["targets"]) and call["owner"] not in own
-        ]
-        callees = [
-            {"reference": target, "evidence": [call]}
-            for call in calls
-            if call["owner"] in own
-            for target in call["targets"]
-            if target not in own
-        ]
-        uses = self._usages()
-        own_uses = [use for use in uses if use["owner"] in own]
-        dependencies = {target for use in own_uses for target in use["targets"] if target not in own}
-        expanded, _, _ = self._closure(dependencies)
-        dependencies.update(entry["reference"] for entry in expanded)
-        own_calls = {entry["reference"] for entry in callees}
-        shared_helpers: list[dict[str, Any]] = []
-        shared_parameters: list[dict[str, Any]] = []
-        for other, symbol in self._symbols.items():
-            if other in own or symbol.kind not in {"function", "method", "property"}:
-                continue
-            other_uses = [use for use in uses if use["owner"] == other]
-            other_dependencies = {target for use in other_uses for target in use["targets"]}
-            expanded, _, _ = self._closure(other_dependencies)
-            other_dependencies.update(entry["reference"] for entry in expanded)
-            common = dependencies & other_dependencies
-            helpers = common & own_calls
-            parameters = {
-                ref
-                for ref in common
-                if ref in self._symbols and self._symbols[ref].kind in {"field", "property", "parameter", "assignment"}
-            }
-            if helpers:
-                shared_helpers.append({"reference": other, "shared": sorted(helpers), "evidence": other_uses})
-            if parameters:
-                shared_parameters.append({"reference": other, "shared": sorted(parameters), "evidence": other_uses})
+
+        def callers():
+            for file, owner, node in self._calls:
+                if owner in own or (consumers is not None and owner not in consumers):
+                    continue
+                call = self._call(file, owner, node)
+                if own.intersection(call["targets"]):
+                    yield {"reference": owner, "evidence": [call]}
+
+        def callees():
+            for file, owner, node in self._calls:
+                if owner not in own:
+                    continue
+                call = self._call(file, owner, node)
+                for target in call["targets"]:
+                    if target not in own and (consumers is None or target in consumers):
+                        yield {"reference": target, "evidence": [call]}
+
+        captured_dependencies = None
+        shared_graph = None
+
+        def dependency_context():
+            nonlocal captured_dependencies
+            if captured_dependencies is None:
+                direct = {
+                    target
+                    for use in self._usages()
+                    if use["owner"] in own
+                    for target in use["targets"]
+                    if target not in own
+                }
+                expanded, cycles, boundaries = self._closure(direct)
+                boundaries.extend({"reason": "dependency cycle", "path": cycle} for cycle in cycles)
+                captured_dependencies = direct | {entry["reference"] for entry in expanded}, boundaries
+            return captured_dependencies
+
+        def shared_context():
+            nonlocal shared_graph
+            if shared_graph is None:
+                own_calls = {
+                    target
+                    for file, owner, node in self._calls
+                    if owner in own
+                    for target in self._call(file, owner, node)["targets"]
+                    if target not in own
+                }
+                # Reverse only the compact syntax graph, not a closure/definition graph per sibling.
+                reverse: dict[str, set[str]] = defaultdict(set)
+                for ref in self._symbols:
+                    for use in self._dependencies(ref):
+                        for target in use["targets"]:
+                            reverse[target].add(ref)
+                usage_owners: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                for use in self._usages():
+                    owner = use["owner"]
+                    if owner in own or (consumers is not None and owner not in consumers):
+                        continue
+                    if owner in self._symbols and self._symbols[owner].kind in {"function", "method", "property"}:
+                        for target in use["targets"]:
+                            usage_owners[target].append(use)
+                shared_graph = own_calls, reverse, usage_owners
+            return shared_graph
+
+        def shared(kinds: set[str] | None):
+            dependencies, _ = dependency_context()
+            if not dependencies:
+                return
+            own_calls, reverse, usage_owners = shared_context()
+            matches: dict[str, dict[str, Any]] = {}
+            for dependency in sorted(dependencies):
+                if kinds is None:
+                    if dependency not in own_calls:
+                        continue
+                elif dependency not in self._symbols or self._symbols[dependency].kind not in kinds:
+                    continue
+                pending = [dependency]
+                seen: set[str] = set()
+                while pending:
+                    target = pending.pop()
+                    if target in seen:
+                        continue
+                    seen.add(target)
+                    for use in usage_owners.get(target, []):
+                        entry = matches.setdefault(use["owner"], {"shared": set(), "evidence": {}})
+                        entry["shared"].add(dependency)
+                        entry["evidence"][dependency, id(use)] = use
+                    pending.extend(sorted(reverse.get(target, ()), reverse=True))
+            for owner in sorted(matches):
+                entry = matches[owner]
+                yield {
+                    "reference": owner,
+                    "shared": sorted(entry["shared"]),
+                    "evidence": [
+                        {"dependency": dependency, **use} for (dependency, _), use in entry["evidence"].items()
+                    ],
+                }
+
+        def unresolved():
+            yield from self.errors
+            yield from dependency_context()[1]
+            for file, owner, node in self._calls:
+                if owner in own:
+                    call = self._call(file, owner, node)
+                    if not call["targets"]:
+                        yield call
+
+        sections = {
+            "callers": callers,
+            "callees": callees,
+            "shared_helpers": lambda: shared(None),
+            "shared_parameters": lambda: shared({"field", "property", "parameter", "assignment"}),
+            "unresolved": unresolved,
+        }
+
+        def evidence():
+            for name, records in sections.items():
+                if name == "evidence":
+                    continue
+                for record in records():
+                    uses = record.get("evidence")
+                    if uses:
+                        for use in uses:
+                            yield {
+                                "section": name,
+                                "reference": record["reference"],
+                                **({"shared": use["dependency"]} if "dependency" in use else {}),
+                                "evidence": use,
+                            }
+                    else:
+                        yield {"section": name, **record}
+
+        sections["evidence"] = evidence
+        return sections
+
+    def related(
+        self,
+        reference: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        consumers: str | list[str] | None = None,
+        section: str = "summary",
+    ) -> dict[str, Any]:
+        consumer_filter = self.query_options(limit, offset, consumers)
         return {
             "reference": reference,
             "source_revision": self.revision,
-            "callers": callers,
-            "callees": callees,
-            "shared_helpers": shared_helpers,
-            "shared_parameters": shared_parameters,
-            "unresolved": [*self.errors, *[call for call in calls if call["owner"] in own and not call["targets"]]],
+            "consumers_filter": sorted(consumer_filter) if consumer_filter is not None else None,
+            **self._answer_sections(self._related_records(reference, consumer_filter), section, limit, offset),
         }
+
+    def callers(self, reference: str):
+        """Unpaged internal navigation stream; public answers remain explicitly paginated."""
+        self.definition(reference)
+        symbol = self._symbols[reference]
+        prefix = symbol.qualified + "."
+        own = {
+            ref
+            for ref, candidate in self._symbols.items()
+            if ref == reference or (candidate.file == symbol.file and candidate.qualified.startswith(prefix))
+        }
+        for file, owner, node in self._calls:
+            if owner not in own:
+                call = self._call(file, owner, node)
+                if own.intersection(call["targets"]):
+                    yield {"reference": owner, "evidence": [call]}

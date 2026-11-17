@@ -1,4 +1,4 @@
-"""Coding-agent sessions (``cadiste mcp``) and the viewer tabs they drive, linked one session to one tab.
+"""Coding-agent sessions, explicitly linked tabs, and recoverable renderer transactions.
 
 A session asks for a tab the first time it needs one: every open tab shows a link request with the session's code,
 and the user picks the tab with Link. The link is kept by tab id, which a tab keeps across reloads; a tab gone for
@@ -12,16 +12,21 @@ it changes.
 from __future__ import annotations
 
 import itertools
+import json
 import random
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 _RECONNECT = 5.0
 """Seconds a linked tab gets to come back (a reload) before it counts as closed."""
+_SESSION_TTL = 75.0
+"""A bridge heartbeats every 20 seconds; old registrations are not live clients."""
 _WORDS = ("amber", "brave", "brisk", "calm", "cedar", "coral", "crisp", "dusky", "eager", "ember", "fern", "frosty")
 _WORDS += ("golden", "hazel", "ivory", "jade", "keen", "lunar", "maple", "misty", "noble", "olive", "pearl", "quiet")
 _WORDS += ("rapid", "rosy", "rusty", "sage", "silver", "snowy", "solar", "spruce", "sunny", "swift", "teal", "vivid")
@@ -42,9 +47,24 @@ class Session:
     tab: str | None = None
     requesting: bool = False
     declined: bool = False
+    skill_digest: str | None = None
+    mcp_generation: str | None = None
+    created: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
 
     def info(self) -> dict[str, Any]:
-        return {"id": self.id, "client": self.client, "code": self.code, "tab": self.tab, "requesting": self.requesting}
+        return {
+            "id": self.id,
+            "client": self.client,
+            "code": self.code,
+            "tab": self.tab,
+            "requesting": self.requesting,
+            "skill_digest": self.skill_digest,
+            "mcp_generation": self.mcp_generation,
+            "created": self.created,
+            "last_seen": self.last_seen,
+            "alive": time.time() - self.last_seen <= _SESSION_TTL,
+        }
 
 
 @dataclass
@@ -63,25 +83,86 @@ class _Pending:
     done: threading.Event = field(default_factory=threading.Event)
     ok: bool = False
     value: Any = None
+    method: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    created: float = field(default_factory=time.time)
 
 
 class Hub:
-    def __init__(self) -> None:
+    def __init__(self, outcomes: Path | None = None, *, retention: int = 256) -> None:
         self._lock = threading.Condition()
         self._sessions: dict[str, Session] = {}
         self._tabs: dict[str, _Tab] = {}
         self._pending: dict[str, _Pending] = {}
         self._connections = itertools.count(1)
+        self._outcomes_path = outcomes
+        self._retention = max(1, retention)
+        self._outcomes: dict[str, dict[str, Any]] = {}
+        if outcomes is not None and outcomes.exists():
+            try:
+                saved = json.loads(outcomes.read_text())
+                for item in saved[-self._retention :]:
+                    if item["status"] == "pending":
+                        item = {
+                            **item,
+                            "status": "interrupted",
+                            "error": "server restarted; outcome unknown; do not blindly rebuild",
+                        }
+                    self._outcomes[item["id"]] = item
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+
+    def _persist(self) -> None:
+        while len(self._outcomes) > self._retention:
+            removable = next((key for key, value in self._outcomes.items() if value["status"] != "pending"), None)
+            if removable is None:
+                break
+            del self._outcomes[removable]
+        if self._outcomes_path is not None:
+            self._outcomes_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._outcomes_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(list(self._outcomes.values()), ensure_ascii=False))
+            temporary.replace(self._outcomes_path)
+
+    def outcome(self, request: str) -> dict[str, Any]:
+        """Read a retained request without resending it, including replies arriving after timeout."""
+        with self._lock:
+            if request not in self._outcomes:
+                raise HubError(f"no retained renderer request {request!r}")
+            return dict(self._outcomes[request])
+
+    def generations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [session.info() for session in self._sessions.values()]
+
+    def track_request(self, tab: str, request: str, method: str, params: dict[str, Any]) -> None:
+        """Register a private renderer transaction in the same durable recovery journal."""
+        with self._lock:
+            if request in self._outcomes:
+                raise HubError(f"request {request} already exists")
+            if sum(value["status"] == "pending" for value in self._outcomes.values()) >= self._retention:
+                raise HubError("renderer request retention is full")
+            self._outcomes[request] = {
+                "id": request,
+                "tab": tab,
+                "method": method,
+                "params": params,
+                "status": "pending",
+                "created": time.time(),
+            }
+            self._persist()
 
     # ---- sessions (the bridge) ----
 
-    def open_session(self, client: str) -> Session:
+    def open_session(self, client: str, skill_digest: str | None = None, mcp_generation: str | None = None) -> Session:
         with self._lock:
             used = {session.code for session in self._sessions.values()}
             code = f"{random.choice(_WORDS)}-{random.choice(_ANIMALS)}"
             while code in used:
                 code = f"{random.choice(_WORDS)}-{random.choice(_ANIMALS)}"
-            session = Session(uuid.uuid4().hex, client or "agent", code)
+            session = Session(
+                uuid.uuid4().hex, client or "agent", code, skill_digest=skill_digest, mcp_generation=mcp_generation
+            )
             self._sessions[session.id] = session
             return session
 
@@ -89,6 +170,16 @@ class Hub:
         with self._lock:
             if self._sessions.pop(session_id, None) is not None:
                 self._broadcast_sessions()
+
+    def heartbeat(self, session_id: str) -> dict[str, Any]:
+        """Refresh exactly one registered bridge; inspection never refreshes liveness."""
+        with self._lock:
+            session = self.session(session_id)
+            was_alive = session.info()["alive"]
+            session.last_seen = time.time()
+            if not was_alive:
+                self._broadcast_sessions()
+            return session.info()
 
     def session(self, session_id: str) -> Session:
         with self._lock:
@@ -181,6 +272,7 @@ class Hub:
             connection = tab.connection = next(self._connections)
             tab.outbox = deque(item for item in tab.outbox if item[0] != "sessions")
             tab.outbox.appendleft(("sessions", {"sessions": [s.info() for s in self._sessions.values()]}))
+            reported_liveness = tuple((session.id, session.info()["alive"]) for session in self._sessions.values())
             self._lock.notify_all()
         try:
             while True:
@@ -190,6 +282,11 @@ class Hub:
                         return
                     events = list(tab.outbox)
                     tab.outbox.clear()
+                    liveness = tuple((session.id, session.info()["alive"]) for session in self._sessions.values())
+                    if liveness != reported_liveness:
+                        if not any(kind == "sessions" for kind, _ in events):
+                            events.append(("sessions", {"sessions": [s.info() for s in self._sessions.values()]}))
+                        reported_liveness = liveness
                 if not events:
                     yield None
                 yield from events
@@ -204,29 +301,69 @@ class Hub:
             self._tab(tab_id).state = state
             self._lock.notify_all()
 
-    def call(self, tab_id: str, method: str, params: dict[str, Any], timeout: float) -> Any:
-        """Send a request to a tab and wait for its reply."""
-        request = uuid.uuid4().hex
-        pending = _Pending(tab_id)
+    def call(
+        self, tab_id: str, method: str, params: dict[str, Any], timeout: float, *, request_id: str | None = None
+    ) -> Any:
+        """Send once; a timeout retains the request so a late reply can be recovered by id."""
+        request = request_id or uuid.uuid4().hex
         with self._lock:
+            previous = self._outcomes.get(request)
+            if previous is not None:
+                if (previous["tab"], previous["method"], previous["params"]) != (tab_id, method, params):
+                    raise HubError(f"request id {request} was already used for a different transaction")
+                if previous["status"] == "ok":
+                    return previous["value"]
+                raise HubError(f"request {request}: {previous['status']}; query request_outcome before retrying")
+            if sum(item["status"] == "pending" for item in self._outcomes.values()) >= self._retention:
+                raise HubError("renderer request retention is full; recover outstanding requests before sending more")
+            pending = _Pending(tab_id, method=method, params=params)
             self._pending[request] = pending
+            self._outcomes[request] = {
+                "id": request,
+                "tab": tab_id,
+                "method": method,
+                "params": params,
+                "status": "pending",
+                "created": pending.created,
+            }
+            self._persist()
             self._tab(tab_id).outbox.append(("request", {"id": request, "method": method, "params": params}))
             self._lock.notify_all()
-        try:
-            if not pending.done.wait(timeout):
-                raise HubError(f"the tab did not answer {method!r} within {timeout:.0f} s (is it still open?)")
-        finally:
+        if not pending.done.wait(timeout):
             with self._lock:
-                self._pending.pop(request, None)
+                if not pending.done.is_set():
+                    self._pending.pop(request, None)
+                    self._outcomes[request]["status"] = "timed_out"
+                    self._persist()
+                    raise HubError(
+                        f"renderer request {request} ({method}) timed out after {timeout:.0f} s; "
+                        "query request_outcome(request_id=...) before retrying or rebuilding"
+                    )
         if not pending.ok:
-            raise HubError(f"the tab could not {method}: {pending.value}")
+            raise HubError(f"the tab could not {method} (request {request}): {pending.value}")
         return pending.value
 
     def reply(self, tab_id: str, request: str, ok: bool, value: Any) -> bool:
         with self._lock:
-            pending = self._pending.get(request)
-            if pending is None or pending.tab != tab_id:
+            record = self._outcomes.get(request)
+            if record is None or record["tab"] != tab_id or record["status"] not in ("pending", "timed_out"):
                 return False
-        pending.ok, pending.value = ok, value
-        pending.done.set()
-        return True
+            expected = record["params"].get("expected", record["params"])
+            if (
+                ok
+                and record["method"] in ("open", "capture", "screenshot")
+                and expected.get("build_id")
+                and (
+                    not isinstance(value, dict)
+                    or any(value.get(key) != expected.get(key) for key in ("target", "build_id"))
+                )
+            ):
+                ok, value = False, "renderer returned a different target/build; transaction discarded"
+            record.update(status="ok" if ok else "error", value=value, completed=time.time())
+            pending = self._pending.pop(request, None)
+            if pending is not None:
+                pending.ok, pending.value = ok, value
+            self._persist()
+            if pending is not None:
+                pending.done.set()
+            return True

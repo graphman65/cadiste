@@ -3,10 +3,14 @@ import type { Target } from "./App";
 
 export class TraceFailure extends Error {
   readonly log: string | undefined;
+  readonly code: string | undefined;
+  readonly details: unknown;
 
-  constructor(message: string, log?: string) {
+  constructor(message: string, log?: string, code?: string, details?: unknown) {
     super(message);
     this.log = log;
+    this.code = code;
+    this.details = details;
   }
 }
 
@@ -23,8 +27,8 @@ export interface Built<T> {
 async function checked<T>(response: Response): Promise<T> {
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    const failure = (body ?? {}) as Partial<TraceError>;
-    throw new TraceFailure(failure.error ?? `${response.status} ${response.statusText}`, failure.log);
+    const failure = (body ?? {}) as Partial<TraceError> & { code?: string; details?: unknown };
+    throw new TraceFailure(failure.error ?? `${response.status} ${response.statusText}`, failure.log, failure.code, failure.details);
   }
   return body as T;
 }
@@ -35,11 +39,11 @@ async function getResponse<T>(url: string, signal?: AbortSignal): Promise<{ body
 }
 
 /** Cached/current-source, explicitly fresh, or one exact retained build generation. */
-export type BuildMode = "cached" | "fresh" | { build_id: string };
+export type BuildMode = "cached" | "fresh" | { build_id: string; baseline?: string };
 
 async function getBuilt<T>(url: string, mode: BuildMode, signal?: AbortSignal): Promise<Built<T>> {
   const query = mode === "cached" ? "" : typeof mode === "object"
-    ? `&build_id=${encodeURIComponent(mode.build_id)}` : "&fresh=1";
+    ? `&build_id=${encodeURIComponent(mode.build_id)}${mode.baseline ? `&baseline=${encodeURIComponent(mode.baseline)}` : ""}` : "&fresh=1";
   const { body, response } = await getResponse<T>(url + query, signal);
   return {
     data: body,
@@ -62,7 +66,7 @@ export interface BackgroundBuild {
 
 export interface BuildsSnapshot {
   fingerprint: string;
-  project: Pick<Project, "parts" | "folders" | "assemblies"> | null;
+  project: Pick<Project, "parts" | "folders" | "assemblies" | "variants" | "default_variant"> | null;
   error: string | null;
   targets: BackgroundBuild[];
 }
@@ -126,8 +130,8 @@ export async function fetchMeasurement(shapes: string, paths: string[], signal?:
   return checked<Measurement>(response);
 }
 
-/** What the server writes a target as: STEP (an assembly's tree kept), STL (one mesh), BREP (OpenCascade's own). */
-export type ExportFormat = "step" | "stl" | "brep";
+/** Target exports: exact STEP assembly, named millimeter 3MF project objects, STL mesh, or exact OpenCascade BREP. */
+export type ExportFormat = "step" | "3mf" | "stl" | "brep";
 
 /** The file name a download's `Content-Disposition` gives, the UTF-8 one first. */
 function attachmentName(disposition: string | null): string | null {
@@ -137,31 +141,108 @@ function attachmentName(disposition: string | null): string | null {
 }
 
 /**
- * A target built again (not traced) and written as a CAD file; `target` is the viewer's (`{kind: "part", name}`,
- * `{kind: "file", path}`, `{kind: "assembly", name}`); `parts` keeps those of a folder's parts (all of them: none).
+ * Retained exact geometry written as a CAD file; `target` is the viewer's (`{kind: "part", name}`,
+ * `{kind: "file", path}`, `{kind: "assembly", name}`); `parts` keeps named folder parts, while `hidden`
+ * excludes exact viewer instance/group paths independently.
  */
 export async function fetchExport(
   target: Record<string, string>,
   format: ExportFormat,
   parts?: string[],
+  hidden?: string[],
   signal?: AbortSignal,
-): Promise<{ file: Blob; name: string }> {
-  const query = new URLSearchParams({ ...target, format });
-  for (const part of parts ?? []) query.append("part", part);
-  const response = await fetch(`/api/export?${query}`, { signal });
+  options: ManufacturingOptions = {},
+): Promise<{ file: Blob; name: string; preflight?: unknown }> {
+  const artifact = await postJson<{ url: string; path: string; preflight?: unknown }>("/api/export", {
+    target, format, only: parts, hidden, ...options,
+  }, signal);
+  const response = await fetch(artifact.url, { signal });
   if (!response.ok) await checked<never>(response);
-  const name = attachmentName(response.headers.get("Content-Disposition")) ?? `model.${format}`;
-  return { file: await response.blob(), name };
+  const name = attachmentName(response.headers.get("Content-Disposition")) ?? artifact.path.split("/").at(-1) ?? `model.${format}`;
+  return { file: await response.blob(), name, preflight: artifact.preflight };
 }
 
-/** Build a STEP file and start Bambu Studio on the server machine; completion means the launcher started. */
-export async function openInBambuStudio(target: Record<string, string>, parts?: string[]): Promise<void> {
-  const response = await fetch("/api/bambu-studio", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target, parts }),
+export interface ManufacturingOptions {
+  group?: string;
+  orientation?: string;
+}
+
+export interface CncjsMachining {
+  tool_diameter: number;
+  cut_depth: number;
+  step_down: number;
+  safe_z: number;
+  feed_rate: number;
+  plunge_rate: number;
+  spindle_speed: number;
+}
+
+/** Download router profile G-code for manual loading; never connects to a machine. */
+export async function fetchCncjsExport(
+  target: Record<string, string>,
+  machining: CncjsMachining,
+  options: ManufacturingOptions & { hidden?: string[] } = {},
+): Promise<{ file: Blob; name: string; cutting?: unknown }> {
+  const artifact = await postJson<{ url: string; path: string; cutting?: unknown }>("/api/cncjs", {
+    target, machining, ...options,
   });
-  await checked<Record<string, never>>(response);
+  const response = await fetch(artifact.url);
+  if (!response.ok) await checked<never>(response);
+  const name = attachmentName(response.headers.get("Content-Disposition")) ?? artifact.path.split("/").at(-1) ?? "model.nc";
+  return { file: await response.blob(), name, cutting: artifact.cutting };
+}
+
+export interface BambuHandoffReport {
+  launched: boolean;
+  import_confirmed: boolean;
+  preflight?: unknown;
+  import_verification?: unknown;
+  [key: string]: unknown;
+}
+
+/** Geometry-only handoff: export, process launch and isolated import verification are separate outcomes. */
+export function openInBambuStudio(
+  target: Record<string, string>, parts?: string[], hidden?: string[],
+  options: ManufacturingOptions & { verify_import?: boolean } = {},
+): Promise<BambuHandoffReport> {
+  return postJson<BambuHandoffReport>("/api/bambu-studio", { target, parts, hidden, ...options });
+}
+
+export function fetchManufacturingPreflight(
+  target: Record<string, string>, options: ManufacturingOptions & { hidden?: string[]; overhang_angle?: number } = {},
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  return postJson("/api/manufacturing/preflight", { target, ...options }, signal);
+}
+
+export async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return checked<T>(await fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
+  }));
+}
+
+export interface BaselineEntry {
+  id: string;
+  name?: string | null;
+  targets: { target: Target; build_id: string; source_revision?: string }[];
+}
+
+export async function fetchBaselines(): Promise<BaselineEntry[]> {
+  return (await getResponse<{ baselines: BaselineEntry[] }>("/api/baselines")).body.baselines;
+}
+
+export function pinBaseline(target: Target, build_id: string, name?: string): Promise<BaselineEntry> {
+  return postJson("/api/baselines", { action: "pin", targets: [{ ...target, build_id }], name });
+}
+
+export function releaseBaseline(id: string): Promise<unknown> {
+  return postJson("/api/baselines", { action: "release", id });
+}
+
+export async function fetchBaselineScene(baseline: string, target: Target): Promise<Built<TraceData | AssemblyData>> {
+  const query = new URLSearchParams({ baseline, ...target });
+  const { body, response } = await getResponse<TraceData | AssemblyData>(`/api/baseline-scene?${query}`);
+  return { data: body, cached: true, shapes: response.headers.get("X-Cadiste-Shapes") };
 }
 
 /** A portable articulated Gazebo model, world, meshes and ROS 2 launch file. */
@@ -171,15 +252,6 @@ export async function fetchGazebo(target: Record<string, string>): Promise<{ fil
   return { file: await response.blob(), name: attachmentName(response.headers.get("Content-Disposition")) ?? "cadiste-gazebo.zip" };
 }
 
-/** Completion means the ROS 2 launcher started on the server, not that Gazebo finished loading. */
-export async function openInGazebo(target: Record<string, string>): Promise<{ directory: string; log: string }> {
-  const response = await fetch("/api/gazebo", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target }),
-  });
-  return checked<{ directory: string; log: string }>(response);
-}
 
 /** Load an adapter's control metadata without exporting or tessellating meshes. */
 export async function fetchSimulationControls(target: SimulationTarget, signal?: AbortSignal): Promise<SimulationControlsConfig> {

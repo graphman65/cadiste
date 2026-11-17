@@ -152,6 +152,7 @@ export interface SectionTool {
   /** A click on a face while picking. */
   pickFace: (path: string) => void;
   chooseAxis: (name: string, normal: Vec3) => void;
+  chooseViewport: () => void;
   setOffset: (offset: number) => void;
   flip: () => void;
   /** Replace the cut when switching to a saved view; picking is transient, never restored. */
@@ -159,8 +160,8 @@ export interface SectionTool {
 }
 
 /**
- * A section of the scene along a plane taken from a flat face or a principal plane, moved along its normal. It
- * stays across renders (a rebuild is cut where the last build was), on until the tool is closed.
+ * A section of the scene along a plane taken from a flat face, principal plane or current viewport, moved along
+ * its normal. It stays across renders (a rebuild is cut where the last build was), on until the tool is closed.
  */
 export function useSection(viewer: () => Viewer | null, rendered: number): SectionTool {
   const [active, setActive] = useState(false);
@@ -207,7 +208,7 @@ export function useSection(viewer: () => Viewer | null, rendered: number): Secti
     (path: string) => {
       const current = ready();
       const plane = current === null ? null : planeOfFace(current, path);
-      if (plane === null) setNote("That face is not flat: pick a flat one, or a principal plane.");
+      if (plane === null) setNote("That face is not flat: pick a flat one, a principal plane or the viewport.");
       else take(plane);
     },
     [ready, take],
@@ -232,6 +233,14 @@ export function useSection(viewer: () => Viewer | null, rendered: number): Secti
     chooseAxis: (name, normal) => {
       const current = ready();
       if (current !== null) take(axisPlane(current, name, normal));
+    },
+    chooseViewport: () => {
+      const current = ready();
+      if (current === null) return;
+      const [x, y, z, w] = current.getCameraQuaternion();
+      // Camera-local +Z in world space: towards the viewer, including after panning.
+      const normal: Vec3 = [2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)];
+      take({ label: "Viewport plane", point: current.getCameraTarget(), normal });
     },
     setOffset: (offset) => setSection((current) => current && { ...current, offset }),
     flip: () => setSection((current) => current && { ...current, flipped: !current.flipped }),
@@ -280,6 +289,13 @@ export function SectionPanel({ tool, viewer }: { tool: SectionTool; viewer: () =
             {name}
           </button>
         ))}
+        <button
+          className={section?.plane.label === "Viewport plane" ? "on" : undefined}
+          onClick={tool.chooseViewport}
+          title="Cut parallel to the current viewport, through the camera's look-at point"
+        >
+          Viewport
+        </button>
       </div>
       {picking && <p className="muted">Click a flat face to cut along its plane.</p>}
       {note !== null && <p className="section-note">{note}</p>}

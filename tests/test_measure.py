@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import io
+import json
 import math
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 from build123d import Axis, Box, BuildPart, Cylinder, Edge, GeomType, Location, Mode, Part, Solid
+
+# OCP is a compiled extension without type stubs.
+# pyright: reportAttributeAccessIssue=false
+from OCP.BinTools import BinTools, BinTools_FormatVersion
+from OCP.BRep import BRep_Builder
+from OCP.BRepGProp import BRepGProp
+from OCP.GProp import GProp_GProps
+from OCP.TopoDS import TopoDS_Compound
 
 from cadiste.measure import MeasureError, Shapes, load, measure, save
 from cadiste.mesh import Scene, SceneObject, tessellate
@@ -123,3 +134,48 @@ def test_a_line_drawn_on_its_own_is_numbered_as_the_viewer_numbers_its_edges(tmp
     assert _rows(entity["properties"])["Length"] == pytest.approx(5)
     with pytest.raises(MeasureError):
         measure(shapes, [_path(scene, "line", "edges", 1)])
+
+
+def test_whole_solids_round_trip_without_reconstructing_a_drilled_shell(tmp_path: Path):
+    block = _drilled_block().moved(Location((30, 40, 50), (0, 0, 90)))
+    scene, shapes = _saved(tmp_path, SceneObject("block", block))
+    path = scene.paths["block"]
+    properties = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shapes.solid(path), properties)
+
+    assert properties.Mass() == pytest.approx(1000 - 40 * math.pi)
+    center = properties.CentreOfMass()
+    assert (center.X(), center.Y(), center.Z()) == pytest.approx((30, 40, 50))
+    transform = shapes.placements[path].Transformation()
+    assert [transform.Value(row, 4) for row in range(1, 4)] == pytest.approx((30, 40, 50))
+
+
+def test_older_entity_cache_remains_measurable_but_requires_rebuild_for_solids(tmp_path: Path):
+    scene = tessellate([SceneObject("block", _drilled_block())])
+    builder = BRep_Builder()
+    root = TopoDS_Compound()
+    builder.MakeCompound(root)
+    index = []
+    for leaf in scene.leaves:
+        entry: dict[str, Any] = {"path": leaf.path}
+        for kind in ("faces", "edges", "vertices"):
+            items = getattr(leaf, kind)
+            entry[kind] = items is not None
+            group = TopoDS_Compound()
+            builder.MakeCompound(group)
+            for item in items or ():
+                builder.Add(group, item)
+            builder.Add(root, group)
+        index.append(entry)
+    stream = io.BytesIO()
+    BinTools.Write_s(root, stream, False, False, BinTools_FormatVersion.BinTools_FormatVersion_CURRENT)
+    file = tmp_path / "old.shapes"
+    with zipfile.ZipFile(file, "w") as archive:
+        archive.writestr("index.json", json.dumps(index))
+        archive.writestr("shapes.bin", stream.getvalue())
+    shapes = load(file)
+
+    assert measure(shapes, [_path(scene, "block", "faces", 0)])["entities"]
+    assert not shapes.whole_available
+    with pytest.raises(MeasureError, match=r"older shape cache.*rebuild"):
+        shapes.solid(scene.paths["block"])

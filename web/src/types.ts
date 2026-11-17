@@ -1,4 +1,6 @@
 import type { Target } from "./App";
+import type { SavedViewState } from "./components/SavedViews";
+import type { SectionPlane } from "./components/Section";
 import type { ViewDirection } from "./components/ViewToolbar";
 
 // The JSON `cadiste export` writes (src/cadiste/export.py) and `cadiste serve` hands out.
@@ -97,6 +99,7 @@ export interface PartScene {
 export interface TraceData {
   /** `volume` in mm³ (of its solids), `bbox` its axis-aligned bounds in mm. */
   build_id: string;
+  source_revision?: string;
   source_fingerprint?: string;
   result: { type: string; faces: number; attributed: number; volume: number; bbox: { min: Vec3; max: Vec3 } };
   build_seconds: number;
@@ -106,12 +109,30 @@ export interface TraceData {
   sources: Record<string, string>;
   scene: PartScene;
 }
+export interface Placement {
+  reference: string | null;
+  definition: string;
+  site: { file: string; line: number; end_line?: number; column?: number };
+  method: string;
+  code: string | null;
+  arguments: { name: string; value: unknown }[];
+  call_arguments?: { name: string; position?: number; expression: string }[];
+  source_revision: string;
+}
+
 
 export interface AssemblyData {
   build_id: string;
+  source_revision?: string;
   source_fingerprint?: string;
   /** `part_of`: instance (leaf path) -> the part it is an instance of, when the server could tell. */
-  scene: { data: SceneData; root: string; part_of?: Record<string, string> };
+  scene: {
+    data: SceneData; root: string; part_of?: Record<string, string>;
+    ownership?: { status: string; matched: number; total: number; unmatched: string[]; explanation: string };
+    instances?: Record<string, { owner: string | null; ownership: "explicit" | "shared_topology" | "unavailable"; placement: Placement | null; placements?: Placement[] }>;
+    sources?: Record<string, string>;
+    source_revision?: string;
+  };
   build_seconds: number;
 }
 
@@ -122,9 +143,26 @@ export interface Project {
   folders: Record<string, { name: string; file: boolean }[]>;
   /** The assemblies' names, in the order `cadiste serve --assembly` gave them. */
   assemblies: string[];
+  /** Optional named catalogs; target and folder identities retain their variant prefix. */
+  variants?: { id: string; label: string }[];
+  default_variant?: string | null;
   /** Assemblies with explicit simulation adapters (`cadiste serve --simulation`). */
   simulations: string[];
   root: string;
+  workspace_only?: boolean;
+  workspace_url?: string | null;
+  project_root?: string;
+  profile_path?: string | null;
+  check_sets?: Record<string, { target: Target; checks: Record<string, unknown>[]; assertions?: Record<string, unknown>[] }>;
+  manufacturing?: ManufacturingConfiguration;
+  manufacturing_by_variant?: Record<string, ManufacturingConfiguration>;
+}
+
+export interface ManufacturingConfiguration {
+  orientations?: Record<string, { rotation: number[]; translation?: number[]; on_bed?: boolean }>;
+  groups?: Record<string, string[]>;
+  part_orientations?: Record<string, string>;
+  bed?: { size: number[]; origin?: number[] };
 }
 
 export interface SimulationTarget {
@@ -157,6 +195,14 @@ export interface SimulationControlsConfig {
   model: string;
   commands: SimulationCommand[];
   transmissions: SimulationTransmission[];
+  topology: {
+    links: { name: string; owner: "robot"; pose: SimulationPose }[];
+    joints: { name: string; parent: string; child: string; kind: string; pose: SimulationPose;
+      axis: Vec3; axis_frame: "joint"; actuated: boolean; lower: number | null; upper: number | null;
+      effort: number | null; velocity: number | null; damping: number; friction: number;
+      spring_stiffness: number; spring_reference: number; velocity_gain: number; velocity_integral_gain: number }[];
+    environment: { name: string; owner: "environment"; static: true; pose: SimulationPose }[];
+  };
   feedback: {
     world_frame: string;
     model_frame: string;
@@ -247,6 +293,9 @@ export interface SessionInfo {
   tab: string | null;
   /** Waiting for the user to link it to a tab. */
   requesting: boolean;
+  alive?: boolean;
+  last_seen?: number;
+  created?: number;
 }
 
 /** A captured selection retains exact entity paths and feature provenance across parts. */
@@ -258,6 +307,7 @@ export type SelectionItem =
 /** What a tab shows, pushed to the hub as it changes. */
 export interface TabState {
   target: Target | null;
+  build_id: string | null;
   status: "none" | "loading" | "ok" | "error";
   error: string | null;
   /** The build's shapes file (`Built.shapes`). */
@@ -267,28 +317,63 @@ export interface TabState {
   partShapes: Record<string, string>;
   /** Hidden instance leaves. */
   hidden: string[];
+  renderer?: unknown;
+  visibility_layers?: {
+    parts: { hidden: string[]; solo: string | null };
+    instances: { hidden: string[]; solo: string | null };
+    effective_hidden: string[];
+  };
 }
 
-/** The calls a session makes on its tab, by method: their params and what the tab answers. */
+export interface BuildIdentity { target: Target; build_id: string; source_revision?: string; source_fingerprint?: string }
+
+export interface CaptureArrangement {
+  selection?: SelectionItem[];
+  hidden?: string[];
+  direction?: ViewDirection;
+  fit?: boolean | "all" | "visible" | "selected";
+  ortho?: boolean;
+  transparent?: boolean;
+  camera?: SavedViewState["camera"];
+  section?: { active: boolean; plane?: SectionPlane | null; offset?: number; flipped?: boolean };
+  explode?: number | null;
+}
+
+export interface CaptureResult extends BuildIdentity {
+  images: {
+    view: ViewDirection | "current"; data: string;
+    diagnostics?: {
+      suspicious_empty: boolean; warnings: string[];
+      pixel_sample: { width: number; height: number; distinct_colors: number; opaque_pixels: number; non_background_pixels: number } | null;
+    };
+  }[];
+  timings?: Record<string, number>;
+}
+
+/** Renderer transactions are target/build guarded and serialized by the page. */
 export interface HubCalls {
-  /** Open a target, its build fetched again, then select a tree node (part) or an instance (assembly, file). */
+  inspect: { params: Record<string, never>; result: object };
   open: {
-    params: { target: Target; build_id: string; select?: string | null };
-    result: { status: "ok" } | { status: "error"; error: string; log?: string };
+    params: BuildIdentity & { select?: string | null };
+    result: BuildIdentity & { status: "ok" };
   };
-  /** Replace the entire explicit selection; [] clears it. */
+  capture: {
+    params: BuildIdentity & { select?: string | null; views: (ViewDirection | "current")[]; arrangement?: CaptureArrangement | null; baseline?: string };
+    result: CaptureResult;
+  };
   select: { params: { items: SelectionItem[] }; result: object };
-  /** Light viewer paths (a component exactly, a leaf all its faces) until the next call or another target. */
   highlight: { params: { paths: string[] }; result: object };
   view: {
-    params: { direction?: ViewDirection; fit?: boolean; ortho?: boolean; transparent?: boolean };
+    params: { direction?: ViewDirection; fit?: boolean | "all" | "visible" | "selected"; ortho?: boolean; transparent?: boolean; camera?: SavedViewState["camera"] };
     result: object;
   };
+  section: { params: { active: boolean; plane?: SectionPlane | null; offset?: number; flipped?: boolean }; result: object };
+  explode: { params: { amount: number | null }; result: object };
+  saved_views: { params: { action: "list" | "create" | "update" | "delete" | "restore"; id?: string; name?: string; state?: SavedViewState }; result: object };
   visibility: { params: { instances: string[]; visible: boolean }; result: object };
-  /** PNGs, base64 without the `data:` prefix, at most `width` px wide; no views: the current camera. */
   screenshot: {
-    params: { views: ViewDirection[]; width?: number };
-    result: { images: { view: ViewDirection | "current"; data: string }[] };
+    params: { views: (ViewDirection | "current")[]; width?: number; arrangement?: CaptureArrangement | null };
+    result: CaptureResult;
   };
 }
 

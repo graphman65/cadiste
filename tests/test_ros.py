@@ -14,7 +14,7 @@ _TARGET = {"kind": "assembly", "name": "Inspection robot"}
 
 
 def _metadata(count: int = 2) -> dict[str, Any]:
-    return {
+    metadata = {
         "model": "inspection_bot",
         "commands": [
             {
@@ -47,18 +47,63 @@ def _metadata(count: int = 2) -> dict[str, Any]:
             "visuals": {},
         },
     }
+    metadata["feedback"]["links"].update(
+        {
+            f"moving_{index}": {
+                "frame": f"inspection_bot/moving_{index}",
+                "rest": {"position": [0, 0, 0], "quaternion": [0, 0, 0, 1]},
+            }
+            for index in range(count)
+        }
+    )
+    metadata["topology"] = {
+        "links": [
+            {"name": name, "owner": "robot", "pose": copy.deepcopy(link["rest"])}
+            for name, link in metadata["feedback"]["links"].items()
+        ],
+        "joints": [
+            {
+                "name": f"motor_{index}",
+                "parent": "body",
+                "child": f"moving_{index}",
+                "kind": "continuous",
+                "pose": {"position": [0, 0, 0], "quaternion": [0, 0, 0, 1]},
+                "axis": [0, 0, 1],
+                "axis_frame": "joint",
+                "actuated": True,
+                "lower": None,
+                "upper": None,
+                "effort": 2.5,
+                "velocity": 4.0,
+                "damping": 0.01,
+                "friction": 0.0,
+                "spring_stiffness": 0.0,
+                "spring_reference": 0.0,
+                "velocity_gain": 0.01,
+                "velocity_integral_gain": 0.0,
+            }
+            for index in range(count)
+        ],
+        "environment": [],
+    }
+    return metadata
 
 
 def _geared_metadata() -> dict[str, Any]:
     metadata = _metadata(1)
     metadata["commands"][0].update(
-        joint="drive_motor", topic="/inspection_bot/motors/drive_motor/cmd_vel",
+        joint="drive_motor",
+        topic="/inspection_bot/motors/drive_motor/cmd_vel",
     )
     metadata["transmissions"] = [{"name": "drive_motor", "joint": "axle", "ratio": -0.4}]
     metadata["feedback"]["joints"] = ["axle"]
+    metadata["topology"]["joints"][0]["name"] = "axle"
     metadata["feedback"]["visuals"] = {
         "pinion": {
-            "parent": "body", "joint": "axle", "multiplier": -2.5, "axis": [0, 1, 0],
+            "parent": "body",
+            "joint": "axle",
+            "multiplier": -2.5,
+            "axis": [0, 1, 0],
             "pose": {"position": [0.02, 0, 0], "quaternion": [0, 0, 0, 1]},
         },
     }
@@ -97,17 +142,20 @@ def _finish(job: tuple[threading.Thread, dict[str, Any]]) -> Any:
     return result["value"]
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("model", "../other"),
-    ("model", 1),
-    ("commands", {}),
-    ("commands", [None]),
-    ("joint_states", "/bad;touch /tmp/injected"),
-    ("tf", "--help"),
-    ("clock", "/tf"),
-    ("launch", None),
-    ("runtime", ""),
-])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "../other"),
+        ("model", 1),
+        ("commands", {}),
+        ("commands", [None]),
+        ("joint_states", "/bad;touch /tmp/injected"),
+        ("tf", "--help"),
+        ("clock", "/tf"),
+        ("launch", None),
+        ("runtime", ""),
+    ],
+)
 def test_invalid_top_level_metadata_cannot_authorize_commands(field: str, value: Any, forbidden_transport: None):
     metadata = _metadata()
     metadata[field] = value
@@ -118,24 +166,27 @@ def test_invalid_top_level_metadata_cannot_authorize_commands(field: str, value:
         controls.send(_TARGET, "anything", {"motor_0": 1.0})
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("joint", "--help"),
-    ("joint", []),
-    ("type", "std_msgs/msg/String"),
-    ("type", "--help"),
-    ("units", "m/s"),
-    ("effort_limit", -1),
-    ("effort_limit", float("nan")),
-    ("velocity_limit", 0),
-    ("velocity_limit", -1),
-    ("velocity_limit", float("nan")),
-    ("velocity_limit", float("inf")),
-    ("velocity_limit", float("-inf")),
-    ("velocity_limit", True),
-    ("velocity_limit", "4"),
-    ("velocity_limit", 10**400),
-    ("example", []),
-])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("joint", "--help"),
+        ("joint", []),
+        ("type", "std_msgs/msg/String"),
+        ("type", "--help"),
+        ("units", "m/s"),
+        ("effort_limit", -1),
+        ("effort_limit", float("nan")),
+        ("velocity_limit", 0),
+        ("velocity_limit", -1),
+        ("velocity_limit", float("nan")),
+        ("velocity_limit", float("inf")),
+        ("velocity_limit", float("-inf")),
+        ("velocity_limit", True),
+        ("velocity_limit", "4"),
+        ("velocity_limit", 10**400),
+        ("example", []),
+    ],
+)
 def test_invalid_command_schema_is_rejected(field: str, value: Any, forbidden_transport: None):
     metadata = _metadata()
     metadata["commands"][0][field] = value
@@ -144,11 +195,27 @@ def test_invalid_command_schema_is_rejected(field: str, value: Any, forbidden_tr
         controls.describe(_TARGET)
 
 
-@pytest.mark.parametrize("topic", [
-    "--help", "relative/topic", "/", "/trailing/", "/two//slashes", "/repeated__underscores",
-    "/starts/1digit", "/bad-name", "/bad name", "/bad\nname", "/bad\x00name", "/$(touch injected)",
-    "/name;touch injected", "/{substitution}", "/~private", "/" + "x" * 255,
-])
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "--help",
+        "relative/topic",
+        "/",
+        "/trailing/",
+        "/two//slashes",
+        "/repeated__underscores",
+        "/starts/1digit",
+        "/bad-name",
+        "/bad name",
+        "/bad\nname",
+        "/bad\x00name",
+        "/$(touch injected)",
+        "/name;touch injected",
+        "/{substitution}",
+        "/~private",
+        "/" + "x" * 255,
+    ],
+)
 def test_unsafe_or_invalid_ros_names_never_reach_a_process(topic: str, forbidden_transport: None):
     metadata = _metadata()
     metadata["commands"][0]["topic"] = topic
@@ -173,12 +240,15 @@ def test_command_topic_cannot_collide_with_state_topic(forbidden_transport: None
         Controls(lambda target: metadata).describe(_TARGET)
 
 
-@pytest.mark.parametrize("change", [
-    lambda metadata: metadata.pop("model"),
-    lambda metadata: metadata.update(executable="/bin/sh"),
-    lambda metadata: metadata["commands"][0].pop("velocity_limit"),
-    lambda metadata: metadata["commands"][0].update(shell=True),
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda metadata: metadata.pop("model"),
+        lambda metadata: metadata.update(executable="/bin/sh"),
+        lambda metadata: metadata["commands"][0].pop("velocity_limit"),
+        lambda metadata: metadata["commands"][0].update(shell=True),
+    ],
+)
 def test_missing_fields_and_executable_configuration_are_not_supported(change, forbidden_transport: None):
     metadata = _metadata()
     change(metadata)
@@ -250,10 +320,16 @@ def test_failed_refresh_revokes_previous_configuration(failure: Exception, forbi
     assert controls.describe(_TARGET)["config_id"] == description["config_id"]
 
 
-@pytest.mark.parametrize("target", [
-    {}, {"kind": "part", "name": "motor"}, {"kind": "assembly", "name": ""},
-    {"kind": "assembly", "name": []}, {**_TARGET, "topic": "/injected"},
-])
+@pytest.mark.parametrize(
+    "target",
+    [
+        {},
+        {"kind": "part", "name": "motor"},
+        {"kind": "assembly", "name": ""},
+        {"kind": "assembly", "name": []},
+        {**_TARGET, "topic": "/injected"},
+    ],
+)
 def test_noncanonical_targets_are_rejected(target: Any, forbidden_transport: None):
     controls = Controls(lambda target: _metadata())
     with pytest.raises(ValueError, match="assembly target"):
@@ -281,10 +357,23 @@ def test_sending_does_not_implicitly_load_an_unknown_target(forbidden_transport:
         Controls(load).send(_TARGET, "anything", {"motor_0": 1})
 
 
-@pytest.mark.parametrize("value", [
-    4.00001, -4.00001, float("nan"), float("inf"), float("-inf"), True, False,
-    "1", None, [], {}, 10**400,
-])
+@pytest.mark.parametrize(
+    "value",
+    [
+        4.00001,
+        -4.00001,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        False,
+        "1",
+        None,
+        [],
+        {},
+        10**400,
+    ],
+)
 def test_batch_validation_is_atomic_even_after_a_valid_joint(value: Any, forbidden_transport: None):
     controls = Controls(lambda target: _metadata())
     description = controls.describe(_TARGET)
@@ -300,10 +389,19 @@ def test_unknown_joint_cannot_route_an_arbitrary_topic(joint: str, forbidden_tra
         controls.send(_TARGET, description["config_id"], {"motor_0": 1, joint: 0})
 
 
-@pytest.mark.parametrize(("values", "stop_all"), [
-    (None, False), ({}, False), ([], False), ({"motor_0": 1}, True), ({}, True),
-    ({"motor_0": 1}, 1), ({"motor_0": 1}, "true"), ({1: 1}, False),
-])
+@pytest.mark.parametrize(
+    ("values", "stop_all"),
+    [
+        (None, False),
+        ({}, False),
+        ([], False),
+        ({"motor_0": 1}, True),
+        ({}, True),
+        ({"motor_0": 1}, 1),
+        ({"motor_0": 1}, "true"),
+        ({1: 1}, False),
+    ],
+)
 def test_malformed_send_modes_are_rejected(values: Any, stop_all: Any, forbidden_transport: None):
     controls = Controls(lambda target: _metadata())
     description = controls.describe(_TARGET)
@@ -425,11 +523,21 @@ def test_refresh_serializes_with_send_and_rejects_the_old_snapshot(forbidden_tra
         _finish(sending)
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("ratio", 0), ("ratio", False), ("ratio", float("nan")), ("ratio", float("inf")),
-    ("name", "axle"), ("name", "body"), ("name", "pinion"), ("name", "unknown"),
-    ("joint", "missing"), ("joint", []),
-])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ratio", 0),
+        ("ratio", False),
+        ("ratio", float("nan")),
+        ("ratio", float("inf")),
+        ("name", "axle"),
+        ("name", "body"),
+        ("name", "pinion"),
+        ("name", "unknown"),
+        ("joint", "missing"),
+        ("joint", []),
+    ],
+)
 def test_invalid_transmission_cannot_authorize_motor_commands(field, value, forbidden_transport):
     metadata = _geared_metadata()
     metadata["transmissions"][0][field] = value
@@ -440,12 +548,19 @@ def test_invalid_transmission_cannot_authorize_motor_commands(field, value, forb
         controls.send(_TARGET, "anything", {"drive_motor": 1.0})
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("parent", "missing"), ("parent", []), ("joint", "drive_motor"),
-    ("axis", [0, 0, 0]), ("axis", [0, 2, 0]), ("axis", [0, float("nan"), 0]),
-    ("multiplier", float("inf")),
-    ("pose", {"position": [0, 0, 0], "quaternion": [0, 0, 0, 0]}),
-])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("parent", "missing"),
+        ("parent", []),
+        ("joint", "drive_motor"),
+        ("axis", [0, 0, 0]),
+        ("axis", [0, 2, 0]),
+        ("axis", [0, float("nan"), 0]),
+        ("multiplier", float("inf")),
+        ("pose", {"position": [0, 0, 0], "quaternion": [0, 0, 0, 0]}),
+    ],
+)
 def test_invalid_gear_dependencies_cannot_authorize_motor_commands(field, value, forbidden_transport):
     metadata = _geared_metadata()
     metadata["feedback"]["visuals"]["pinion"][field] = value
@@ -464,3 +579,31 @@ def test_transmission_direction_change_invalidates_previous_command_and_feedback
     with pytest.raises(ConfigConflictError):
         controls.snapshot(_TARGET, previous["config_id"])
     assert controls.snapshot(_TARGET, current["config_id"])["transmissions"][0]["ratio"] == 0.4
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda value: value["topology"]["joints"][0].update(parent="environment"),
+        lambda value: value["topology"]["joints"][0].update(axis=[0, 0, 2]),
+        lambda value: value["topology"]["joints"][0].update(lower=-1),
+        lambda value: value["topology"]["links"][0].update(owner="environment"),
+        lambda value: value["topology"]["joints"].pop(),
+    ],
+)
+def test_invalid_physical_topology_cannot_authorize_commands(change, forbidden_transport):
+    value = _metadata()
+    change(value)
+    with pytest.raises(InvalidConfigError, match="topology"):
+        Controls(lambda target: value).describe(_TARGET)
+
+
+def test_topology_change_invalidates_command_and_feedback_snapshot(forbidden_transport):
+    value = _metadata()
+    controls = Controls(lambda target: value)
+    previous = controls.describe(_TARGET)
+    value["topology"]["joints"][0]["axis"] = [0, 1, 0]
+    current = controls.describe(_TARGET)
+    assert current["config_id"] != previous["config_id"]
+    with pytest.raises(ConfigConflictError):
+        controls.snapshot(_TARGET, previous["config_id"])

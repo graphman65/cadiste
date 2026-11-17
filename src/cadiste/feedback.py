@@ -14,6 +14,7 @@ from typing import Any
 
 _START_TIMEOUT = 15.0
 _MAX_LINE = 1024 * 1024
+STALE_AFTER = 1.0
 
 
 def _empty(config: dict[str, Any]) -> dict[str, Any]:
@@ -198,7 +199,7 @@ class Feedback:
                     elapsed = now - arrival
                     if last["age"] is not None:
                         heartbeat["age"] = last["age"] + elapsed
-                    if elapsed > 1.0 or (heartbeat["age"] is not None and heartbeat["age"] > 1.0):
+                    if elapsed > STALE_AFTER or (heartbeat["age"] is not None and heartbeat["age"] > STALE_AFTER):
                         heartbeat["status"] = "stale" if last["status"] in {"live", "stale"} else "waiting"
                 yield heartbeat
         finally:

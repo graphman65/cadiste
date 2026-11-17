@@ -22,7 +22,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 _CONFIG_FIELDS = {
-    "model", "commands", "joint_states", "tf", "clock", "launch", "runtime", "feedback", "transmissions",
+    "model",
+    "commands",
+    "joint_states",
+    "tf",
+    "clock",
+    "launch",
+    "runtime",
+    "feedback",
+    "transmissions",
+    "topology",
 }
 _COMMAND_FIELDS = {"joint", "topic", "type", "units", "effort_limit", "velocity_limit", "example"}
 _IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
@@ -83,12 +92,7 @@ def _finite(value: Any) -> bool:
 
 
 def _topic(value: Any, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not _TOPIC.fullmatch(value)
-        or "__" in value
-        or len(value) > 255
-    ):
+    if not isinstance(value, str) or not _TOPIC.fullmatch(value) or "__" in value or len(value) > 255:
         raise InvalidConfigError(f"{label} must be a valid absolute ROS topic name")
     return value
 
@@ -132,10 +136,7 @@ def _feedback_metadata(value: Any, model: str) -> None:
     if not isinstance(visuals, dict):
         raise InvalidConfigError("feedback visuals must be a map")
     for name, visual in visuals.items():
-        if (
-            not isinstance(name, str) or not _IDENTIFIER.fullmatch(name)
-            or name in links or name in joints
-        ):
+        if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) or name in links or name in joints:
             raise InvalidConfigError("driven visual names must be distinct identifiers")
         if not isinstance(visual, dict) or set(visual) != {"parent", "joint", "multiplier", "axis", "pose"}:
             raise InvalidConfigError(f"driven visual {name!r} has unsupported fields")
@@ -147,7 +148,9 @@ def _feedback_metadata(value: Any, model: str) -> None:
             raise InvalidConfigError(f"driven visual {name!r} multiplier must be finite")
         axis = visual["axis"]
         if (
-            not isinstance(axis, list) or len(axis) != 3 or not all(_finite(item) for item in axis)
+            not isinstance(axis, list)
+            or len(axis) != 3
+            or not all(_finite(item) for item in axis)
             or not math.isclose(math.hypot(*axis), 1.0, abs_tol=1e-6)
         ):
             raise InvalidConfigError(f"driven visual {name!r} needs a unit spin axis")
@@ -165,8 +168,12 @@ def _transmission_metadata(value: Any, model: str, feedback: dict, commands: dic
             raise InvalidConfigError("each transmission must declare name, joint and signed ratio")
         name, joint, ratio = (transmission[key] for key in ("name", "joint", "ratio"))
         if (
-            not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) or name in names
-            or name in physical or name in feedback["links"] or name in feedback["visuals"]
+            not isinstance(name, str)
+            or not _IDENTIFIER.fullmatch(name)
+            or name in names
+            or name in physical
+            or name in feedback["links"]
+            or name in feedback["visuals"]
             or name not in commands
         ):
             raise InvalidConfigError("transmission names must uniquely identify motor commands")
@@ -183,6 +190,115 @@ def _transmission_metadata(value: Any, model: str, feedback: dict, commands: dic
         outputs.add(joint)
     if not commands.keys() <= physical | names:
         raise InvalidConfigError("commands must identify physical joints or declared motor transmissions")
+
+
+def _topology_metadata(value: Any, feedback: dict) -> None:
+    if not isinstance(value, dict) or set(value) != {"links", "joints", "environment"}:
+        raise InvalidConfigError("topology must declare robot links, physical joints and environment ownership")
+    names: dict[str, set[str]] = {}
+    for key, owner in (("links", "robot"), ("environment", "environment")):
+        if not isinstance(value[key], list):
+            raise InvalidConfigError(f"topology {key} must be a list")
+        names[key] = set()
+        for link in value[key]:
+            fields = {"name", "owner", "pose"} | ({"static"} if key == "environment" else set())
+            if not isinstance(link, dict) or set(link) != fields:
+                raise InvalidConfigError(f"topology {key} contain unsupported fields")
+            name = link["name"]
+            if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) or name in names[key]:
+                raise InvalidConfigError(f"topology {key} need unique identifiers")
+            if link["owner"] != owner or (key == "environment" and link["static"] is not True):
+                raise InvalidConfigError("topology must distinguish robot links from static environment models")
+            _pose_metadata(link["pose"], f"topology link {name!r}")
+            names[key].add(name)
+    if names["links"] != set(feedback["links"]) or names["links"] & names["environment"]:
+        raise InvalidConfigError("topology robot links must match feedback frames and exclude environment models")
+    joints = value["joints"]
+    if not isinstance(joints, list):
+        raise InvalidConfigError("topology joints must be a list")
+    fields = {
+        "name",
+        "parent",
+        "child",
+        "kind",
+        "pose",
+        "axis",
+        "axis_frame",
+        "actuated",
+        "lower",
+        "upper",
+        "effort",
+        "velocity",
+        "damping",
+        "friction",
+        "spring_stiffness",
+        "spring_reference",
+        "velocity_gain",
+        "velocity_integral_gain",
+    }
+    seen: set[str] = set()
+    parents: dict[str, str] = {}
+    for joint in joints:
+        if not isinstance(joint, dict) or set(joint) != fields:
+            raise InvalidConfigError("topology joints contain unsupported fields")
+        name = joint["name"]
+        if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) or name in seen:
+            raise InvalidConfigError("topology joints need unique identifiers")
+        seen.add(name)
+        parent, child = joint["parent"], joint["child"]
+        if (
+            not isinstance(parent, str)
+            or not isinstance(child, str)
+            or parent not in names["links"]
+            or child not in names["links"]
+            or parent == child
+            or child in parents
+        ):
+            raise InvalidConfigError("topology joints must connect distinct robot links with unique parents")
+        parents[child] = parent
+        if joint["kind"] not in ("fixed", "revolute", "continuous") or not isinstance(joint["actuated"], bool):
+            raise InvalidConfigError("topology joint kind or actuation is invalid")
+        axis = joint["axis"]
+        if (
+            joint["axis_frame"] != "joint"
+            or not isinstance(axis, list)
+            or len(axis) != 3
+            or not all(_finite(item) for item in axis)
+            or not math.isclose(math.hypot(*axis), 1, abs_tol=1e-6)
+        ):
+            raise InvalidConfigError("topology joints need a joint-frame unit axis")
+        _pose_metadata(joint["pose"], f"topology joint {name!r}")
+        for key in ("effort", "velocity", "velocity_gain"):
+            if not _finite(joint[key]) or joint[key] <= 0:
+                raise InvalidConfigError(f"topology joint {key} must be finite and positive")
+        for key in ("damping", "friction", "spring_stiffness", "velocity_integral_gain"):
+            if not _finite(joint[key]) or joint[key] < 0:
+                raise InvalidConfigError(f"topology joint {key} must be finite and nonnegative")
+        if not _finite(joint["spring_reference"]):
+            raise InvalidConfigError("topology spring reference must be finite")
+        if joint["kind"] == "revolute":
+            if (
+                not all(_finite(joint[key]) for key in ("lower", "upper"))
+                or not joint["lower"] <= 0 <= joint["upper"]
+                or joint["lower"] >= joint["upper"]
+            ):
+                raise InvalidConfigError("topology revolute limits must be ordered and include zero")
+        elif joint["lower"] is not None or joint["upper"] is not None:
+            raise InvalidConfigError("only revolute topology joints have position limits")
+        if joint["kind"] == "fixed" and (joint["actuated"] or joint["spring_stiffness"]):
+            raise InvalidConfigError("fixed topology joints cannot be actuated or sprung")
+    if seen != set(feedback["joints"]):
+        raise InvalidConfigError("topology joints must match physical feedback joints")
+    roots = names["links"] - parents.keys()
+    if len(roots) != 1:
+        raise InvalidConfigError("topology must form one connected tree")
+    for link in names["links"]:
+        visited: set[str] = set()
+        while link in parents:
+            if link in visited:
+                raise InvalidConfigError("topology must form one connected tree")
+            visited.add(link)
+            link = parents[link]
 
 
 def _metadata(value: Any) -> tuple[str, dict[str, _Command]]:
@@ -224,6 +340,7 @@ def _metadata(value: Any) -> tuple[str, dict[str, _Command]]:
         commands[joint] = _Command(topic, float(item["velocity_limit"]))
     _feedback_metadata(value["feedback"], value["model"])
     _transmission_metadata(value["transmissions"], value["model"], value["feedback"], commands)
+    _topology_metadata(value["topology"], value["feedback"])
     try:
         metadata = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError) as error:
@@ -246,9 +363,19 @@ def _publish(prefix: tuple[str, ...], command: _Command, value: float) -> str | 
     try:
         done = subprocess.run(
             [
-                *prefix, "topic", "pub", "--once", "--max-wait-time-secs", "3",
-                "--wait-matching-subscriptions", "1", "--keep-alive", "0.1",
-                command.topic, "std_msgs/msg/Float64", json.dumps({"data": value}, allow_nan=False),
+                *prefix,
+                "topic",
+                "pub",
+                "--once",
+                "--max-wait-time-secs",
+                "3",
+                "--wait-matching-subscriptions",
+                "1",
+                "--keep-alive",
+                "0.1",
+                command.topic,
+                "std_msgs/msg/Float64",
+                json.dumps({"data": value}, allow_nan=False),
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -271,9 +398,7 @@ def _publish(prefix: tuple[str, ...], command: _Command, value: float) -> str | 
 class Controls:
     """Project-scoped control snapshots and ordered, bounded one-shot publishing."""
 
-    def __init__(
-        self, load: Callable[[dict[str, str]], dict[str, Any]], *, ros_command: tuple[str, ...] = ("ros2",)
-    ):
+    def __init__(self, load: Callable[[dict[str, str]], dict[str, Any]], *, ros_command: tuple[str, ...] = ("ros2",)):
         if not ros_command or any(not isinstance(arg, str) or not arg for arg in ros_command):
             raise ValueError("ros_command must contain an executable and nonempty arguments")
         self._ros_command = ros_command

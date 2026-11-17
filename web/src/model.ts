@@ -246,9 +246,9 @@ export function leafOfPick(root: ShapeNode, path: string): string | null {
   return leaf?.id ?? null;
 }
 
-/** The leaf of a file's scene showing a part: the file's parts are its leaves, named after them. */
-export function leafOfPart(root: ShapeNode, part: string): string | null {
-  return shapeLeaves(root).find((leaf) => leaf.name === part)?.id ?? null;
+/** A file scene's leaf for a catalog part; ownership may be qualified while geometry labels stay local. */
+export function leafOfPart(root: ShapeNode, part: string, partOf: Readonly<Record<string, string>> | undefined): string | null {
+  return shapeLeaves(root).find((leaf) => (partOf?.[leaf.id] ?? leaf.name) === part)?.id ?? null;
 }
 
 /**

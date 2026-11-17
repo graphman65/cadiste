@@ -57,7 +57,8 @@ interface Props {
   settings: ViewSettings;
   onChange: (change: Partial<ViewSettings>) => void;
   onView: (direction: ViewDirection) => void;
-  onFit: () => void;
+  onFit: (mode: "all" | "visible" | "selected") => void;
+  hasSelection?: boolean;
   /** Whether exact entity selections are also measured. */
   measuring: boolean;
   onMeasure: (measuring: boolean) => void;
@@ -77,6 +78,7 @@ export function ViewToolbar({
   onChange,
   onView,
   onFit,
+  hasSelection = false,
   measuring,
   onMeasure,
   exploded,
@@ -97,9 +99,11 @@ export function ViewToolbar({
           </button>
         ))}
       </div>
-      <button className="icon-button" onClick={onFit} title="Reset the view">
+      <button className="icon-button" onClick={() => onFit("all")} title="Fit all geometry">
         <Icon name="fit" />
       </button>
+      <button onClick={() => onFit("visible")} title="Fit visible geometry">Visible</button>
+      <button disabled={!hasSelection || !cadActions} onClick={() => onFit("selected")} title="Fit selected geometry">Selected</button>
       <span className="divider" />
       <button
         className="icon-button"
@@ -143,7 +147,7 @@ export function ViewToolbar({
         aria-pressed={sectioning}
         disabled={!cadActions}
         onClick={() => onSection(!sectioning)}
-        title="Section: cut the scene along a flat face or a principal plane, and move the cut"
+        title="Section: cut the scene along a flat face, a principal plane or the current viewport, and move the cut"
       >
         <Icon name="section" />
       </button>

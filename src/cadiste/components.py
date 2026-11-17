@@ -325,7 +325,7 @@ class CodeModel:
         else:
             static = [
                 entry["reference"]
-                for entry in self.index.related(reference).get("callers", [])
+                for entry in self.index.callers(reference)
                 if entry.get("reference") in self.index.definitions
             ]
         represented = [self.nodes[ref]["definition"] for ref in observed]
@@ -410,19 +410,81 @@ class CodeModel:
             "source_scope": "captured files only; no live source was read",
         }
 
-    def follow_parameter(self, component: str, expression: str) -> Json:
+    def follow_parameter(
+        self,
+        component: str,
+        expression: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        consumers: str | list[str] | None = None,
+        section: str = "summary",
+    ) -> Json:
+        consumer_filter = self.index.query_options(limit, offset, consumers)
         reference = self._resolve(component)
         definition = self.nodes[reference]["definition"] if reference in self.nodes else reference
         if not definition:
             raise LookupError("this captured component has no source definition; parameter analysis is unavailable")
         scope = self._constructor(definition)
-        result = self.index.follow_parameter(scope, expression)
-        roots = self._occurrences(reference)
-        pending = list(roots)
+        runtime_sections = ("captured_operation_values", "observed_parameter_values")
+        if section in runtime_sections:
+            try:
+                ast.parse(expression, mode="eval")
+            except SyntaxError as error:
+                raise ValueError(f"expected a Python expression: {expression}") from error
+            result: Json = {
+                "reference": scope,
+                "expression": expression,
+                "section": section,
+                "pages": {},
+                "available_sections": [
+                    "origins",
+                    "dependencies",
+                    "consumers",
+                    "cycles",
+                    "unresolved",
+                    "evidence",
+                    *runtime_sections,
+                ],
+            }
+        else:
+            result = self.index.follow_parameter(
+                scope, expression, limit=limit, offset=offset, consumers=consumers, section=section
+            )
+            result["available_sections"].extend(runtime_sections)
+        for name in runtime_sections:
+            if section not in ("summary", name):
+                continue
+            values, page = self.index.page(
+                (
+                    value
+                    for kind, value in self._runtime_parameter_values(reference, scope, expression, consumer_filter)
+                    if kind == name
+                ),
+                limit=limit,
+                offset=offset,
+                render=self.index._compact if section == "summary" else None,
+            )
+            result[name] = values
+            result["pages"][name] = page
+        return {
+            **result,
+            "part": self.part,
+            "source_revision": self.revision,
+            "component": self.reference(reference),
+        }
+
+    def _runtime_parameter_values(
+        self,
+        reference: str,
+        scope: str,
+        expression: str,
+        consumers: set[str] | None,
+    ):
+        pending = list(reversed(self._occurrences(reference)))
         seen: set[str] = set()
-        values = []
         observed_invocations: set[int | None] = set()
-        observed_values = []
+        # Observations belong to their own invocation, never to a same-spelled helper argument.
         while pending:
             occurrence = pending.pop()
             if occurrence in seen:
@@ -432,49 +494,51 @@ class CodeModel:
             same_scope = node["definition"] == scope
             invocation = node.get("observed_invocation")
             observed = self._observed(node) if same_scope and invocation not in observed_invocations else None
-            if observed:
+            included = consumers is None or scope in consumers or occurrence in consumers
+            if observed and included:
                 observed_invocations.add(invocation)
                 for parameter in observed.get("parameters", []):
                     name = parameter["name"]
                     if expression == name:
-                        observed_values.append(
+                        yield (
+                            "observed_parameter_values",
                             {
                                 "component": occurrence,
                                 "expression": name,
                                 "value": parameter.get("value"),
                                 "capture": observed["capture"],
-                            }
+                            },
                         )
                     elif expression.startswith(name + ".") and expression[len(name) + 1 :] in parameter.get(
                         "fields", {}
                     ):
-                        observed_values.append(
+                        yield (
+                            "observed_parameter_values",
                             {
                                 "component": occurrence,
                                 "expression": expression,
                                 "value": parameter["fields"][expression[len(name) + 1 :]],
                                 "capture": observed["capture"],
-                            }
+                            },
                         )
             arguments = node["record"].get("arguments", []) if same_scope else []
             for argument in arguments:
                 source = argument.get("source")
                 # Only directly evidenced expression/value pairs; declared defaults are never runtime values.
-                if source and (source == expression or self._contains_expression(source, expression)):
-                    values.append({"component": occurrence, "operation": node["runtime_alias"], **argument})
-            pending.extend(node["children"])
+                if included and source and (source == expression or self._contains_expression(source, expression)):
+                    yield (
+                        "captured_operation_values",
+                        {
+                            "component": occurrence,
+                            "operation": node["runtime_alias"],
+                            **argument,
+                        },
+                    )
+            pending.extend(reversed(node["children"]))
             if node["kind"] == "builder":
                 published = self.aliases.get(f"o{node['record'].get('published_by')}")
                 if published:
                     pending.append(published)
-        return {
-            **result,
-            "part": self.part,
-            "source_revision": self.revision,
-            "component": self.reference(reference),
-            "captured_operation_values": values,
-            "observed_parameter_values": observed_values,
-        }
 
     @staticmethod
     def _contains_expression(source: str, expression: str) -> bool:
@@ -486,13 +550,170 @@ class CodeModel:
         except SyntaxError:
             return False
 
-    def related(self, component: str) -> Json:
+    def edit_context(self, component: str, expressions: list[str] | None = None, limit: int = 10) -> Json:
+        """A bounded edit packet; observations retain their own invocation and source identities."""
+        self.index.query_options(limit, 0, None)
+        if expressions is not None and (
+            not isinstance(expressions, list)
+            or any(not isinstance(value, str) or not value.strip() for value in expressions)
+        ):
+            raise ValueError("expressions must be a list of nonempty Python expressions")
+        reference = self._resolve(component)
+        definition = self.nodes[reference]["definition"] if reference in self.nodes else reference
+        if not definition:
+            raise LookupError("this captured component has no source definition; edit context is unavailable")
+        scope = self._constructor(definition)
+        declaration = self.index.definition(scope)
+        pages: Json = {}
+
+        def page(name, records, *, render=None):
+            values, pages[name] = self.index.page(
+                records, limit=limit, offset=0, render=render or self.index._compact
+            )
+            return values
+
+        arguments = []
+        observations = []
+        environments = []
+        pending = list(reversed(self._occurrences(reference)))
+        seen = set()
+        invocations = set()
+        while pending:
+            occurrence = pending.pop()
+            if occurrence in seen:
+                continue
+            seen.add(occurrence)
+            node = self.nodes[occurrence]
+            if node["definition"] == scope:
+                for argument in node["record"].get("arguments", []):
+                    arguments.append(
+                        {
+                            "component": occurrence,
+                            "operation": node["runtime_alias"],
+                            "invocation": node.get("observed_invocation"),
+                            **argument,
+                        }
+                    )
+                invocation = node.get("observed_invocation")
+                captured = self._observed(node)
+                if captured and invocation not in invocations:
+                    invocations.add(invocation)
+                    environment = {}
+                    for parameter in captured.get("parameters", []):
+                        values = {parameter["name"]: parameter.get("value")}
+                        values.update(
+                            (parameter["name"] + "." + field, value)
+                            for field, value in parameter.get("fields", {}).items()
+                        )
+                        for expression, value in values.items():
+                            evidence = {
+                                "component": occurrence,
+                                "invocation": invocation,
+                                "owner": scope,
+                                "expression": expression,
+                                "value": value,
+                                "capture": captured["capture"],
+                            }
+                            observations.append(evidence)
+                            environment[scope, expression] = evidence
+                    environments.append((occurrence, invocation, environment))
+            pending.extend(reversed(node["children"]))
+            if node["kind"] == "builder":
+                published = self.aliases.get(f"o{node['record'].get('published_by')}")
+                if published:
+                    pending.append(published)
+        selected = list(
+            dict.fromkeys(
+                expressions
+                if expressions is not None
+                else [
+                    *[
+                        parameter["name"]
+                        for parameter in declaration.get("parameters", [])
+                        if parameter["name"] != "self"
+                    ],
+                    *[observation["expression"] for observation in observations],
+                    *[argument["source"] for argument in arguments if argument.get("source")],
+                ]
+            )
+        )
+
+        def expression_report(expression):
+            static = self.index.follow_parameter(scope, expression, limit=limit)
+            observed, observed_page = self.index.page(
+                (
+                    {
+                        "component": occurrence,
+                        "invocation": invocation,
+                        **self.index.dimension_drivers(scope, expression, observed=environment, limit=limit),
+                    }
+                    for occurrence, invocation, environment in environments
+                ),
+                limit=limit,
+                offset=0,
+            )
+            return {
+                "expression": expression,
+                "static": self.index.dimension_drivers(scope, expression, limit=limit),
+                "observed": observed,
+                "observed_page": observed_page,
+                **{
+                    name: static[name]
+                    for name in ("origins", "dependencies", "consumers", "cycles", "unresolved", "pages")
+                },
+            }
+
+        source_lines = self.trace.get("sources", {}).get(declaration["file"], "").splitlines()
+        source = page(
+            "source",
+            (
+                {"file": declaration["file"], "line": number, "text": source_lines[number - 1]}
+                for number in range(declaration["line"], min(declaration["end_line"], len(source_lines)) + 1)
+            ),
+        )
+        chosen, pages["expressions"] = self.index.page(selected, limit=limit, offset=0)
+        summary = self._summary(reference)
+        if "call_site" in summary:
+            summary["call_site"] = self.index._compact(
+                {key: value for key, value in summary["call_site"].items() if key != "calls"}
+            )
+        return {
+            "part": self.part,
+            "source_revision": self.revision,
+            "component": self.index._compact(summary),
+            "definition": {
+                key: declaration[key]
+                for key in ("reference", "qualified", "kind", "file", "line", "end_line", "source_revision")
+            },
+            "source": source,
+            "parameters": page("parameters", declaration.get("parameters", [])),
+            "arguments": page("arguments", arguments),
+            "observations": page("observations", observations),
+            "direct_consumers": page("direct_consumers", self.index.callers(definition)),
+            "expressions": [expression_report(expression) for expression in chosen],
+            "pages": pages,
+            "source_scope": "captured files only; no live source was read",
+            "value_semantics": (
+                "Static defaults are separate from scoped runtime observations; "
+                "missing observations never fall back to defaults."
+            ),
+        }
+
+    def related(
+        self,
+        component: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        consumers: str | list[str] | None = None,
+        section: str = "summary",
+    ) -> Json:
         reference = self._resolve(component)
         definition = self.nodes[reference]["definition"] if reference in self.nodes else reference
         if not definition:
             raise LookupError("this captured component has no source definition; related-code analysis is unavailable")
         return {
-            **self.index.related(definition),
+            **self.index.related(definition, limit=limit, offset=offset, consumers=consumers, section=section),
             "part": self.part,
             "source_revision": self.revision,
             "component": self.reference(reference),

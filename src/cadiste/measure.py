@@ -28,7 +28,7 @@ from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp
 from OCP.collections import List_TopoDS_Shape
 from OCP.GeomAbs import GeomAbs_CurveType, GeomAbs_SurfaceType
-from OCP.gp import gp_Ax1
+from OCP.gp import gp_Ax1, gp_Trsf
 from OCP.GProp import GProp_GProps
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX
 from OCP.TopExp import TopExp_Explorer
@@ -58,8 +58,10 @@ class MeasureError(Exception):
 
 
 def save(leaves: Sequence[Leaf], file: Path) -> None:
-    """The leaves' faces, edges and vertices, in a zip: an index of the leaves and one binary B-rep (without
-    triangulations) of a compound holding, per leaf, a compound of each list."""
+    """Save placed entities and whole leaf solids, without triangulations.
+
+    Version 2 adds a fourth compound per leaf for the intact solid and its recorded world placement.
+    """
     builder = BRep_Builder()
     root = TopoDS_Compound()
     builder.MakeCompound(root)
@@ -73,11 +75,18 @@ def save(leaves: Sequence[Leaf], file: Path) -> None:
                 builder.Add(part, item)
             builder.Add(root, part)
         present = {topo: items is not None for topo, items in zip(_TOPOS, lists, strict=True)}
-        index.append({"path": leaf.path, **present})
+        whole = TopoDS_Compound()
+        builder.MakeCompound(whole)
+        if leaf.shape is not None:
+            builder.Add(whole, leaf.shape)
+        builder.Add(root, whole)
+        transform = (leaf.location or TopLoc_Location()).Transformation()
+        placement = [transform.Value(row, column) for row in range(1, 4) for column in range(1, 5)]
+        index.append({"path": leaf.path, **present, "solid": leaf.shape is not None, "placement": placement})
     stream = io.BytesIO()
     BinTools.Write_s(root, stream, False, False, BinTools_FormatVersion.BinTools_FormatVersion_CURRENT)
     with zipfile.ZipFile(file, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(_INDEX, json.dumps(index))
+        archive.writestr(_INDEX, json.dumps({"version": 2, "leaves": index}))
         archive.writestr(_SHAPES, stream.getvalue())
 
 
@@ -96,6 +105,20 @@ class Shapes:
     shape's."""
 
     leaves: dict[str, dict[str, list[TopoDS_Shape] | None]]
+    solids: dict[str, TopoDS_Shape | None] = field(default_factory=dict)
+    placements: dict[str, TopLoc_Location] = field(default_factory=dict)
+    whole_available: bool = False
+
+    def solid(self, path: str) -> TopoDS_Shape:
+        """The intact solid in viewer world coordinates; never reconstruct it from numbered faces."""
+        if path not in self.leaves:
+            raise MeasureError(f"{path} is not a whole leaf instance in this build")
+        if not self.whole_available:
+            raise MeasureError("this older shape cache has no whole solids; rebuild with fresh=True before checking")
+        shape = self.solids.get(path)
+        if shape is None:
+            raise MeasureError(f"{path} has no whole solid available for checking")
+        return shape
 
     def entity(self, path: str) -> tuple[str, TopoDS_Shape]:
         """The topology (``face``, ``edge``, ``vertex``) and shape of a viewer component path."""
@@ -116,18 +139,36 @@ class Shapes:
 
 def load(file: Path) -> Shapes:
     with zipfile.ZipFile(file) as archive:
-        index = json.loads(archive.read(_INDEX))
+        metadata = json.loads(archive.read(_INDEX))
         data = archive.read(_SHAPES)
+    whole_available = isinstance(metadata, dict) and metadata.get("version") == 2
+    if isinstance(metadata, dict) and not whole_available:
+        raise MeasureError("unsupported shape cache version; rebuild with fresh=True")
+    index = metadata["leaves"] if whole_available else metadata
     root = TopoDS_Shape()
     BinTools.Read_s(root, io.BytesIO(data))
     lists = _children(root)
     leaves: dict[str, dict[str, list[TopoDS_Shape] | None]] = {}
+    solids: dict[str, TopoDS_Shape | None] = {}
+    placements: dict[str, TopLoc_Location] = {}
+    stride = 4 if whole_available else 3
+    if len(lists) != stride * len(index):
+        raise MeasureError("incomplete shape cache; rebuild with fresh=True")
     for at, entry in enumerate(index):
-        leaves[entry["path"]] = {
-            topo: [_downcast(item) for item in _children(lists[3 * at + k])] if entry[topo] else None
+        path = entry["path"]
+        leaves[path] = {
+            topo: [_downcast(item) for item in _children(lists[stride * at + k])] if entry[topo] else None
             for k, topo in enumerate(_TOPOS)
         }
-    return Shapes(leaves)
+        if whole_available:
+            items = _children(lists[stride * at + 3])
+            if len(items) != int(entry["solid"]):
+                raise MeasureError("incomplete whole-solid cache; rebuild with fresh=True")
+            solids[path] = items[0] if items else None
+            transform = gp_Trsf()
+            transform.SetValues(*entry["placement"])
+            placements[path] = TopLoc_Location(transform)
+    return Shapes(leaves, solids, placements, whole_available)
 
 
 def _mass(shape: TopoDS_Shape, *, area: bool) -> float:

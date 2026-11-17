@@ -12,6 +12,7 @@ interface Props {
   data: AssemblyData;
   /** The project's parts, in its order: the Parts tab lists those the assembly has instances of in this order. */
   parts: string[];
+  variant: string | null;
   hiddenParts: ReadonlySet<string>;
   hiddenInstances: ReadonlySet<string>;
   soloPart: string | null;
@@ -35,7 +36,7 @@ const TABS = ["parts", "instances"] as const;
 
 /** An assembly's sidebar: its parts (every instance of each at once) or its instances as built. */
 export function AssemblyPane(props: Props) {
-  const { name, data, parts, hiddenParts, hiddenInstances, instance, marked, selectedPaths, selectedParts, onVisibility, onPartVisibility, onSelectInstance, onSelectPart } = props;
+  const { name, data, parts, variant, hiddenParts, hiddenInstances, instance, marked, selectedPaths, selectedParts, onVisibility, onPartVisibility, onSelectInstance, onSelectPart } = props;
   const { onHover, onOpen } = props;
   const { soloPart, soloInstance, onSoloPart, onSoloInstance } = props;
   const [tab, setTab] = usePersistentChoice("cadiste.assembly-tab", TABS);
@@ -44,14 +45,15 @@ export function AssemblyPane(props: Props) {
   const root = data.scene.data.shapes;
   const leaves = useMemo(() => shapeLeaves(root), [root]);
   const hiddenHere = leaves.filter((leaf) => hidden.has(leaf.id)).length;
+  const matched = leaves.filter((leaf) => data.scene.part_of?.[leaf.id] !== undefined).length;
+  const unmatched = leaves.filter((leaf) => data.scene.part_of?.[leaf.id] === undefined);
   const openable = useMemo(() => new Set(parts), [parts]);
+  const placement = instance === null ? undefined : data.scene.instances?.[instance]?.placement;
   return (
-    <div className="assembly-pane">
-      <div className="assembly-pane-head">
-        <Icon name="assembly" className="builder-icon" />
-        <span className="assembly-pane-title">{name}</span>
+    <div className="assembly-pane" aria-label={`${variant === null ? name : name.slice(variant.length + 1)} contents`}>
+      <div className="sidebar-section-meta">
         <span className="part-status">
-          {leaves.length} instances{hiddenHere > 0 && ` · ${hiddenHere} hidden`}
+          {matched}/{leaves.length} matched{hiddenHere > 0 && ` · ${hiddenHere} hidden`}
         </span>
         {hiddenHere > 0 && (
           <button className="link show-all" onClick={() => showAll(leaves.map((leaf) => leaf.id), true)}>
@@ -72,10 +74,33 @@ export function AssemblyPane(props: Props) {
           </button>
         ))}
       </div>
+      {matched < leaves.length && (
+        <details className="assembly-note">
+          <summary>{unmatched.length} unmatched instance(s)</summary>
+          <p>{data.scene.part_of === undefined
+            ? "Ownership is unavailable: configure parts or annotate model instances with cadiste.assembly.instance(..., part=...)."
+            : matched === 0
+              ? "No ownership matches. Freshly rebuilt shapes do not share topology; use explicit instance ownership. Labels and geometric resemblance are not ownership evidence."
+              : "Partial ownership mapping: unmatched instances have no unique source evidence. Use explicit instance ownership."}</p>
+          <ul>{unmatched.map((leaf) => <li key={leaf.id}>{leaf.id}</li>)}</ul>
+        </details>
+      )}
+      {instance !== null && (
+        <details className="assembly-note">
+          <summary>Selected instance placement source</summary>
+          {placement ? <>
+            <p>{placement.site.file}:{placement.site.line}</p>
+            <p>Placement code: {placement.reference ?? "stable reference unavailable"}</p>
+            <pre>{placement.code ?? "Call expression unavailable"}</pre>
+            <p>Owning-part source is separate; use Open on its mapped part.</p>
+          </> : <p>No explicit helper or safely traceable ordinary placement call was captured for this instance.</p>}
+        </details>
+      )}
       {tab === "parts" ? (
         <AssemblyParts
           data={data}
           parts={parts}
+          variant={variant}
           hidden={hiddenParts}
           solo={soloPart}
           onSolo={onSoloPart}
@@ -97,6 +122,7 @@ export function AssemblyPane(props: Props) {
           onSelect={onSelectInstance}
           onHover={onHover}
           openable={openable}
+          partOf={data.scene.part_of}
           onOpen={onOpen}
         />
       )}
@@ -107,6 +133,7 @@ export function AssemblyPane(props: Props) {
 interface PartsProps {
   data: AssemblyData;
   parts: string[];
+  variant: string | null;
   hidden: ReadonlySet<string>;
   solo: string | null;
   onSolo: (part: string) => void;
@@ -118,7 +145,7 @@ interface PartsProps {
 }
 
 /** The assembly's parts, each with its instances: hide or show them all, light them all, open the part. */
-function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marked, onVisibility, onSelect, onOpen }: PartsProps) {
+function AssemblyParts({ data, parts, variant, hidden, solo, onSolo, selectedParts, marked, onVisibility, onSelect, onOpen }: PartsProps) {
   const [filter, setFilter] = useState("");
   const list = useRef<HTMLUListElement>(null);
   const anchor = useRef<string | null>(null);
@@ -142,7 +169,8 @@ function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marke
     );
   }
   const needle = filter.trim().toLowerCase();
-  const shown = instances.filter(({ part }) => part.toLowerCase().includes(needle));
+  const shown = instances.filter(({ part }) =>
+    (variant === null ? part : part.slice(variant.length + 1)).toLowerCase().includes(needle));
   const choose = (part: string, event: SelectionModifiers) => {
     const from = shown.findIndex((row) => row.part === anchor.current);
     const to = shown.findIndex((row) => row.part === part);
@@ -178,6 +206,7 @@ function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marke
           const visible = showing > 0;
           const selected = selectedParts.includes(part);
           const soloed = solo === part;
+          const label = variant === null ? part : part.slice(variant.length + 1);
           return (
             <li key={part} role="presentation">
               <div
@@ -200,9 +229,9 @@ function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marke
                 </button>
                 <button
                   className={soloed ? "eye solo active" : "eye solo"}
-                  aria-label={`Solo ${part}`}
+                  aria-label={`Solo ${label}`}
                   aria-pressed={soloed}
-                  title={soloed ? "Disable solo; restore eye settings" : `Solo ${part}: show only its instances`}
+                  title={soloed ? "Disable solo; restore eye settings" : `Solo ${label}: show only its instances`}
                   onClick={(event) => {
                     event.stopPropagation();
                     onSolo(part);
@@ -210,11 +239,11 @@ function AssemblyParts({ data, parts, hidden, solo, onSolo, selectedParts, marke
                 >
                   <Icon name="solo" />
                 </button>
-                <span className={visible ? "title" : "title muted"}>{part}</span>
+                <span className={visible ? "title" : "title muted"}>{label}</span>
                 <span className="count">×{leaves.length}</span>
                 <button
                   className="open-part"
-                  title={`Open ${part}: its features, sketches and source`}
+                  title={`Open ${label}: its features, sketches and source`}
                   onClick={(event) => {
                     event.stopPropagation();
                     onOpen(part);

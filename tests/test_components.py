@@ -319,6 +319,8 @@ def test_mcp_discovery_and_structured_results_use_the_same_headless_navigation(t
     tools = {tool.name: tool for tool in discovered}
     assert {"walk_components", "inspect_component", "follow_parameter", "find_related_components"} <= tools.keys()
     assert tools["walk_components"].input_schema["properties"]["depth"]["maximum"] == 8
+    for name in ("follow_parameter", "find_related_components"):
+        assert {"limit", "offset", "consumers", "section"} <= tools[name].input_schema["properties"].keys()
     result = bridge.call("test", "inspect_component", {"part": "Part", "component": "g1"})
     assert isinstance(result, CallToolResult)
     assert result.structured_content["definition"]["reference"] == code_ref("model.py", "pocket")
@@ -420,3 +422,68 @@ class Inner:
     assert root["children"][0]["label"] == "Inner"
     assert model.inspect("b0")["invocations"][0]["call_stack"][0]["function"] == "dispatch"
     assert model.inspect(root["reference"])["invocations"][0]["call_stack"][0]["function"] == "dispatch"
+
+
+def test_runtime_parameter_values_share_bounded_pages_and_exact_consumer_filter():
+    trace = _trace()
+    trace["ops"][0]["arguments"] = [
+        {"name": f"dimension_{i}", "source": "spec.wall", "value": str(i)} for i in range(75)
+    ]
+    model = CodeModel(trace, "Part")
+    result = model.follow_parameter("g1", "spec.wall", limit=5)
+    page = result["pages"]["captured_operation_values"]
+    assert page["returned"] == len(result["captured_operation_values"]) == 5
+    assert page["total"] == 76 and page["omitted"] == 71
+    assert page["next_offset"] == 5
+    values = []
+    offset = 0
+    while True:
+        expanded = model.follow_parameter(
+            "g1", "spec.wall", section="captured_operation_values", offset=offset, limit=10
+        )
+        values.extend(expanded["captured_operation_values"])
+        assert "origins" not in expanded
+        assert expanded["source_revision"] == model.revision
+        offset = expanded["pages"]["captured_operation_values"]["next_offset"]
+        if offset is None:
+            break
+    assert len(values) == 76
+    assert {item["name"] for item in values} == {f"dimension_{i}" for i in range(75)} | {"amount"}
+    filtered = model.follow_parameter("g1", "spec.wall", consumers=[])
+    assert filtered["captured_operation_values"] == filtered["observed_parameter_values"] == []
+    assert filtered["origins"]
+    scope = code_ref("model.py", "pocket")
+    assert (
+        model.follow_parameter("g1", "spec.wall", consumers=scope)["pages"]["captured_operation_values"]["total"] == 76
+    )
+
+
+def test_parent_walk_does_not_inherit_related_query_page_limit():
+    source = "def helper():\n    return 1\n"
+    source += "".join(f"def caller_{i}():\n    return helper()\n" for i in range(35))
+    model = CodeModel({"sources": {"model.py": source}}, "Part")
+    related = model.related("helper")
+    assert related["pages"]["callers"]["total"] == 35
+    assert len(related["callers"]) == 20
+    walked = model.walk("helper", direction="parents", depth=1)["nodes"][0]["parents"]
+    assert len(walked) == 35
+
+
+def test_parameter_agent_pages_keep_revision_guard_and_filters_headless(tmp_path: Path):
+    agent, _, trace = _agent(tmp_path)
+    arguments = {
+        "part": "Part",
+        "component": "g1",
+        "expression": "spec.wall",
+        "revision": trace["source_revision"],
+        "limit": 1,
+        "section": "consumers",
+        "consumers": [],
+    }
+    answer = agent.call("unlinked", "follow_parameter", arguments)
+    assert answer.data is not None
+    assert answer.data["source_revision"] == trace["source_revision"]
+    assert answer.data["pages"]["consumers"]["limit"] == 1
+    assert answer.data["pages"]["consumers"]["total"] == 0
+    with pytest.raises(ToolError, match="source revision mismatch"):
+        agent.call("unlinked", "follow_parameter", {**arguments, "revision": "stale"})

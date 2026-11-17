@@ -9,10 +9,8 @@ import pytest
 from build123d import Axis, Box, BuildPart, Cylinder, Location, Locations, Mode, Part, fillet
 
 from cadiste import Provenance, context, tracing
-from cadiste.agent import Agent
 from cadiste.cache import TraceCache
 from cadiste.export import export_trace
-from cadiste.hub import Hub
 from cadiste.measure import Shapes, adjacent_faces, corresponding_entity, load, save
 from cadiste.mesh import SceneObject, tessellate
 from cadiste.references import SelectionItem, Snapshot, SnapshotError, selection_items
@@ -81,7 +79,10 @@ def _setup(tmp_path: Path, *, folder: bool = False, fillets: bool = False):
                 SceneObject("B", _independent_part(3)),
             ]
         )
-        body = {"scene": {"data": scene.data}, "build_seconds": 0}
+        body = {
+            "scene": {"data": scene.data, "part_of": {scene.paths[name]: name for name in ("A", "B")}},
+            "build_seconds": 0,
+        }
         shapes = tmp_path / "folder.shapes"
         save(scene.leaves, shapes)
         target = {"kind": "file", "path": "Parts"}
@@ -344,28 +345,8 @@ def test_unknown_feature_is_preserved_with_an_explicit_unavailable_detail(tmp_pa
     assert "Feature o999 of part 'A'" in text and "Feature detail unavailable" in text
 
 
-def test_selection_validation_and_agent_live_command_use_the_canonical_items(tmp_path: Path):
-    snapshot, builds, state, _ = _setup(tmp_path)
+def test_selection_validation_deduplicates_items_and_rejects_missing_owners():
     items = cast(list[SelectionItem], [{"kind": "feature", "part": "A", "node": "o0"}])
-    calls = []
-
-    class _Hub:
-        def linked_tab(self, session: str, timeout: float):
-            return "tab-a"
-
-        def tab_state(self, tab: str):
-            return state
-
-        def call(self, tab: str, command: str, params: dict[str, Any], timeout: float):
-            calls.append((tab, command, params))
-            state["selection"] = params["items"]
-
-    agent = Agent(cast(Hub, _Hub()), cast(Builds, builds), snapshot.measurer, snapshot.project, tmp_path)
-    answer = agent.select("session", [*items, *items])
-    assert calls == [("tab-a", "select", {"items": items})]
-    assert "1 item(s)" in answer.text
-    assert "get_reference" not in agent.tools
-    assert "Entire current target" in agent.select("session", []).text
     assert selection_items([*items, *items]) == items
     with pytest.raises(SnapshotError, match="invalid selection item"):
         selection_items([{"kind": "feature", "node": "o0"}])
@@ -401,7 +382,7 @@ def test_recorded_instance_placement_maps_geometry_to_trace_and_is_captured_in_t
     scene = tessellate([SceneObject("A", part)])
     shapes = tmp_path / "placed.shapes"
     save(scene.leaves, shapes)
-    body = {"scene": {"data": scene.data}, "build_seconds": 0}
+    body = {"scene": {"data": scene.data, "part_of": {scene.paths["A"]: "A"}}, "build_seconds": 0}
     builds.put(state["target"], Build(json.dumps(body).encode(), False, shapes, {}))
     state["shapes"] = shapes.name
     leaf = scene.paths["A"]

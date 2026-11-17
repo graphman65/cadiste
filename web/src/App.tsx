@@ -11,6 +11,8 @@ import {
   fetchProject,
   fetchTrace,
   listenBuilds,
+  fetchBaselineScene,
+  type BaselineEntry,
   TraceFailure,
 } from "./api";
 import { AssemblyPane } from "./components/AssemblyPane";
@@ -20,13 +22,20 @@ import { FeatureHover, InstanceHover } from "./components/HoverCard";
 import { FeatureTree } from "./components/FeatureTree";
 import { FileFeatures } from "./components/FileFeatures";
 import { ExportMenu } from "./components/ExportMenu";
+import { BaselineReview } from "./components/BaselineReview";
+import { CheckReview, type ExactCheckReport } from "./components/CheckReview";
+import { WorkflowTools } from "./components/WorkflowTools";
 import { Icon } from "./components/Icon";
 import { LinkRequests, LinkedSessions } from "./components/Link";
 import { PartList } from "./components/PartList";
 import { Splitter } from "./components/Splitter";
 import { SimulationControls } from "./components/SimulationControls";
+import { SnapshotCopy, type SnapshotCopyState } from "./components/SnapshotCopy";
 import { Timeline } from "./components/Timeline";
-import type { SavedViewState } from "./components/SavedViews";
+import { ProjectLauncher } from "./components/ProjectLauncher";
+import { RuntimeInfo } from "./components/RuntimeInfo";
+import { SolidCheck } from "./components/SolidCheck";
+import { editSavedViews, type SavedViewState } from "./components/SavedViews";
 import { ViewBar } from "./components/ViewBar";
 import { useHub } from "./hub";
 import {
@@ -48,9 +57,18 @@ import {
 import { usePersistentFlag, usePersistentNumber } from "./persist";
 import { useLiveSimulation } from "./simulation";
 import { updateSelection, type SelectionMode } from "./selection";
-import type { AssemblyData, HubCalls, HubRequest, Project, SceneData, SelectionItem, ShapeNode, TabState, TraceData } from "./types";
+import type { AssemblyData, BuildIdentity, CaptureArrangement, HubCalls, HubRequest, Project, SceneData, SelectionItem, ShapeNode, TabState, TraceData } from "./types";
 
 const NO_NODES: ReadonlySet<string> = new Set();
+const CAPTURE_MODE = new URLSearchParams(window.location.search).get("capture") === "1";
+const HARNESS_MODE = new URLSearchParams(window.location.search).get("harness") === "1";
+
+declare global {
+  interface Window {
+    cadisteCapture?: { protocol: string; call: (request: HubRequest) => Promise<unknown>; inspect: () => Record<string, unknown> };
+    cadisteRenderer?: { inspect: () => Record<string, unknown> };
+  }
+}
 
 /** Whether a part's folder is `path` or under it. */
 function inFolder(project: Project, part: string, path: string): boolean {
@@ -66,7 +84,7 @@ function folderParts(project: Project | null, path: string): string[] {
 /** A part's trace and its leaf in a file's scene, when the leaf has the trace's faces (the same build of it). */
 function partInFile(data: AssemblyData, traces: Record<string, Load<TraceData>>, part: string) {
   const load = traces[part];
-  const leaf = leafOfPart(data.scene.data.shapes, part);
+  const leaf = leafOfPart(data.scene.data.shapes, part, data.scene.part_of);
   if (load?.status !== "ok" || leaf === null) return null;
   if (data.source_fingerprint !== undefined && load.data.source_fingerprint !== undefined &&
     data.source_fingerprint !== load.data.source_fingerprint) return null;
@@ -108,39 +126,38 @@ function keyOf(target: Target): string {
   return target.name;
 }
 
-/** Keep an available target, otherwise open the first assembly or part in the refreshed catalog. */
-function targetIn(project: Project, current: Target | null): Target | null {
-  if (current?.kind === "assembly" && project.assemblies.includes(current.name)) return current;
-  if (current?.kind === "part" && project.parts.includes(current.name)) return current;
-  if (current?.kind === "file" && project.parts.some((part) => inFolder(project, part, current.path))) return current;
-  if (project.assemblies.length > 0) return { kind: "assembly", name: project.assemblies[0] };
-  return project.parts.length > 0 ? { kind: "part", name: project.parts[0] } : null;
+/** Infer the catalog from any target, including a hash or a private capture, before using the default. */
+function variantIn(project: Project, target: Target | null): string | null {
+  const variants = project.variants ?? [];
+  const identity = target?.kind === "file" ? target.path : target?.name;
+  return variants.find(({ id }) => identity?.startsWith(`${id}/`) || target?.kind === "file" && identity === id)?.id
+    ?? variants.find(({ id }) => id === project.default_variant)?.id
+    ?? variants[0]?.id
+    ?? null;
+}
+
+function catalogIn(project: Project, variant: string | null) {
+  if (variant === null) return { parts: project.parts, assemblies: project.assemblies };
+  const prefix = `${variant}/`;
+  return {
+    parts: project.parts.filter((name) => name.startsWith(prefix)),
+    assemblies: project.assemblies.filter((name) => name.startsWith(prefix)),
+  };
+}
+
+/** Keep an available target, otherwise stay within its inferred (or default) catalog. */
+function targetIn(project: Project, current: Target | null, variant = variantIn(project, current)): Target | null {
+  const catalog = catalogIn(project, variant);
+  if (current?.kind === "assembly" && catalog.assemblies.includes(current.name)) return current;
+  if (current?.kind === "part" && catalog.parts.includes(current.name)) return current;
+  if (current?.kind === "file" && catalog.parts.some((part) => inFolder(project, part, current.path))) return current;
+  if (catalog.assemblies.length > 0) return { kind: "assembly", name: catalog.assemblies[0] };
+  return catalog.parts.length > 0 ? { kind: "part", name: catalog.parts[0] } : null;
 }
 
 function failed(error: unknown): { status: "error"; error: string; log?: string } {
   const failure = error instanceof TraceFailure ? error : new TraceFailure(String(error));
   return { status: "error", error: failure.message, log: failure.log };
-}
-
-/**
- * The clipboard API needs a secure context (localhost is one) and may still refuse (a page without focus, a browser's
- * permission policy): then the old select-and-copy way.
- */
-async function copyText(text: string): Promise<void> {
-  if (window.isSecureContext && navigator.clipboard !== undefined) {
-    try {
-      return await navigator.clipboard.writeText(text);
-    } catch {
-      // refused: try the other way
-    }
-  }
-  const area = document.createElement("textarea");
-  area.value = text;
-  document.body.append(area);
-  area.select();
-  const copied = document.execCommand("copy");
-  area.remove();
-  if (!copied) throw new Error("the browser refused to copy");
 }
 
 /** A failed refresh must not take a usable scene (or its trace) away. */
@@ -156,6 +173,8 @@ function stopLoading<T>(all: Record<string, Load<T>>, name: string): Record<stri
   return previous?.status === "ok" && previous.refreshing
     ? { ...all, [name]: { ...previous, refreshing: false } } : all;
 }
+
+
 
 /** A load's outcome: the scene to render, or why there is none. */
 type Loaded = { status: "ok"; scene: SceneData; build_id: string } | { status: "error"; error: string; log?: string };
@@ -225,9 +244,27 @@ export function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [refreshingProject, setRefreshingProject] = useState(false);
-  const [target, setTarget] = useState<Target | null>(targetFromHash);
+  const [target, setTarget] = useState<Target | null>(() => CAPTURE_MODE ? null : targetFromHash());
+  const comparisonBusy = useRef(false);
+  const [comparisonActive, setComparisonActive] = useState(false);
+  const [sceneOverride, setSceneOverride] = useState<SceneData | null>(null);
+  const [comparisonReview, setComparisonReview] = useState<{
+    baseline: { id: string; name?: string; image: string; build_id?: string };
+    current: { image: string; build_id?: string };
+  } | null>(null);
+  const [workflowReport, setWorkflowReport] = useState<Record<string, unknown> | null>(null);
+  const downloadTimings = useRef(new Map<string, number>());
+  const activeVariant = project === null ? null : variantIn(project, target);
+  const catalog = useMemo(
+    () => project === null ? { parts: [], assemblies: [] } : catalogIn(project, activeVariant),
+    [project, activeVariant],
+  );
   const { live: simulation, enable: enableSimulation, disable: disableSimulation } = useLiveSimulation(target?.kind === "assembly" ? target : null);
   const [savedView, setSavedView] = useState<SavedViewState | null>(null);
+  const [assemblyReturn, setAssemblyReturn] = useState<{
+    target: Extract<Target, { kind: "assembly" }>;
+    view: SavedViewState | null;
+  } | null>(null);
   const [traces, setTraces] = useState<Record<string, Load<TraceData>>>({});
   const [assemblies, setAssemblies] = useState<Record<string, Load<AssemblyData>>>({});
   const [files, setFiles] = useState<Record<string, Load<AssemblyData>>>({});
@@ -242,6 +279,7 @@ export function App() {
   const [hiddenParts, setHiddenParts] = useState<ReadonlySet<string>>(new Set());
   const [soloPart, setSoloPart] = useState<string | null>(null);
   const [soloInstance, setSoloInstance] = useState<string | null>(null);
+  const [visibilityTarget, setVisibilityTarget] = useState<string | null>(null);
   const [instance, setInstance] = useState<string | null>(null);
   // In an assembly's view, the part whose instances are all lit.
   const [litPart, setLitPart] = useState<string | null>(null);
@@ -256,7 +294,7 @@ export function App() {
     fetchProject()
       .then((loaded) => {
         setProject(loaded);
-        setTarget((current) => targetIn(loaded, current));
+        if (!CAPTURE_MODE && !loaded.workspace_only) setTarget((current) => targetIn(loaded, current));
       })
       .catch((error: unknown) => setProjectError(String(error)));
   }, []);
@@ -284,6 +322,7 @@ export function App() {
   const [watchError, setWatchError] = useState<string | null>(null);
   const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const load = useCallback((what: Target, mode: BuildMode = "cached"): Promise<Loaded> => {
+    const startedAt = performance.now();
     if (what.kind === "part" && mode === "cached") {
       const pending = traceLoads.current.get(what.name);
       if (pending !== undefined) return pending;
@@ -308,7 +347,7 @@ export function App() {
       if (loadVersions.current.get(key) !== version) return false;
       pendingLoads.current.delete(key);
       // An exact download started in CAD may finish after simulation was enabled.
-      if (typeof mode === "object" && context.current.simulation) {
+      if (typeof mode === "object" && context.current.simulation && !CAPTURE_MODE) {
         attemptedIds.current.delete(key);
         pauseLoad(what);
         return false;
@@ -360,12 +399,13 @@ export function App() {
         if (traceLoads.current.get(name) === loading) traceLoads.current.delete(name);
       });
     }
+    void loading.then(() => downloadTimings.current.set(key, performance.now() - startedAt));
     void loading.finally(() => reconcileBuilds.current());
     return loading;
   }, [pauseLoad]);
 
   const applyReady = useCallback(() => {
-    if (context.current.simulation) return;
+    if (CAPTURE_MODE || context.current.simulation || comparisonBusy.current) return;
     for (const [key, entry] of readyBuilds.current) {
       const id = entry.build_id;
       if (entry.status !== "ready" || id === undefined || !requested.current.has(key) ||
@@ -384,11 +424,13 @@ export function App() {
       catalogFingerprint.current = snapshot.fingerprint;
       const catalog = snapshot.project;
       const previous = context.current.project;
-      if (previous !== null && JSON.stringify([previous.parts, previous.folders, previous.assemblies]) !==
-        JSON.stringify([catalog.parts, catalog.folders, catalog.assemblies])) {
+      if (previous !== null) {
         const updated = { ...previous, ...catalog };
-        setProject(updated);
-        setTarget((current) => targetIn(updated, current));
+        if (JSON.stringify([previous.parts, previous.folders, previous.assemblies, previous.variants, previous.default_variant]) !==
+          JSON.stringify([updated.parts, updated.folders, updated.assemblies, updated.variants, updated.default_variant])) {
+          setProject(updated);
+          setTarget((current) => targetIn(updated, current));
+        }
       }
     }
     readyBuilds.current.clear();
@@ -411,7 +453,7 @@ export function App() {
   }, [applyReady, pauseLoad]);
 
   const targetKey = target === null ? null : keyOf(target);
-  const watching = project !== null;
+  const watching = project !== null && !project.workspace_only && !CAPTURE_MODE;
   useEffect(() => {
     if (!watching) return;
     setConnection("connecting");
@@ -422,6 +464,34 @@ export function App() {
     applyReady();
   }, [simulation.enabled, applyReady]);
   const view = useRef<CadViewHandle>(null);
+  const navigate = (next: Target) => {
+    if (target?.kind === "assembly" && next.kind === "part") {
+      const captured = view.current?.capture() ?? null;
+      setAssemblyReturn({
+        target,
+        view: captured !== null && keyOf(captured.target) === keyOf(target) ? captured : null,
+      });
+    }
+    setTarget(next);
+  };
+  const selectVariant = (variant: string) => {
+    if (project === null || variant === activeVariant) return;
+    const identity = target?.kind === "file" ? target.path : target?.name;
+    const local = identity === undefined ? null
+      : activeVariant === null ? identity : identity === activeVariant ? "" : identity.slice(activeVariant.length + 1);
+    const qualified = local === null ? null : local === "" ? variant : `${variant}/${local}`;
+    const candidate: Target | null = qualified === null || target === null ? null
+      : target.kind === "file" ? { kind: "file", path: qualified } : { kind: target.kind, name: qualified };
+    disableSimulation();
+    setSavedView(null);
+    setAssemblyReturn(null);
+    setTarget(targetIn(project, candidate, variant));
+  };
+  const returnToAssembly = () => {
+    if (assemblyReturn === null) return;
+    setSavedView(assemblyReturn.view);
+    setTarget(assemblyReturn.target);
+  };
   const clearSelection = useCallback(() => {
     setSelection([]);
     setSelected(null);
@@ -431,9 +501,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (target?.kind !== "part" || project !== null && assemblyReturn !== null &&
+      variantIn(project, assemblyReturn.target) !== activeVariant) setAssemblyReturn(null);
+    setHiddenInstances(new Set());
     setHiddenParts(new Set());
     setSoloPart(null);
     setSoloInstance(null);
+    setVisibilityTarget(target === null ? null : keyOf(target));
     if (target === null || (target.kind === "assembly" && target.name === "")) return;
     window.history.replaceState(null, "", hashOf(target));
     setSelected(null);
@@ -441,7 +515,6 @@ export function App() {
     setCollapsedBy({});
     setFocusPart(null);
     setHover(null);
-    setHiddenInstances(new Set());
     setInstance(null);
     setLitPart(null);
     view.current?.highlight([]);
@@ -454,6 +527,7 @@ export function App() {
   );
   useEffect(() => {
     // A file's view lists every part's features: their traces, cached once made.
+    if (CAPTURE_MODE) return;
     for (const name of fileParts) if (!requested.current.has(name)) load({ kind: "part", name });
   }, [fileParts, load]);
 
@@ -474,6 +548,7 @@ export function App() {
   );
   useEffect(() => {
     if (target?.kind !== "assembly") return;
+    if (CAPTURE_MODE) return;
     for (const name of selectedParts) if (!requested.current.has(name)) void load({ kind: "part", name });
   }, [target, selectedParts, load]);
   const index = useMemo(() => trace === null ? null : treeIndex(trace), [trace]);
@@ -486,8 +561,8 @@ export function App() {
     if (assemblyData === null || (soloPart === null && soloInstance === null && hiddenParts.size === 0)) return hiddenInstances;
     const root = assemblyData.scene.data.shapes;
     const leaves = shapeLeaves(root);
-    const partLeaves = soloPart === null ? null : new Set(leaves.filter((leaf) => target?.kind === "file"
-      ? leaf.name === soloPart : assemblyData.scene.part_of?.[leaf.id] === soloPart).map((leaf) => leaf.id));
+    const partLeaves = soloPart === null ? null : new Set(leaves.filter((leaf) =>
+      (assemblyData.scene.part_of?.[leaf.id] ?? (target?.kind === "file" ? leaf.name : null)) === soloPart).map((leaf) => leaf.id));
     const node = soloInstance === null ? undefined : findShape(root, soloInstance);
     const instanceLeaves = node === undefined ? null : new Set(shapeLeaves(node).map((leaf) => leaf.id));
     return new Set(leaves.filter((leaf) => {
@@ -678,13 +753,34 @@ export function App() {
   };
 
   /** In a file's view, each part's leaf: its visibility is the part's. */
-  const leafOf = (part: string) => (assemblyData === null ? null : leafOfPart(assemblyData.scene.data.shapes, part));
-  // In a file's view, the parts its eyes leave shown, when some are hidden: the ones Export writes.
-  const shownParts = fileParts.filter((part) => {
-    const leaf = leafOf(part);
-    return leaf === null || !effectiveHidden.has(leaf);
-  });
-  const exportShown = shownParts.length < fileParts.length ? { parts: shownParts, of: fileParts.length } : null;
+  const leafOf = (part: string) => (assemblyData === null ? null
+    : leafOfPart(assemblyData.scene.data.shapes, part, assemblyData.scene.part_of));
+  // Use only paths in this target's loaded scene, after its visibility reset has committed.
+  const exportReady = target?.kind === "part" || (
+    target !== null && assemblyData !== null && visibilityTarget === keyOf(target)
+  );
+  const exportShown = useMemo(() => {
+    if (target === null || target.kind === "part" || assemblyData === null || !exportReady) return null;
+    const root = assemblyData.scene.data.shapes;
+    const hidden: string[] = [];
+    const hiddenLeaves = new Set<string>();
+    const collect = (node: ShapeNode) => {
+      if (effectiveHidden.has(node.id)) {
+        hidden.push(node.id);
+        for (const leaf of shapeLeaves(node)) hiddenLeaves.add(leaf.id);
+      } else {
+        node.parts?.forEach(collect);
+      }
+    };
+    collect(root);
+    const leaves = shapeLeaves(root);
+    return {
+      hidden,
+      visible: leaves.length - hiddenLeaves.size,
+      of: leaves.length,
+      unit: target.kind === "file" ? "parts" as const : "instances" as const,
+    };
+  }, [target, assemblyData, effectiveHidden, exportReady]);
 
   // A call waits until what it changed is committed and the view's effects ran: the next render's effects.
   const committing = useRef<(() => void)[]>([]);
@@ -700,15 +796,125 @@ export function App() {
   );
 
   // The hub's calls read these: this render's, still current once a call has waited for a load or a render.
-  const live = useRef({ target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation });
-  live.current = { target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation };
+  const live = useRef({
+    target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation, state,
+    hiddenParts, hiddenInstances, soloPart, soloInstance, effectiveHidden, background, connection, watchError,
+  });
+  live.current = {
+    target, index, assemblyData, selectIn, onPick, project, traces, selection, simulation, state,
+    hiddenParts, hiddenInstances, soloPart, soloInstance, effectiveHidden, background, connection, watchError,
+  };
+  const inspectCurrent = useCallback((): Record<string, unknown> => {
+    const current = live.current;
+    const renderer = view.current?.inspect();
+    return {
+      ...renderer,
+      phase: renderer?.phase ?? "mounting",
+      ready: renderer?.ready === true && current.state?.status === "ok" && !current.simulation.enabled && !comparisonBusy.current,
+      target: current.target, build_id: current.state?.status === "ok" ? current.state.data.build_id : null,
+      status: current.state?.status ?? "none", selection: current.selection, hidden: [...current.effectiveHidden],
+      visibility_layers: {
+        ...renderer?.visibility_layers,
+        parts: { hidden: [...current.hiddenParts], solo: current.soloPart },
+        instances: { hidden: [...current.hiddenInstances], solo: current.soloInstance },
+        hidden_parts: [...current.hiddenParts], hidden_instances: [...current.hiddenInstances],
+        solo_part: current.soloPart, solo_instance: current.soloInstance, effective_hidden: [...current.effectiveHidden],
+      },
+      background: current.background, connection: current.connection, watch_error: current.watchError,
+      download_ms: current.target === null ? null : downloadTimings.current.get(keyOf(current.target)) ?? null,
+    };
+  }, []);
 
-  const handleHub = useCallback(
+  const compareBaseline = async (baseline: BaselineEntry) => {
+    const handle = view.current;
+    const current = live.current;
+    if (comparisonBusy.current || handle === null || current.target === null || current.state?.status !== "ok") {
+      throw new Error("Wait for the current build to finish rendering");
+    }
+    const target = current.target;
+    const buildId = current.state.data.build_id;
+    const original = current.state.data.scene.data;
+    const saved = handle.capture();
+    if (saved === null) throw new Error("No rendered camera is available");
+    const guard = () => {
+      if (live.current.target === null || keyOf(live.current.target) !== keyOf(target) ||
+        live.current.state?.status !== "ok" || live.current.state.data.build_id !== buildId ||
+        view.current?.identity !== handle.identity) {
+        throw new Error("Target or build changed during comparison; images discarded");
+      }
+    };
+    comparisonBusy.current = true;
+    setComparisonActive(true);
+    try {
+      const pinned = await fetchBaselineScene(baseline.id, target);
+      guard();
+      await handle.rendered(original);
+      const currentImages = await handle.screenshot(["current"]);
+      guard();
+      setSceneOverride(pinned.data.scene.data);
+      await afterCommit();
+      await handle.rendered(pinned.data.scene.data);
+      handle.restore(saved);
+      await afterCommit();
+      const baselineImages = await handle.screenshot(["current"]);
+      guard();
+      if (!currentImages[0] || !baselineImages[0]) throw new Error("Comparison capture returned no image");
+      setComparisonReview({
+        baseline: { id: baseline.id, name: baseline.name ?? undefined, image: baselineImages[0].data, build_id: pinned.data.build_id },
+        current: { image: currentImages[0].data, build_id: buildId },
+      });
+    } finally {
+      setSceneOverride(null);
+      await afterCommit();
+      if (view.current?.identity === handle.identity && live.current.target !== null && keyOf(live.current.target) === keyOf(target) &&
+        live.current.state?.status === "ok" && live.current.state.data.build_id === buildId) {
+        await handle.rendered(original);
+        handle.restore(saved);
+        await afterCommit();
+      }
+      comparisonBusy.current = false;
+      setComparisonActive(false);
+      reconcileBuilds.current();
+    }
+  };
+
+  const executeHub = useCallback(
     async (request: HubRequest): Promise<unknown> => {
+      if (request.method === "inspect") return inspectCurrent();
       if (live.current.simulation.enabled) throw new Error("Live simulation is enabled. Return to CAD view before using CAD harness actions, exact measurements or snapshots.");
       const viewer = () => {
         if (view.current === null) throw new Error("Nothing is rendered");
         return view.current;
+      };
+      const params = request.params as Record<string, unknown>;
+      const identity = (): BuildIdentity => {
+        const current = live.current;
+        if (current.target === null || current.state?.status !== "ok" || !current.state.data.build_id) throw new Error("No exact target/build is rendered");
+        return { target: current.target, build_id: current.state.data.build_id,
+          source_revision: current.state.data.source_revision, source_fingerprint: current.state.data.source_fingerprint };
+      };
+      const guard = (expected: BuildIdentity) => {
+        const current = identity();
+        if (keyOf(current.target) !== keyOf(expected.target) || current.build_id !== expected.build_id) {
+          throw new Error(`Renderer navigation/build changed: expected ${JSON.stringify(expected)}, showing ${JSON.stringify(current)}; request discarded`);
+        }
+      };
+      if (request.method !== "open" && request.method !== "capture") {
+        if (params.expected === undefined) throw new Error("Renderer transaction requires expected target and build_id");
+        guard(params.expected as BuildIdentity);
+      }
+      const restoreState = async (saved: SavedViewState) => {
+        setHiddenInstances(new Set(saved.scene.hidden));
+        setHiddenParts(new Set());
+        setSoloPart(null);
+        setSoloInstance(null);
+        setSelection(saved.scene.selection);
+        setSelected(saved.scene.selected);
+        setFocusPart(saved.scene.focusPart);
+        setInstance(saved.scene.instance);
+        setLitPart(saved.scene.litPart);
+        viewer().restore(saved);
+        await afterCommit();
       };
       /** Sets the selection a `select` call (or `open`) asks for, once all of it is known to exist. */
       const applySelect = ({ items }: HubCalls["select"]["params"]) => {
@@ -740,36 +946,60 @@ export function App() {
         setSelection(next);
       };
 
+      const arrange = async (arrangement?: CaptureArrangement | null) => {
+        if (arrangement == null) return;
+        if (arrangement.selection !== undefined) applySelect({ items: arrangement.selection });
+        if (arrangement.hidden !== undefined) {
+          const root = live.current.assemblyData?.scene.data.shapes;
+          if (root === undefined && arrangement.hidden.length > 0) throw new Error("Hidden instances require a composite target");
+          const hidden = arrangement.hidden.flatMap((path) => {
+            const node = root === undefined ? undefined : findShape(root, path);
+            if (node === undefined) throw new Error(`Unknown hidden instance: ${path}`);
+            return shapeLeaves(node).map((leaf) => leaf.id);
+          });
+          setHiddenInstances(new Set(hidden));
+          setHiddenParts(new Set());
+          setSoloPart(null);
+          setSoloInstance(null);
+        }
+        await afterCommit();
+        viewer().view(arrangement);
+        if (arrangement.section !== undefined) viewer().section(arrangement.section);
+        if (arrangement.explode !== undefined) viewer().explode(arrangement.explode);
+        await afterCommit();
+      };
       switch (request.method) {
-        case "open": {
-          const asked = (request.params as HubCalls["open"]["params"]).target;
-          const chosen = (request.params as HubCalls["open"]["params"]).select;
-          if (!["part", "assembly", "file"].includes(asked.kind)) {
-            throw new Error(`Unknown target: ${JSON.stringify(asked)}`);
-          }
-          // An assembly asked for without its name: the first one.
-          const first = live.current.project?.assemblies[0];
-          const next: Target =
-            asked.kind === "assembly" && !asked.name
-              ? { kind: "assembly", name: first ?? "" }
-              : asked;
-          // Asked for before the target is set, so its effect does not ask for the cached build too.
-          const loading = load(next, { build_id: (request.params as HubCalls["open"]["params"]).build_id });
+        case "open":
+        case "capture": {
+          const asked = request.params as HubCalls["capture"]["params"];
+          const startedAt = performance.now();
+          if (!["part", "assembly", "file"].includes(asked.target.kind) || !asked.build_id) throw new Error("Open/capture requires an explicit target and exact build_id");
+          const next = asked.target;
+          const loading = load(next, { build_id: asked.build_id, baseline: asked.baseline });
           setTarget(next);
           const loaded = await loading;
-          if (loaded.status === "error") {
-            await afterCommit();
-            return loaded;
-          }
-          if (loaded.build_id !== (request.params as HubCalls["open"]["params"]).build_id) {
-            throw new Error("Server substituted a different build; navigation discarded");
-          }
-          await viewer().rendered(loaded.scene);
-          if (chosen !== undefined && chosen !== null) {
-            applySelect({ items: [next.kind === "part" ? { kind: "feature", part: next.name, node: chosen } : { kind: "instance", path: chosen }] });
-          }
           await afterCommit();
-          return { status: "ok" } satisfies HubCalls["open"]["result"];
+          if (loaded.status === "error") throw new Error(loaded.error);
+          const downloadedAt = performance.now();
+          const expected = { target: next, build_id: asked.build_id };
+          if (loaded.build_id !== asked.build_id) throw new Error("Server substituted a different build; capture discarded");
+          guard(expected);
+          await viewer().rendered(loaded.scene);
+          const renderedAt = performance.now();
+          guard(expected);
+          if (asked.select !== undefined && asked.select !== null) {
+            applySelect({ items: [next.kind === "part" ? { kind: "feature", part: next.name, node: asked.select } : { kind: "instance", path: asked.select }] });
+          }
+          await arrange(asked.arrangement);
+          await afterCommit();
+          guard(expected);
+          if (request.method === "open") return { status: "ok", ...expected };
+          const images = asked.views.length === 0 ? [] : await viewer().screenshot(asked.views);
+          guard(expected);
+          return { ...identity(), images, renderer: inspectCurrent(), timings: {
+            download_ms: downloadedAt - startedAt, render_ms: renderedAt - downloadedAt,
+            capture_ms: performance.now() - renderedAt,
+          } };
         }
         case "select": {
           applySelect(request.params as HubCalls["select"]["params"]);
@@ -796,7 +1026,37 @@ export function App() {
         case "view":
           viewer().view(request.params as HubCalls["view"]["params"]);
           await afterCommit();
-          return {};
+          guard(params.expected as BuildIdentity);
+          return identity();
+        case "section":
+          viewer().section(request.params as HubCalls["section"]["params"]);
+          await afterCommit();
+          guard(params.expected as BuildIdentity);
+          return identity();
+        case "explode":
+          viewer().explode((request.params as HubCalls["explode"]["params"]).amount);
+          await afterCommit();
+          guard(params.expected as BuildIdentity);
+          return identity();
+        case "saved_views": {
+          const project = live.current.project;
+          if (project === null) throw new Error("No project is loaded");
+          const edited = editSavedViews(JSON.stringify([project.root, project.target]), request.params as HubCalls["saved_views"]["params"], () => viewer().capture());
+          if (edited.restored !== undefined) {
+            const saved = edited.restored;
+            if (keyOf(saved.target) !== keyOf(identity().target)) {
+              const loaded = await load(saved.target);
+              setTarget(saved.target);
+              await afterCommit();
+              if (loaded.status === "error") throw new Error(loaded.error);
+              guard({ target: saved.target, build_id: loaded.build_id });
+              await viewer().rendered(loaded.scene);
+            }
+            applySelect({ items: saved.scene.selection });
+            await restoreState(saved);
+          }
+          return { ...edited, ...identity() };
+        }
         case "visibility": {
           const { instances, visible } = request.params as HubCalls["visibility"]["params"];
           const composite = live.current.assemblyData;
@@ -813,18 +1073,74 @@ export function App() {
           return {};
         }
         case "screenshot": {
-          const { views, width } = request.params as HubCalls["screenshot"]["params"];
-          return { images: await viewer().screenshot(views, width) } satisfies HubCalls["screenshot"]["result"];
+          const asked = request.params as HubCalls["screenshot"]["params"];
+          const expected = params.expected as BuildIdentity;
+          const before = viewer().capture();
+          try {
+            await arrange(asked.arrangement);
+            guard(expected);
+            const images = await viewer().screenshot(asked.views, asked.width);
+            guard(expected);
+            return { ...identity(), images };
+          } finally {
+            if (before !== null && asked.arrangement != null && live.current.target !== null &&
+                keyOf(live.current.target) === keyOf(expected.target) &&
+                live.current.state?.status === "ok" && live.current.state.data.build_id === expected.build_id) await restoreState(before);
+          }
         }
         default:
           throw new Error(`Unknown method: ${request.method}`);
       }
     },
-    [load, afterCommit, setVisibility, clearSelection],
+    [load, afterCommit, setVisibility, clearSelection, inspectCurrent],
   );
+  const transactionQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const executor = useRef(executeHub);
+  executor.current = executeHub;
+  const handled = useRef(new Map<string, { fingerprint: string; result: Promise<unknown>; settled: boolean }>());
+  const handleHub = useCallback((request: HubRequest): Promise<unknown> => {
+    const fingerprint = JSON.stringify([request.method, request.params]);
+    const previous = handled.current.get(request.id);
+    if (previous !== undefined) {
+      if (previous.fingerprint !== fingerprint) return Promise.reject(new Error("Request id was reused for a different transaction"));
+      return previous.result;
+    }
+    if (handled.current.size >= 256) {
+      const removable = [...handled.current].find(([, value]) => value.settled);
+      if (removable === undefined) return Promise.reject(new Error("Renderer transaction queue is full"));
+      handled.current.delete(removable[0]);
+    }
+    const result = transactionQueue.current.then(() => executor.current(request)).then((value) => {
+      // executeHub validated this transaction's identity before executing it.
+      const params = request.params as { expected?: BuildIdentity };
+      const expected = params.expected;
+      if (expected !== undefined && request.method !== "saved_views") {
+        const current = live.current;
+        if (current.target === null || keyOf(current.target) !== keyOf(expected.target) ||
+            current.state?.status !== "ok" || current.state.data.build_id !== expected.build_id) {
+          throw new Error("Renderer navigation/build changed during transaction; result discarded");
+        }
+      }
+      return value !== null && typeof value === "object" && !Array.isArray(value) ? { ...value, request_id: request.id } : value;
+    });
+    transactionQueue.current = result.catch(() => undefined);
+    const record = { fingerprint, result, settled: false };
+    handled.current.set(request.id, record);
+    void result.finally(() => { record.settled = true; }).catch(() => undefined);
+    return result;
+  }, []);
+
+  useEffect(() => {
+    window.cadisteRenderer = { inspect: inspectCurrent };
+    if (CAPTURE_MODE || HARNESS_MODE) {
+      window.cadisteCapture = { protocol: "cadiste-renderer-v2", call: handleHub, inspect: inspectCurrent };
+    }
+    return () => { delete window.cadisteCapture; delete window.cadisteRenderer; };
+  }, [handleHub, inspectCurrent]);
 
   const tabState: TabState = {
     target,
+    build_id: state?.status === "ok" ? state.data.build_id : null,
     status: simulation.enabled ? "error" : state?.status ?? "none",
     error: simulation.enabled ? "Live simulation is enabled; measured poses are not static CAD geometry. Return to CAD view for harness actions." : state?.status === "error" ? state.error : null,
     shapes: simulation.enabled ? null : shapes,
@@ -832,12 +1148,25 @@ export function App() {
     partShapes: Object.fromEntries(Object.entries(traces).flatMap(([part, load]) =>
       load.status === "ok" && load.shapes !== null ? [[part, load.shapes]] : [])),
     hidden: [...effectiveHidden],
+    visibility_layers: {
+      parts: { hidden: [...hiddenParts], solo: soloPart },
+      instances: { hidden: [...hiddenInstances], solo: soloInstance },
+      effective_hidden: [...effectiveHidden],
+    },
   };
-  const hub = useHub(tabState, handleHub);
+  const hub = useHub(tabState, handleHub, !CAPTURE_MODE);
 
   // ---- standalone snapshots: explicit selection first; pointed context only when it is empty ----
 
   const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
+  const [snapshotCopy, setSnapshotCopy] = useState<SnapshotCopyState | null>(null);
+  const snapshotAttempt = useRef<{ cancel: () => void } | null>(null);
+  const closeSnapshotCopy = () => {
+    snapshotAttempt.current?.cancel();
+    snapshotAttempt.current = null;
+    setSnapshotCopy(null);
+  };
+  useEffect(() => () => { snapshotAttempt.current?.cancel(); }, []);
   useEffect(() => {
     if (notice === null) return;
     const timer = window.setTimeout(() => setNotice(null), 4000);
@@ -877,40 +1206,85 @@ export function App() {
     return tabState;
   };
 
-  const copyReference = async (state: TabState) => {
-    try {
+  const copyReference = (asked: TabState) => {
+    // A repeated C/click must not generate a second snapshot or overwrite retained fallback text.
+    if (snapshotAttempt.current !== null) return;
+    const frozen = structuredClone(asked);
+    const tab = hub.tab;
+    const composite = assemblyData;
+    const capturedTraces = traces;
+    const label = frozen.selection.length === 0 ? "entire target" : `${frozen.selection.length} selected item(s)`;
+    let cancelled = false;
+    const attempt = { cancel: () => { cancelled = true; } };
+    snapshotAttempt.current = attempt;
+    setNotice(null);
+    setSnapshotCopy({ phase: "generating" });
+
+    // This promise is shared by the clipboard item and the fallback UI: exactly one server request.
+    const generated = (async () => {
       if (live.current.simulation.enabled) throw new Error("Return to CAD view before copying a CAD selection snapshot. Measured simulation poses have no static CAD provenance.");
-      if ((state.target?.kind === "assembly" || state.target?.kind === "file") && assemblyData !== null) {
-        const parts = assemblySelectionParts(assemblyData, state.selection, state.target.kind === "file");
-        const pending = parts.flatMap((part) => {
+      if ((frozen.target?.kind === "assembly" || frozen.target?.kind === "file") && composite !== null) {
+        const parts = assemblySelectionParts(composite, frozen.selection, frozen.target.kind === "file");
+        const missing = parts.filter((part) => frozen.partShapes[part] === undefined);
+        await Promise.all(missing.flatMap((part) => {
           const loading = traceLoads.current.get(part);
           if (loading !== undefined) return [loading];
-          return live.current.traces[part] === undefined ? [load({ kind: "part", name: part })] : [];
-        });
-        if (pending.length > 0 || parts.some((part) => live.current.traces[part]?.status === "loading")) {
-          setNotice({ text: "Loading selected parts’ feature context…", failed: false });
-          await Promise.all(pending);
-          await afterCommit();
-        }
-        const partShapes = { ...state.partShapes };
-        for (const part of parts) {
+          return capturedTraces[part] === undefined ? [load({ kind: "part", name: part })] : [];
+        }));
+        if (missing.length > 0) await afterCommit();
+        if (cancelled) throw new Error("Snapshot copy cancelled");
+        for (const part of missing) {
           const loaded = live.current.traces[part];
           if (loaded?.status !== "ok" || loaded.shapes === null) {
             const reason = loaded?.status === "error" ? loaded.error : "trace build is unavailable";
             throw new Error(`Feature context for ${part} could not be loaded: ${reason}`);
           }
-          partShapes[part] = loaded.shapes;
+          if (composite.source_fingerprint !== undefined && loaded.data.source_fingerprint !== undefined &&
+              composite.source_fingerprint !== loaded.data.source_fingerprint) {
+            throw new Error(`Feature context for ${part} changed since this selection was captured. Copy again from the updated view.`);
+          }
+          frozen.partShapes[part] = loaded.shapes;
         }
-        state = { ...state, partShapes };
       }
+      if (cancelled) throw new Error("Snapshot copy cancelled");
       if (live.current.simulation.enabled) throw new Error("Live simulation started before the CAD snapshot finished. Return to CAD view and copy again.");
-      const { text } = await createReference(hub.tab, state);
-      await copyText(text);
-      const label = state.selection.length === 0 ? "entire target" : `${state.selection.length} selected item(s)`;
-      setNotice({ text: `Copied snapshot: ${label}`, failed: false });
-    } catch (error) {
-      setNotice({ text: `Could not copy snapshot: ${error instanceof Error ? error.message : String(error)}`, failed: true });
+      return createReference(tab, frozen);
+    })();
+
+    let written: Promise<boolean> = Promise.resolve(false);
+    if (window.isSecureContext && typeof ClipboardItem !== "undefined" && navigator.clipboard?.write !== undefined) {
+      const blob = generated.then(({ text }) => {
+        if (cancelled) throw new Error("Snapshot copy cancelled");
+        return new Blob([text], { type: "text/plain" });
+      });
+      // Some implementations reject construction/write before consuming the promised data.
+      void blob.catch(() => undefined);
+      try {
+        // Do not await generation here: this call must occur in the original trusted C/click gesture.
+        written = navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]).then(() => true, () => false);
+      } catch {
+        // Unsupported promise-backed items and synchronous denials use the same retained-text UI.
+      }
     }
+    void (async () => {
+      try {
+        const { text } = await generated;
+        if (cancelled || snapshotAttempt.current !== attempt) return;
+        setSnapshotCopy({ phase: "ready", text, copying: true });
+        const copied = await written;
+        if (cancelled || snapshotAttempt.current !== attempt) return;
+        if (copied) {
+          snapshotAttempt.current = null;
+          setSnapshotCopy(null);
+          setNotice({ text: `Copied snapshot: ${label}`, failed: false });
+        } else {
+          setSnapshotCopy({ phase: "ready", text, copying: false });
+        }
+      } catch (error) {
+        if (cancelled || snapshotAttempt.current !== attempt) return;
+        setSnapshotCopy({ phase: "failed", error: error instanceof Error ? error.message : String(error) });
+      }
+    })();
   };
   // The key handler reads this render's state through a ref: it is attached once.
   const copyPointed = useRef(() => {});
@@ -920,6 +1294,14 @@ export function App() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.repeat) return;
+      if (event.key === "Escape" && snapshotAttempt.current !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        snapshotAttempt.current.cancel();
+        snapshotAttempt.current = null;
+        setSnapshotCopy(null);
+        return;
+      }
       const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable], [role=dialog], .saved-views");
       if (typing) return;
       if (event.key === "Escape") {
@@ -928,6 +1310,7 @@ export function App() {
         return;
       }
       if (event.key.toLowerCase() !== "c" || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (window.getSelection()?.isCollapsed === false) return;
       event.preventDefault();
       copyPointed.current();
     };
@@ -957,8 +1340,12 @@ export function App() {
   if (projectError !== null) {
     return <div className="fatal">Cannot load the project: {projectError}</div>;
   }
+  if (project?.workspace_only) return <div className="workspace-launcher"><RuntimeInfo /><ProjectLauncher /></div>;
 
-  const title = target?.kind === "file" ? target.path.replaceAll("/", " / ") : target?.name;
+  const targetIdentity = target?.kind === "file" ? target.path : target?.name;
+  const targetLabel = activeVariant !== null && targetIdentity?.startsWith(`${activeVariant}/`)
+    ? targetIdentity.slice(activeVariant.length + 1) : targetIdentity;
+  const title = target?.kind === "file" ? targetLabel?.replaceAll("/", " / ") : targetLabel;
   const sceneData = simulation.enabled && simulation.scene !== null ? simulation.scene.scene.data
     : target?.kind === "part" ? (trace?.scene.data ?? null) : (assemblyData?.scene.data ?? null);
   const buildFailure = background?.status === "error"
@@ -975,10 +1362,16 @@ export function App() {
 
   const partView = target?.kind === "part";
   const assemblyView = target?.kind === "assembly";
+  const assemblyBack = partView && assemblyReturn !== null && project?.assemblies.includes(assemblyReturn.target.name)
+    ? assemblyReturn : null;
   // Both part lists follow actual selection ownership, not the last focus (which can be toggled off).
   const markedPart = selectedParts.at(-1) ?? null;
   // A part, a file's parts or an assembly share the sidebar with what they list: features, parts and instances.
   const featurePane = target !== null;
+  const contentsTitle = simulation.enabled ? "Simulation scene" : partView ? "Part features"
+    : assemblyView ? "Assembly contents" : "Folder contents";
+  const contentsCount = simulation.enabled ? null : partView ? (trace === null ? null : `${trace.ops.length} ops`)
+    : target?.kind === "file" ? fileParts.length : assemblyData === null ? null : countLeaves(assemblyData.scene.data.shapes);
   const showDetails = trace !== null && index !== null && (partView || selected !== null);
 
   // A hidden panel leaves only its show button: the column shrinks to it. An assembly's view has none: its
@@ -990,7 +1383,17 @@ export function App() {
     <div className={layout} style={{ gridTemplateColumns: `${sidebarWidth}px minmax(0, 1fr)${panelColumn}` }}>
       <header className="topbar">
         <span className="brand">cadiste</span>
+        {activeVariant !== null && (
+          <label className="variant-selector">
+            Variant
+            <select value={activeVariant} onChange={(event) => selectVariant(event.target.value)}>
+              {project?.variants?.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+            </select>
+          </label>
+        )}
         {project && <span className="project">{project.root}</span>}
+        {!CAPTURE_MODE && project !== null && <ProjectLauncher currentRoot={project.root} />}
+        <RuntimeInfo />
         <span className="spacer" />
         <span className="selection-count" role="status" aria-live="polite" data-selection-count={selection.length}>
           {selection.length === 0 ? "Entire target" : `${selection.length} selected`}
@@ -1004,21 +1407,36 @@ export function App() {
             <button onClick={collapseAll}>Collapse all</button>
           </>
         )}
-        <LinkedSessions sessions={hub.sessions} tab={hub.tab} onUnlink={hub.unlink} />
+        <LinkedSessions sessions={hub.sessions.filter((session) => session.alive !== false)} tab={hub.tab} onUnlink={hub.unlink} />
         <button
           className="icon-button"
           aria-label="Copy standalone selection snapshot"
           data-action="copy-snapshot"
           disabled={simulation.enabled || target === null || state?.status === "loading"}
+          aria-disabled={snapshotCopy !== null || undefined}
           onClick={() => void copyReference(tabState)}
           title="Copy a standalone snapshot of all selected items (no MCP lookup needed). C copies the selection; when empty, C uses pointed context. Ctrl/Cmd-click toggles; Shift-click adds; Escape clears."
         >
           <Icon name="links" />
         </button>
-        <ExportMenu target={target} title={title} shown={exportShown} simulation={target?.kind === "assembly" && (project?.simulations.includes(target.name) ?? false)} />
+        <WorkflowTools target={target} buildId={state?.status === "ok" ? state.data.build_id : null}
+          checkSets={Object.entries(project?.check_sets ?? {}).filter(([name, specification]) => {
+            if (target === null) return false;
+            const prefix = activeVariant === null ? "" : `${activeVariant}/`;
+            if (prefix && !name.startsWith(prefix)) return false;
+            const registered = specification.target;
+            return registered.kind === target.kind && (registered.kind === "file"
+              ? target.kind === "file" && `${prefix}${registered.path}` === target.path
+              : target.kind !== "file" && `${prefix}${registered.name}` === target.name);
+          }).map(([name]) => name)}
+          selection={selection} disabled={simulation.enabled || comparisonActive}
+          onCompare={compareBaseline} onResult={setWorkflowReport} />
+        <ExportMenu target={target} title={title} shown={exportShown} ready={exportReady && !comparisonActive}
+          manufacturing={activeVariant === null ? project?.manufacturing : project?.manufacturing_by_variant?.[activeVariant]}
+          simulation={target?.kind === "assembly" && (project?.simulations.includes(target.name) ?? false)} />
         <button
           className="primary"
-          disabled={target === null || refreshingProject}
+          disabled={target === null || refreshingProject || comparisonActive}
           onClick={() => void rebuild()}
           title="Rebuild only the current target, even if its cached build is up to date"
         >
@@ -1027,36 +1445,46 @@ export function App() {
       </header>
 
       <aside className="sidebar">
-        {/* The part list has the sidebar to itself until a part is open; then it shares it with the part's tree. */}
+        {/* Project navigation above, the current target's contents below. */}
         <div
           className={featurePane ? "parts-pane" : "parts-pane full"}
-          style={featurePane ? { height: partsHeight } : undefined}
+          style={featurePane ? { gridTemplateRows: `minmax(0, ${partsHeight}px) auto auto` } : undefined}
         >
           <PartList
-            parts={project?.parts ?? []}
+            parts={catalog.parts}
             folders={project?.folders ?? {}}
-            assemblies={project?.assemblies ?? []}
+            assemblies={catalog.assemblies}
+            variant={activeVariant}
             target={target}
             traces={traces}
             assemblyLoads={assemblies}
             files={files}
             marked={selectedParts}
-            onSelect={setTarget}
+            onSelect={navigate}
+            divider={featurePane ? (
+              <Splitter
+                axis="y"
+                value={partsHeight}
+                min={90}
+                max={Math.max(120, window.innerHeight - 260)}
+                onChange={setPartsHeight}
+              />
+            ) : undefined}
           />
         </div>
         {featurePane && (
           <>
-            <Splitter
-              axis="y"
-              value={partsHeight}
-              min={90}
-              max={Math.max(120, window.innerHeight - 260)}
-              onChange={setPartsHeight}
-            />
-            <div className="sidebar-tree">
+            <section className="sidebar-tree" aria-label={contentsTitle}>
+              <header className="sidebar-section-header">
+                <h2>{contentsTitle}</h2>
+                {contentsCount !== null && <span className="sidebar-section-count">{contentsCount}</span>}
+              </header>
+              <div className="sidebar-section-context" title={title}>
+                <Icon name={partView ? "part" : assemblyView ? "assembly" : "folder"} />
+                <span>{title}</span>
+              </div>
               {simulation.enabled && (
                 <section className="simulation-scene-tree" aria-label="Simulation adapter scene">
-                  <h3>Live simulation · adapter scene</h3>
                   <p className="muted">Measured TF and joint states move adapter nodes. CAD provenance and entity picking are disabled.</p>
                   {simulation.scene === null ? <p>{simulation.error ?? "Loading adapter geometry…"}</p>
                     : <ul><SimulationSceneNode node={simulation.scene.scene.data.shapes} /></ul>}
@@ -1083,6 +1511,7 @@ export function App() {
               {target?.kind === "file" && (
                 <FileFeatures
                   parts={fileParts}
+                  variant={activeVariant}
                   traces={traces}
                   selected={focusPart !== null && selected !== null ? { part: focusPart, node: selected } : null}
                   selection={selection}
@@ -1101,14 +1530,15 @@ export function App() {
                     if (leaf !== null) setPartVisibility([leaf], visible);
                   }}
                   onHover={(part) => setHover(part === null ? null : leafOf(part))}
-                  onOpen={(name) => setTarget({ kind: "part", name })}
+                  onOpen={(name) => navigate({ kind: "part", name })}
                 />
               )}
               {assemblyView && assemblyData && !simulation.enabled && (
                 <AssemblyPane
                   name={target.name}
                   data={assemblyData}
-                  parts={project?.parts ?? []}
+                  parts={catalog.parts}
+                  variant={activeVariant}
                   hiddenParts={hiddenParts}
                   hiddenInstances={hiddenInstances}
                   soloPart={soloPart}
@@ -1140,10 +1570,10 @@ export function App() {
                     });
                   }}
                   onHover={setHover}
-                  onOpen={(name) => setTarget({ kind: "part", name })}
+                  onOpen={(name) => navigate({ kind: "part", name })}
                 />
               )}
-            </div>
+            </section>
           </>
         )}
         <Splitter axis="x" value={sidebarWidth} min={220} max={640} onChange={setSidebarWidth} />
@@ -1151,7 +1581,11 @@ export function App() {
 
       <main className="view">
         {target !== null && (
-          <ViewBar target={target} project={project}>
+          <ViewBar target={target} project={project} variant={activeVariant} navigation={assemblyBack && (
+            <button className="view-back" onClick={returnToAssembly} title={`Return to ${activeVariant === null ? assemblyBack.target.name : assemblyBack.target.name.slice(activeVariant.length + 1)}`}>
+              Back to {activeVariant === null ? assemblyBack.target.name : assemblyBack.target.name.slice(activeVariant.length + 1)}
+            </button>
+          )}>
             {simulation.enabled && <strong className="simulation-view-title">Live simulation · {simulation.status} · measured world poses</strong>}
             {partView && trace && (
               <span className="stats">
@@ -1181,9 +1615,10 @@ export function App() {
         )}
         <div className="view-body">
           <CadView
+            key={activeVariant ?? ""}
             ref={view}
-            data={sceneData}
-            focus={simulation.enabled ? null : focus}
+            data={sceneOverride ?? sceneData}
+            focus={simulation.enabled || sceneOverride !== null ? null : focus}
             hover={simulation.enabled ? null : hover}
             onPick={simulation.enabled ? undefined : onPick}
             describe={simulation.enabled ? undefined : describeHover}
@@ -1201,6 +1636,30 @@ export function App() {
               setTarget((current) => current !== null && keyOf(current) === keyOf(saved.target) ? current : saved.target);
             }}
           />
+          {!simulation.enabled && !CAPTURE_MODE && <details className="solid-check"><summary>Solid check</summary>
+            <SolidCheck shapes={shapes} selection={selection} onReview={(review) => view.current?.reviewCheck(review)} />
+          </details>}
+          {workflowReport !== null && <details className="workflow-report" open>
+            <summary>Verification report · {workflowReport.ok ? "Pass" : "Fail"}</summary>
+            <button onClick={() => { view.current?.reviewCheck(null); setWorkflowReport(null); }}>Close report</button>
+            {(workflowReport.results as { target: Target; build_id?: string; checks?: { ok: boolean; result?: ExactCheckReport; error?: string }[]; assertions?: unknown[]; error?: string }[] ?? []).map((result, i) => <section key={i}>
+              <strong>{result.target.kind === "file" ? result.target.path : result.target.name}</strong>
+              {result.error && <p role="alert">{result.error}</p>}
+              {(result.checks ?? []).map((check, j) => <div key={j}>
+                {check.error && <p role="alert">{check.error}</p>}
+                {check.result && Array.isArray(check.result.pairs) && <CheckReview result={check.result}
+                  onReview={(review) => {
+                    if (target === null || JSON.stringify(result.target) !== JSON.stringify(target) ||
+                      state?.status !== "ok" || result.build_id !== state.data.build_id) {
+                      throw new Error("This check belongs to another target/build; run it again for the displayed geometry");
+                    }
+                    view.current?.reviewCheck(review);
+                  }} />}
+              </div>)}
+              <details><summary>Exact assertions and evidence</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>
+            </section>)}
+          </details>}
+          {comparisonReview !== null && <BaselineReview {...comparisonReview} onClose={() => setComparisonReview(null)} />}
           {state?.status === "loading" && (
             <div className="view-overlay">
               <span className="spinner" /> Building {title}…
@@ -1258,8 +1717,12 @@ export function App() {
       ) : (
         partView && <footer className="timeline" />
       )}
-      <LinkRequests sessions={hub.sessions} onLink={hub.link} onDecline={hub.decline} />
-      {notice && <div className={notice.failed ? "notice failed" : "notice"}>{notice.text}</div>}
+      <LinkRequests sessions={hub.sessions.filter((session) => session.alive !== false)} onLink={hub.link} onDecline={hub.decline} />
+      {snapshotCopy !== null && <SnapshotCopy state={snapshotCopy} onClose={closeSnapshotCopy} onCopied={() => {
+        closeSnapshotCopy();
+        setNotice({ text: "Copied snapshot", failed: false });
+      }} />}
+      {notice && <div role={notice.failed ? "alert" : "status"} className={notice.failed ? "notice failed" : "notice"}>{notice.text}</div>}
     </div>
   );
 }

@@ -13,12 +13,38 @@ import type { Target } from "../App";
 import type { Focus } from "../model";
 import { selectionMode, type SelectionMode } from "../selection";
 import type { LiveSimulation } from "../simulation";
-import type { HubCalls, SceneData, SimulationPose, SimulationScene } from "../types";
+import type { HubCalls, SceneData, SimulationPose, SimulationScene, Vec3 } from "../types";
 import { type SceneHover, Readout } from "./HoverCard";
 import { MeasureMarks, MeasurePanel, type Picked, measurementOf, useMeasurement } from "./Measure";
 import { SectionPanel, useSection } from "./Section";
 import { SavedViews, type SavedViewState, type SceneViewState } from "./SavedViews";
 import { type ViewDirection, type ViewSettings, ViewToolbar, useViewSettings } from "./ViewToolbar";
+import type { CheckVisualization } from "./CheckReview";
+
+export interface ScreenshotDiagnostics {
+  suspicious_empty: boolean;
+  warnings: string[];
+  pixel_sample: { width: number; height: number; distinct_colors: number; opaque_pixels: number; non_background_pixels: number } | null;
+}
+
+export interface RendererInspection {
+  phase: "initializing" | "empty" | "rendering" | "ready" | "error" | "disposed";
+  ready: boolean;
+  camera: SavedViewState["camera"] | null;
+  section: SavedViewState["section"];
+  display: ViewSettings & { explode: number | null; measuring: boolean; simulation: boolean };
+  viewport: { width: number; height: number; canvas_width: number; canvas_height: number; context_lost: boolean };
+  visibility: Record<string, number[]>;
+  visibility_layers: { selected: readonly string[]; highlighted: string[]; check_review: string | null };
+  check_review: null | {
+    label: string;
+    poses: CheckVisualization["poses"];
+    transforms: { path: string; recorded_matrix_world: number[]; matrix_world: number[] }[];
+  };
+  timings: { mounted_at: number; render_started_at: number | null; render_completed_at: number | null; render_ms: number | null; capture_ms: number | null; resize_at: number | null };
+  errors: { phase: string; message: string; at: number }[];
+  diagnostics: ScreenshotDiagnostics | null;
+}
 
 // OCP CAD Viewer's defaults, so models look the way they do there.
 const RENDER_OPTIONS: RenderOptions = {
@@ -35,6 +61,8 @@ const SCREENSHOT_WIDTH = 1024;
 
 /** The scene's operations driven by the app and by a harness session through the hub. */
 export interface CadViewHandle {
+  /** Stable across handle refreshes; changes only when the renderer component remounts. */
+  readonly identity: symbol;
   /** Resolves once this scene is rendered and focused: at once if it is the one shown. */
   rendered: (data: SceneData) => Promise<void>;
   /** Validate entity paths without changing the selection or measurement mode. */
@@ -43,11 +71,18 @@ export interface CadViewHandle {
   highlight: (paths: string[]) => string[];
   view: (params: HubCalls["view"]["params"]) => void;
   /** PNGs of the scene (base64), along each direction (none: as it is), the camera put back after. */
-  screenshot: (views: ViewDirection[], width?: number) => Promise<HubCalls["screenshot"]["result"]["images"]>;
+  screenshot: (views: (ViewDirection | "current")[], width?: number) => Promise<HubCalls["screenshot"]["result"]["images"]>;
   /** The viewer path of the face, edge, vertex or object under the pointer (null: none). */
   hovered: () => string | null;
   /** Restore viewer-owned state after the app has opened the saved target and restored its selection. */
   restore: (state: SavedViewState) => void;
+  capture: () => SavedViewState | null;
+  section: (params: HubCalls["section"]["params"]) => void;
+  explode: (amount: number | null) => void;
+  /** Read-only evidence, available before the first scene and after a failed render. */
+  inspect: () => RendererInspection;
+  /** Independent exact-check pose preview. Null restores the original recorded transforms. */
+  reviewCheck: (review: CheckVisualization | null) => void;
 }
 
 function viewerOptions(settings: ViewSettings): ViewerOptions {
@@ -93,11 +128,59 @@ function leafOf(info: { path: string; solidPath: string | null }): string {
   return info.solidPath ?? info.path.replace(/\/(faces|edges|vertices)\/[^/]+$/, "");
 }
 
-/** A PNG data URL as base64 PNG at most `width` px wide, its aspect kept. */
-async function scaled(dataUrl: string, width: number): Promise<string> {
+interface FitBox {
+  min: { x: number; y: number; z: number };
+  max: { x: number; y: number; z: number };
+  clone(): FitBox;
+  makeEmpty(): FitBox;
+  expandByObject(object: unknown, precise?: boolean): FitBox;
+}
+
+/** Fit a bounding sphere without importing a second Three.js runtime or changing orientation. */
+function fitGeometry(viewer: Viewer, mode: "all" | "visible" | "selected", selected: readonly string[]): void {
+  if (viewer.bbox === null) throw new Error("No rendered bounds are available");
+  const box = (viewer.bbox as unknown as FitBox).clone().makeEmpty();
+  const states = viewer.getStates();
+  const groups = viewer.rendered.nestedGroup.groups;
+  const wanted = new Set(selected.map((path) => path.replace(/\/(faces|edges|vertices)\/[^/]+$/, "")));
+  for (const [path, state] of Object.entries(states)) {
+    if (mode === "visible" && state[0] === 0 && state[1] === 0) continue;
+    if (mode === "selected" && ![...wanted].some((own) => path === own || path.startsWith(own + "/"))) continue;
+    const group = groups[path];
+    if (group !== undefined) box.expandByObject(group, true);
+  }
+  const low = [box.min.x, box.min.y, box.min.z];
+  const high = [box.max.x, box.max.y, box.max.z];
+  if (![...low, ...high].every(Number.isFinite)) throw new Error(`No ${mode} geometry to fit`);
+  const center = low.map((value, i) => (value + high[i]) / 2) as Vec3;
+  const radius = Math.max(1e-6, Math.hypot(...high.map((value, i) => value - low[i])) / 2);
+  const camera = viewer.rendered.camera;
+  const position = viewer.getCameraPosition();
+  const target = viewer.getCameraTarget();
+  const delta = position.map((value, i) => value - target[i]);
+  const distance = Math.hypot(...delta);
+  let nextDistance = distance;
+  let zoom: number | null = null;
+  if (camera.ortho) {
+    const area = camera.getVisibleArea();
+    zoom = viewer.getCameraZoom() * Math.min(area.width, area.height) / (2.2 * radius);
+  } else {
+    const perspective = camera.pCamera as unknown as { fov: number; aspect: number };
+    const vertical = perspective.fov * Math.PI / 180;
+    const horizontal = 2 * Math.atan(Math.tan(vertical / 2) * perspective.aspect);
+    nextDistance = 1.1 * radius / Math.sin(Math.min(vertical, horizontal) / 2);
+  }
+  const next = center.map((value, i) => value + delta[i] / Math.max(distance, 1e-9) * nextDistance) as Vector3Tuple;
+  viewer.setCameraLocationSettings(next, null, center, zoom, false);
+  viewer.update(true, false);
+}
+
+/** Scale once, and diagnose a small deterministic pixel sample; warnings never trigger an implicit retry. */
+async function scaled(dataUrl: string, width: number): Promise<{ data: string; diagnostics: ScreenshotDiagnostics }> {
   const image = new Image();
   image.src = dataUrl;
   await image.decode();
+  if (image.naturalWidth === 0 || image.naturalHeight === 0) throw new Error("Screenshot has no pixels");
   const scale = Math.min(1, width / image.naturalWidth);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
@@ -105,7 +188,28 @@ async function scaled(dataUrl: string, width: number): Promise<string> {
   const context = canvas.getContext("2d");
   if (context === null) throw new Error("Cannot draw the screenshot");
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/png").slice("data:image/png;base64,".length);
+  const data = canvas.toDataURL("image/png").slice("data:image/png;base64,".length);
+  const sample = document.createElement("canvas");
+  sample.width = Math.min(64, canvas.width);
+  sample.height = Math.min(64, canvas.height);
+  const pixels = sample.getContext("2d", { willReadFrequently: true });
+  if (pixels === null) throw new Error("Cannot inspect screenshot pixels");
+  pixels.drawImage(canvas, 0, 0, sample.width, sample.height);
+  const rgba = pixels.getImageData(0, 0, sample.width, sample.height).data;
+  const colors = new Map<string, number>();
+  let opaque = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    if (rgba[i + 3] > 0) opaque++;
+    const color = `${rgba[i] >> 3},${rgba[i + 1] >> 3},${rgba[i + 2] >> 3},${rgba[i + 3] >> 3}`;
+    colors.set(color, (colors.get(color) ?? 0) + 1);
+  }
+  const nonBackground = sample.width * sample.height - Math.max(0, ...colors.values());
+  const suspicious = opaque === 0 || nonBackground < 4;
+  return { data, diagnostics: {
+    suspicious_empty: suspicious,
+    warnings: suspicious ? ["Screenshot appears empty or near-uniform. Check camera, clipping, hidden/solo layers and render errors; image retained without retry."] : [],
+    pixel_sample: { width: sample.width, height: sample.height, distinct_colors: colors.size, opaque_pixels: opaque, non_background_pixels: nonBackground },
+  } };
 }
 
 interface Instance {
@@ -137,6 +241,7 @@ function displayOptions(width: number, height: number, settings: ViewSettings) {
 
 // Structural types keep the renderer's own THREE instance: no second bundled Three.js runtime.
 interface LiveMatrix {
+  elements: ArrayLike<number>;
   clone: () => LiveMatrix;
   set: (...values: number[]) => LiveMatrix;
   invert: () => LiveMatrix;
@@ -145,6 +250,8 @@ interface LiveMatrix {
 }
 interface LiveNode {
   matrix: LiveMatrix;
+  matrixWorld: LiveMatrix;
+  parent: { matrixWorld: LiveMatrix; updateWorldMatrix: (parents: boolean, children: boolean) => void } | null;
   position: unknown;
   quaternion: unknown;
   scale: unknown;
@@ -164,12 +271,25 @@ function poseMatrix(pose: SimulationPose, translationScale: number, matrix: Live
   );
 }
 
+/** Fixed world XYZ rotations (Rz * Ry * Rx), then translation, about the exact checker's world pivot. */
+function checkMatrix(pose: CheckVisualization["poses"][number], matrix: LiveMatrix): LiveMatrix {
+  const [x, y, z] = pose.rotation.map((angle) => (angle % 360) * Math.PI / 180);
+  const [sx, sy, sz] = [Math.sin(x), Math.sin(y), Math.sin(z)];
+  const [cx, cy, cz] = [Math.cos(x), Math.cos(y), Math.cos(z)];
+  const r = [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+    sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx, -sy, cy * sx, cy * cx];
+  const [ox, oy, oz] = pose.origin;
+  const t = pose.translation.map((value, i) => value + pose.origin[i] - r[i * 3] * ox - r[i * 3 + 1] * oy - r[i * 3 + 2] * oz);
+  return matrix.set(r[0], r[1], r[2], t[0], r[3], r[4], r[5], t[1], r[6], r[7], r[8], t[2], 0, 0, 0, 1);
+}
+
 /**
  * three-cad-viewer (OCP CAD Viewer's renderer) in a div it owns, with the app's own toolbar over it; one viewer,
  * Section-plane picking consumes a click first. Measurement mode keeps its additive picks in the same canonical
  * selection as tree/scene items, so copying never omits measurements or resets unrelated selected items.
  */
 export function CadView({ data, focus, hover = null, onPick, describe, shapes = null, selectionPaths, onDropPick, onClearPicks, onClearSelection, viewScope, viewTarget, sceneState, onRestoreView, simulation, ref }: Props) {
+  const [identity] = useState(() => Symbol("CadView"));
   const host = useRef<HTMLDivElement>(null);
   const instance = useRef<Instance | null>(null);
   const [rendered, setRendered] = useState(0);
@@ -193,7 +313,10 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   const [extra, setExtra] = useState<string[]>([]);
   /** The scene last rendered, and who waits for a scene to be. */
   const shown = useRef<SceneData | null>(null);
-  const waiting = useRef<{ data: SceneData; resolve: () => void }[]>([]);
+  const waiting = useRef<{ data: SceneData; resolve: () => void; reject: (error: Error) => void }[]>([]);
+  const captureCurrent = useRef<() => SavedViewState | null>(() => null);
+  const currentSelection = useRef<readonly string[]>([]);
+  currentSelection.current = [...(focus?.lit ?? []), ...sceneState.selection.flatMap((item) => item.kind === "feature" ? [] : [item.path])];
   const section = useSection(viewerOf, rendered);
   const { picking: sectionPicking, pickFace: pickSectionFace } = section;
   const pendingView = useRef<SavedViewState | null>(null);
@@ -202,6 +325,32 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   const liveNodes = useRef<{ scene: SimulationScene; nodes: { link: string; node: LiveNode; restToInitial: LiveMatrix }[]; fitted: boolean } | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [appliedStamp, setAppliedStamp] = useState<number | null>(null);
+  const lifecycle = useRef<RendererInspection["phase"]>("initializing");
+  const timings = useRef<RendererInspection["timings"]>({
+    mounted_at: performance.now(), render_started_at: null, render_completed_at: null,
+    render_ms: null, capture_ms: null, resize_at: null,
+  });
+  const errors = useRef<RendererInspection["errors"]>([]);
+  const diagnostics = useRef<ScreenshotDiagnostics | null>(null);
+  const inspectCurrent = useRef<() => RendererInspection>(() => { throw new Error("Renderer is initializing"); });
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [checkReview, setCheckReview] = useState<CheckVisualization | null>(null);
+  const checkNodes = useRef<{ node: LiveNode; original: LiveMatrix }[]>([]);
+  const checkReviewActive = useRef(false);
+  const recordError = (phase: string, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    errors.current.push({ phase, message, at: performance.now() });
+    errors.current = errors.current.slice(-32);
+    return message;
+  };
+  const restoreCheck = () => {
+    for (const { node, original } of checkNodes.current) {
+      node.matrix = original.clone();
+      node.matrix.decompose(node.position, node.quaternion, node.scale);
+      node.updateMatrixWorld(true);
+    }
+    checkNodes.current = [];
+  };
 
   /** The hover card beside the pointer, flipped to its other side near the view's right and bottom edges. */
   const placeCard = () => {
@@ -222,8 +371,17 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     if (element === null) return;
     const { width, height } = element.getBoundingClientRect();
     const options = displayOptions(width, height, settingsRef.current);
-    const display = new Display(element, options);
-    const viewer = new Viewer(display, options, null);
+    let display: Display | undefined;
+    let viewer: Viewer;
+    try {
+      display = new Display(element, options);
+      viewer = new Viewer(display, options, null);
+    } catch (error) {
+      display?.dispose();
+      lifecycle.current = "error";
+      setRenderError(recordError("initialize", error));
+      return;
+    }
     const handleHover = viewer.pickingController.handleHover.bind(viewer.pickingController);
     viewer.pickingController.handleHover = () => {
       if (!simulationMode.current) handleHover();
@@ -252,6 +410,18 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       }
     };
     element.addEventListener("keydown", guardLiveKeys, true);
+    const onError = (event: ErrorEvent) => { recordError("browser", event.message); };
+    const onRejection = (event: PromiseRejectionEvent) => { recordError("promise", event.reason); };
+    const onContextLost = () => {
+      lifecycle.current = "error";
+      const message = recordError("webgl", "WebGL context lost; no automatic capture retry was attempted");
+      setRenderError(message);
+      for (const waiter of waiting.current) waiter.reject(new Error(message));
+      waiting.current = [];
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    viewer.renderer.domElement.addEventListener("webglcontextlost", onContextLost);
     const fit = () => {
       if (!viewer.ready) return; // resizeCadView throws before the first render
       const box = element.getBoundingClientRect();
@@ -259,14 +429,22 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       const canvas = element.querySelector(".tcv_cad_view_glass, .tcv_cad_view");
       const chrome = canvas ? canvas.getBoundingClientRect().top - box.top : 0;
       viewer.resizeCadView(Math.max(box.width, 200), TREE_WIDTH, Math.max(box.height - chrome, 200), true);
+      timings.current.resize_at = performance.now();
     };
     instance.current = { display, viewer, fit };
     const observer = new ResizeObserver(fit);
     observer.observe(element);
+    lifecycle.current = "empty";
     return () => {
       stopExplodeSync();
       element.removeEventListener("pointermove", onMove);
       element.removeEventListener("keydown", guardLiveKeys, true);
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+      viewer.renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
+      for (const waiter of waiting.current) waiter.reject(new Error("Renderer was disposed before the scene was ready"));
+      waiting.current = [];
+      lifecycle.current = "disposed";
       observer.disconnect();
       viewer.dispose();
       display.dispose();
@@ -277,15 +455,33 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
   useEffect(() => {
     const current = instance.current;
     if (current === null || data === null) return;
+    for (const waiter of waiting.current.filter((waiter) => waiter.data !== data)) waiter.reject(new Error("Navigation changed before the requested scene rendered"));
+    waiting.current = waiting.current.filter((waiter) => waiter.data === data);
     liveNodes.current = null;
-    if (current.viewer.ready) current.viewer.clear();
-    // render() takes the instanced format too (it decodes it first), but its type only names the decoded tree.
-    const shapes = data as unknown as Shapes;
-    current.viewer.render(shapes, RENDER_OPTIONS, viewerOptions(settingsRef.current));
-    current.fit();
-    lastView.current = null;
-    shown.current = data;
-    setRendered((count) => count + 1);
+    checkReviewActive.current = false;
+    checkNodes.current = [];
+    setCheckReview(null);
+    lifecycle.current = "rendering";
+    timings.current.render_started_at = performance.now();
+    timings.current.render_completed_at = null;
+    diagnostics.current = null;
+    setRenderError(null);
+    shown.current = null;
+    try {
+      if (current.viewer.ready) current.viewer.clear();
+      // render() accepts the instanced format too; its declaration names only the decoded tree.
+      current.viewer.render(data as unknown as Shapes, RENDER_OPTIONS, viewerOptions(settingsRef.current));
+      current.fit();
+      lastView.current = null;
+      shown.current = data;
+      setRendered((count) => count + 1);
+    } catch (error) {
+      lifecycle.current = "error";
+      const message = recordError("render", error);
+      setRenderError(message);
+      for (const waiter of waiting.current) waiter.reject(new Error(message));
+      waiting.current = [];
+    }
   }, [data]);
 
   useEffect(() => {
@@ -294,6 +490,9 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     viewer.setPickHandler(!simulation.enabled);
     viewer.setSelectionInput(false);
     if (simulation.enabled) {
+      restoreCheck();
+      checkReviewActive.current = false;
+      setCheckReview(null);
       setMeasuring(false);
       section.open(false);
       viewer.setExplode(false);
@@ -361,17 +560,20 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     viewer.setAxes(settings.axes);
     viewer.setGrids([settings.grid, false, false]);
     viewer.setBlackEdges(settings.edges);
-    const tools = settings.tools && !simulation.enabled;
+    const tools = settings.tools && !simulation.enabled && checkReview === null;
     if (viewer.getTools() !== tools) {
       viewer.showTools(tools);
       current.fit();
     }
-  }, [settings, rendered, simulation.enabled]);
+  }, [settings, rendered, simulation.enabled, checkReview]);
 
   useEffect(() => {
     const viewer = instance.current?.viewer;
     if (viewer === undefined || !viewer.ready || focus === null) return;
-    viewer.setStates(focus.states);
+    const states = { ...focus.states };
+    // A review is its own display layer: show the checked pair without rewriting either eye/solo layer.
+    for (const path of checkReview?.pair.paths ?? []) states[path] = [1, 1];
+    viewer.setStates(states);
     viewer.setTransparent(focus.ghost || settings.transparent);
     const group = viewer.rendered.nestedGroup;
     const highlight = group.highlight;
@@ -382,9 +584,9 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
         if (lit.has(info.path) || (info.topo === "face" && lit.has(leafOf(info)))) highlight.setSelected(info.id, true);
       }
     }
-    if (highlight && extra.length > 0) {
+    if (highlight && (extra.length > 0 || checkReview !== null)) {
       // A component lights exactly; a leaf, all its faces.
-      const lit = new Set(extra);
+      const lit = new Set([...extra, ...(checkReview?.pair.paths ?? [])]);
       for (const info of group.registry.entries()) {
         if (lit.has(info.path) || (info.topo === "face" && lit.has(leafOf(info)))) highlight.setSelected(info.id, true);
       }
@@ -393,7 +595,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     if (focus.view !== null && focus.view !== lastView.current) viewer.presetCamera(focus.view);
     lastView.current = focus.view;
     viewer.update(true, false);
-  }, [focus, settings.transparent, rendered, extra]);
+  }, [focus, settings.transparent, rendered, extra, checkReview]);
 
   // Restore after focus has applied its visibility and optional sketch camera. Otherwise focus would undo it.
   useEffect(() => {
@@ -410,11 +612,22 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
     viewer.update(true, false);
   }, [focus, settings, rendered]);
 
-  // After the focus effect: a scene waited for is focused too once this runs.
+  // Focus/section effects and two browser frames precede readiness; a nonzero canvas is not proof of a painted scene.
   useEffect(() => {
-    const ready = waiting.current.filter((waiter) => waiter.data === shown.current);
-    waiting.current = waiting.current.filter((waiter) => waiter.data !== shown.current);
-    ready.forEach((waiter) => waiter.resolve());
+    if (shown.current === null || lifecycle.current !== "rendering") return;
+    const scene = shown.current;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        if (shown.current !== scene || lifecycle.current !== "rendering") return;
+        lifecycle.current = "ready";
+        timings.current.render_completed_at = performance.now();
+        timings.current.render_ms = timings.current.render_completed_at - (timings.current.render_started_at ?? timings.current.render_completed_at);
+        const ready = waiting.current.filter((waiter) => waiter.data === scene);
+        waiting.current = waiting.current.filter((waiter) => waiter.data !== scene);
+        ready.forEach((waiter) => waiter.resolve());
+      });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [rendered]);
 
   const selectedPathsKey = selectionPaths.join("\n");
@@ -435,11 +648,73 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       const readyViewer = () => {
         if (simulationMode.current) throw new Error("Return to CAD view before using CAD harness actions or snapshots.");
         const viewer = instance.current?.viewer;
-        return viewer !== undefined && viewer.ready ? viewer : null;
+        return viewer !== undefined && viewer.ready && lifecycle.current === "ready" ? viewer : null;
       };
       const registry = () => readyViewer()?.rendered.nestedGroup.registry.entries() ?? [];
       return {
+        identity,
         hovered: () => hoveredPath.current,
+        capture: () => captureCurrent.current(),
+        inspect: () => inspectCurrent.current(),
+        reviewCheck: (review) => {
+          if (review === null && !checkReviewActive.current) return;
+          const viewer = review === null ? instance.current?.viewer ?? null : readyViewer();
+          if (viewer === null) {
+            if (review !== null) throw new Error("Nothing is rendered");
+            restoreCheck();
+            setCheckReview(null);
+            return;
+          }
+          // Validate all paths and pivots before changing even one node.
+          for (const path of review?.pair.paths ?? []) {
+            if (viewer.rendered.nestedGroup.groups[path] === undefined) throw new Error(`Checked instance is not in this scene: ${path}`);
+          }
+          const poses = review?.poses ?? [];
+          const nodes = poses.map((pose) => {
+            if (![pose.translation, pose.rotation, pose.origin].every((vector) => Array.isArray(vector) && vector.length === 3 && vector.every(Number.isFinite))) throw new Error("A pose review needs the checker's finite resolved world origin");
+            const node = viewer.rendered.nestedGroup.groups[pose.path] as unknown as LiveNode | undefined;
+            if (node === undefined) throw new Error(`Checked instance is not in this scene: ${pose.path}`);
+            return { pose, node };
+          });
+          restoreCheck();
+          viewer.setExplode(false);
+          setMeasuring(false);
+          for (const { pose, node } of nodes) {
+            node.updateMatrix();
+            const original = node.matrix.clone();
+            node.parent?.updateWorldMatrix(true, false);
+            const delta = checkMatrix(pose, original.clone());
+            const world = node.parent === null ? original.clone() : node.parent.matrixWorld.clone().multiply(original);
+            const moved = delta.multiply(world);
+            node.matrix = node.parent === null ? moved : node.parent.matrixWorld.clone().invert().multiply(moved);
+            node.matrix.decompose(node.position, node.quaternion, node.scale);
+            node.updateMatrixWorld(true);
+            checkNodes.current.push({ node, original });
+          }
+          viewer.updateBounds();
+          viewer.idPicker?.setDirty();
+          viewer.update(true, false);
+          setCheckReview(review);
+          checkReviewActive.current = review !== null;
+        },
+        section: ({ active, plane, offset = 0, flipped = false }) => {
+          if (!active) { section.restore(false, null); return; }
+          if (plane === undefined || plane === null || !Array.isArray(plane.point) || !Array.isArray(plane.normal) ||
+              plane.point.length !== 3 || plane.normal.length !== 3 ||
+              ![...plane.point, ...plane.normal, offset].every(Number.isFinite)) throw new Error("A section requires a finite plane point, normal and offset");
+          const length = Math.hypot(...plane.normal);
+          if (length < 1e-12) throw new Error("Section normal cannot be zero");
+          section.restore(true, { plane: { ...plane, normal: plane.normal.map((value) => value / length) as Vector3Tuple }, offset, flipped });
+        },
+        explode: (amount) => {
+          if (amount !== null && (!Number.isFinite(amount) || amount < 0 || amount > 1)) throw new Error("Explode amount must be null or 0–1");
+          const viewer = readyViewer();
+          if (viewer === null) throw new Error("Nothing is rendered");
+          setMeasuring(false);
+          viewer.setExplode(amount !== null);
+          if (amount !== null) viewer.setRelativeTime(amount);
+          setExploded(amount !== null);
+        },
         restore: (saved) => {
           if (simulationMode.current) throw new Error("Return to CAD view before restoring a saved CAD view.");
           pendingView.current = saved;
@@ -454,9 +729,18 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           }
         },
         rendered: (scene) =>
-          new Promise((resolve) => {
-            if (shown.current === scene) resolve();
-            else waiting.current.push({ data: scene, resolve });
+          new Promise((resolve, reject) => {
+            if (lifecycle.current === "error") { reject(new Error(errors.current.at(-1)?.message ?? "Renderer failed")); return; }
+            if (shown.current === scene && lifecycle.current === "ready") { resolve(); return; }
+            const timer = window.setTimeout(() => {
+              waiting.current = waiting.current.filter((waiter) => waiter.data !== scene);
+              reject(new Error("Requested scene did not render within 240 seconds; no capture was accepted"));
+            }, 240000);
+            waiting.current.push({
+              data: scene,
+              resolve: () => { window.clearTimeout(timer); resolve(); },
+              reject: (error) => { window.clearTimeout(timer); reject(error); },
+            });
           }),
         unknownPaths: (paths) => {
           const known = new Set<string>();
@@ -470,36 +754,78 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
           if (unknown.length === 0) setExtra(paths);
           return unknown;
         },
-        view: ({ direction, fit, ortho, transparent }) => {
+        view: ({ direction, fit, ortho, transparent, camera }) => {
           const viewer = readyViewer();
-          if ((direction !== undefined || fit) && viewer === null) throw new Error("Nothing is rendered");
-          if (direction !== undefined) viewer?.presetCamera(direction);
-          if (fit) viewer?.reset();
+          if (viewer === null) throw new Error("Nothing is rendered");
+          if (direction !== undefined) viewer.presetCamera(direction);
+          if (ortho !== undefined) viewer.setOrtho(ortho);
+          if (fit) fitGeometry(viewer, fit === true ? "all" : fit, currentSelection.current);
+          if (camera !== undefined) {
+            if (![...camera.position, ...camera.quaternion, ...camera.target, camera.zoom].every(Number.isFinite) || camera.zoom <= 0) throw new Error("Camera values must be finite with positive zoom");
+            viewer.setCameraLocationSettings(camera.position, null, camera.target, viewer.rendered.camera.ortho ? camera.zoom : null, false);
+            viewer.rendered.camera.setQuaternion(camera.quaternion);
+            viewer.update(true, false);
+          }
           const change = { ...(ortho === undefined ? {} : { ortho }), ...(transparent === undefined ? {} : { transparent }) };
           if (Object.keys(change).length > 0) changeSettings(change);
         },
         screenshot: async (views, width = SCREENSHOT_WIDTH) => {
           const viewer = readyViewer();
           if (viewer === null || shown.current === null) throw new Error("Nothing is rendered");
+          if (!Number.isInteger(width) || width < 64 || width > 4096) throw new Error("Capture width must be an integer from 64 to 4096");
+          const scene = shown.current;
+          const captureStarted = performance.now();
           const [x, y, z] = viewer.getCameraPosition();
-          const position: Vector3Tuple = [x, y, z];
+          const position: Vec3 = [x, y, z];
           const quaternion = viewer.getCameraQuaternion();
-          const target = viewer.getCameraTarget();
+          const target = viewer.getCameraTarget() as Vec3;
           const zoom = viewer.getCameraZoom();
           const images: HubCalls["screenshot"]["result"]["images"] = [];
+          let changedCamera = false;
           try {
-            for (const view of views.length > 0 ? views : [null]) {
-              if (view !== null) viewer.presetCamera(view, null, false);
-              const image = await viewer.getImage(`cadiste-${view ?? "current"}`);
+            for (const view of views.length > 0 ? views : ["current" as const]) {
+              if (shown.current !== scene) throw new Error("Navigation changed during capture; images discarded");
+              if (view !== "current") {
+                changedCamera = true;
+                // Presets recenter on the entire scene; retain the requested framing while changing direction.
+                viewer.presetCamera(view, null, false);
+                const presetPosition = viewer.getCameraPosition() as Vec3;
+                const presetTarget = viewer.getCameraTarget() as Vec3;
+                const offset = presetPosition.map((value, i) => value - presetTarget[i]);
+                const distance = Math.hypot(...position.map((value, i) => value - target[i]));
+                const scale = distance / Math.max(Math.hypot(...offset), 1e-9);
+                const next = target.map((value, i) => value + offset[i] * scale) as Vec3;
+                const orientation = viewer.getCameraQuaternion();
+                viewer.setCameraLocationSettings(next, null, target, viewer.rendered.camera.ortho ? zoom : null, false);
+                viewer.rendered.camera.setQuaternion(orientation);
+                viewer.update(true, false);
+              }
+              const image = await viewer.getImage(`cadiste-${view}`);
+              if (shown.current !== scene) throw new Error("Navigation changed during capture; images discarded");
               if (typeof image.dataUrl !== "string") throw new Error("The view could not be captured");
-              images.push({ view: view ?? "current", data: await scaled(image.dataUrl, width) });
+              const captured = await scaled(image.dataUrl, width);
+              if (shown.current !== scene) throw new Error("Navigation changed while encoding capture; images discarded");
+              const states = Object.values(viewer.getStates());
+              if (states.length === 0 || states.every((state) => state[0] === 0 && state[1] === 0)) {
+                captured.diagnostics.suspicious_empty = true;
+                captured.diagnostics.warnings.push("No visible scene leaves; inspect hidden and independent solo layers.");
+              }
+              if (checkReviewActive.current) captured.diagnostics.warnings.push("Image shows an exact-check pose preview, not the build's recorded pose.");
+              diagnostics.current = captured.diagnostics;
+              const evidence = { view, ...captured };
+              images.push(evidence);
             }
+          } catch (error) {
+            recordError("capture", error);
+            throw error;
           } finally {
-            // presetCamera moves the target to the scene's centre: the target first, then where the camera was.
-            viewer.setCameraTarget(target, false);
-            viewer.setCameraPosition(position, false, false);
-            viewer.setCameraQuaternion(quaternion, false);
-            viewer.setCameraZoom(zoom, false);
+            timings.current.capture_ms = performance.now() - captureStarted;
+            // Never restore a former target's camera onto a target the user navigated to mid-capture.
+            if (changedCamera && shown.current === scene) {
+              viewer.setCameraLocationSettings(position, null, target, viewer.rendered.camera.ortho ? zoom : null, false);
+              viewer.rendered.camera.setQuaternion(quaternion);
+              viewer.update(true, false);
+            }
           }
           return images;
         },
@@ -522,7 +848,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       down = { x: event.clientX, y: event.clientY };
     };
     const onUp = (event: PointerEvent) => {
-      if (simulationMode.current) return;
+      if (simulationMode.current || checkReviewActive.current) return;
       // A drag orbits the camera; only a click picks.
       if (down === null || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
       const box = canvas.getBoundingClientRect();
@@ -576,7 +902,7 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
 
   const captureView = (): SavedViewState | null => {
     const viewer = instance.current?.viewer;
-    if (simulationMode.current) return null;
+    if (simulationMode.current || checkReviewActive.current) return null;
     if (viewer === undefined || !viewer.ready || data === null || shown.current !== data || viewTarget === null) return null;
     const [x, y, z] = viewer.getCameraPosition();
     const states = viewer.getStates();
@@ -596,11 +922,52 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       measuring,
     });
   };
+  captureCurrent.current = captureView;
+  inspectCurrent.current = () => {
+    const viewer = instance.current?.viewer;
+    const canvas = viewer?.renderer.domElement as HTMLCanvasElement | undefined;
+    const box = host.current?.getBoundingClientRect();
+    const ready = viewer !== undefined && viewer.ready && lifecycle.current === "ready";
+    return structuredClone({
+      phase: lifecycle.current, ready,
+      camera: !ready ? null : {
+        position: viewer.getCameraPosition() as Vec3,
+        quaternion: viewer.getCameraQuaternion(), target: viewer.getCameraTarget() as Vec3, zoom: viewer.getCameraZoom(),
+      },
+      section: { active: section.active, section: section.section },
+      display: {
+        ...settings,
+        ...(ready ? { ortho: viewer.getOrtho(), axes: viewer.getAxes(), grid: viewer.getGrids()[0], transparent: viewer.getTransparent(), edges: viewer.getBlackEdges(), tools: viewer.getTools() } : {}),
+        explode: ready && exploded ? viewer.getRelativeTime() : null, measuring, simulation: simulation.enabled,
+      },
+      viewport: { width: box?.width ?? 0, height: box?.height ?? 0, canvas_width: canvas?.width ?? 0, canvas_height: canvas?.height ?? 0, context_lost: viewer?.renderer.getContext().isContextLost() ?? false },
+      visibility: ready ? viewer.getStates() : {},
+      visibility_layers: { selected: currentSelection.current, highlighted: extra, check_review: checkReview?.label ?? null },
+      check_review: checkReview === null ? null : {
+        label: checkReview.label, poses: checkReview.poses,
+        transforms: checkNodes.current.map(({ node, original }, i) => ({
+          path: checkReview.poses[i].path,
+          recorded_matrix_world: Array.from((node.parent === null ? original : node.parent.matrixWorld.clone().multiply(original)).elements),
+          matrix_world: Array.from(node.matrixWorld.elements),
+        })),
+      },
+      timings: timings.current, errors: errors.current, diagnostics: diagnostics.current,
+    });
+  };
 
   return (
     <div className={simulation.enabled ? "cad simulation-mode" : "cad"} data-view-mode={simulation.enabled ? "simulation" : "cad"} data-rendered-feedback-stamp={appliedStamp ?? undefined}>
-      {/* Hidden until the first render: three-cad-viewer applies glass and tools only then, its raw panels before. */}
-      <div className={rendered === 0 ? "cad-view unrendered" : "cad-view"} ref={host} />
+      <div className="cad-view" ref={host} style={{ visibility: rendered === 0 ? "hidden" : undefined }} />
+      {renderError !== null && <div className="simulation-view-note" role="alert">Renderer failed: {renderError}</div>}
+      {!simulation.enabled && checkReview !== null && (
+        <>
+          <MeasureMarks viewer={viewerOf} measurement={{ entities: [], results: checkReview.pair.witnesses == null ? [] : [
+            { label: "Minimum distance", kind: "length", value: checkReview.pair.minimum_distance ?? 0, line: checkReview.pair.witnesses },
+            ...checkReview.pair.witnesses.map((value) => ({ label: "Witness", kind: "point" as const, value })),
+          ] }} />
+          <div className="simulation-view-note" role="status">{checkReview.label} · discrete exact-check pose preview; no continuous-motion proof.</div>
+        </>
+      )}
       {!simulation.enabled && hovered !== null && (
         <div className="hover-card" ref={card}>
           {hovered.path !== null && describe?.(hovered.path)}
@@ -628,10 +995,11 @@ export function CadView({ data, focus, hover = null, onPick, describe, shapes = 
       {(data !== null || viewScope !== null) && (
         <ViewToolbar
           settings={settings}
-          cadActions={!simulation.enabled}
+          cadActions={!simulation.enabled && checkReview === null}
           onChange={changeSettings}
           onView={(direction) => withViewer((viewer) => viewer.presetCamera(direction))}
-          onFit={() => withViewer((viewer) => viewer.reset())}
+          onFit={(mode) => withViewer((viewer) => fitGeometry(viewer, mode, currentSelection.current))}
+          hasSelection={sceneState.selection.length > 0}
           measuring={measuring}
           onMeasure={measure}
           exploded={exploded}

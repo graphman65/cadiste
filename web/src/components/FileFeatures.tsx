@@ -9,6 +9,7 @@ import { Icon } from "./Icon";
 interface Props {
   /** The file's parts, in the order the project lists them. */
   parts: string[];
+  variant: string | null;
   traces: Record<string, Load<TraceData>>;
   /** The part whose feature is selected, and the feature. */
   selected: { part: string; node: string } | null;
@@ -31,7 +32,7 @@ const NO_NODES: ReadonlySet<string> = new Set();
 
 /** Every part of a file with its features, a group per part: a feature selected here is lit among the others. */
 export function FileFeatures(props: Props) {
-  const { parts, traces, selected, selection, related, collapsed, visible, onSelect, onToggle, onVisibility, onHover, onOpen } = props;
+  const { parts, variant, traces, selected, selection, related, collapsed, visible, onSelect, onToggle, onVisibility, onHover, onOpen } = props;
   const { solo, onSolo } = props;
   const [closed, toggleClosed] = usePersistentSet("cadiste.closed-file-parts");
   return (
@@ -43,6 +44,7 @@ export function FileFeatures(props: Props) {
         const open = !closed.has(part);
         const shown = visible(part);
         const soloed = solo === part;
+        const label = variant === null ? part : part.slice(variant.length + 1);
         return (
           <section key={part} className="file-part">
             <div
@@ -53,7 +55,7 @@ export function FileFeatures(props: Props) {
               <button className="file-part-toggle" aria-expanded={open} onClick={() => toggleClosed(part)}>
                 <Icon name="chevron" className={open ? "chevron open" : "chevron"} />
                 <Icon name="part" className="builder-icon" />
-                <span className="part-name">{part}</span>
+                <span className="part-name">{label}</span>
                 {(state?.status === "loading" || state?.status === "ok" && state.refreshing) && <span className="spinner" title="Tracing…" />}
                 {failure !== undefined && <span className="part-status error">failed</span>}
                 {trace && <span className="part-status">{trace.ops.length} ops</span>}
@@ -67,14 +69,14 @@ export function FileFeatures(props: Props) {
               </button>
               <button
                 className={soloed ? "eye solo active" : "eye solo"}
-                aria-label={`Solo ${part}`}
+                aria-label={`Solo ${label}`}
                 aria-pressed={soloed}
-                title={soloed ? "Disable solo; restore eye settings" : `Solo ${part}: show only this part`}
+                title={soloed ? "Disable solo; restore eye settings" : `Solo ${label}: show only this part`}
                 onClick={() => onSolo(part)}
               >
                 <Icon name="solo" />
               </button>
-              <button className="open-part" title={`Open ${part} on its own`} onClick={() => onOpen(part)}>
+              <button className="open-part" title={`Open ${label} on its own`} onClick={() => onOpen(part)}>
                 Open
               </button>
             </div>

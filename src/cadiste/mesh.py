@@ -48,6 +48,10 @@ class Leaf:
     faces: list[TopoDS_Shape] | None
     edges: list[TopoDS_Shape] | None
     vertices: list[TopoDS_Shape] | None
+    shape: TopoDS_Shape | None = None
+    """The exact whole shape in the same world placement as its entities; None for non-shape leaves."""
+    location: TopLoc_Location | None = None
+    """Composed viewer placement, before applying it to the converter's unlocated source shape."""
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,7 @@ def _leaves(shapes: dict[str, Any], mapping: dict[str, Any], meshed: list[dict[s
         source = objects.get(node["id"])
         if source is None:
             return
+        shape = None
         if node["type"] == "shapes":
             shape = place(source["obj"])
             mesh = meshed[node["shape"]["ref"]]
@@ -118,7 +123,7 @@ def _leaves(shapes: dict[str, Any], mapping: dict[str, Any], meshed: list[dict[s
                 seen, edges = list(source), []
             faces = []
             vertices = _counted([place(vertex) for vertex in seen], len(mesh["obj_vertices"]) // 3)
-        leaves.append(Leaf(node["id"], faces, edges, vertices))
+        leaves.append(Leaf(node["id"], faces, edges, vertices, shape, loc))
 
     walk(shapes, None)
     return leaves

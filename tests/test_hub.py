@@ -128,3 +128,81 @@ def test_a_reloaded_tab_replaces_its_old_stream_and_gets_the_requests():
     hub.reply("tab-a", new.wait_for("request")["id"], True, {})
     calling["thread"].join(2)
     assert calling["value"] == {}
+
+
+def test_timeout_keeps_late_reply_and_replays_only_the_same_transaction(tmp_path):
+    journal = tmp_path / "outcomes.json"
+    hub = Hub(journal)
+    params = {"target": {"kind": "part", "name": "A"}, "build_id": "generation-one", "views": ["front"]}
+    with pytest.raises(HubError, match=r"request capture-1.*timed out"):
+        hub.call("tab-a", "capture", params, timeout=0, request_id="capture-1")
+    assert hub.outcome("capture-1")["status"] == "timed_out"
+    assert not hub.reply("other-tab", "capture-1", True, {})
+    result = {"target": params["target"], "build_id": "generation-one", "images": []}
+    assert hub.reply("tab-a", "capture-1", True, result)
+    assert not hub.reply("tab-a", "capture-1", True, {"build_id": "generation-two"})
+    recovered = Hub(journal)
+    assert recovered.outcome("capture-1")["value"] == result
+    assert recovered.call("tab-a", "capture", params, timeout=0, request_id="capture-1") == result
+    with pytest.raises(HubError, match="different transaction"):
+        recovered.call("tab-a", "capture", {**params, "build_id": "generation-two"}, timeout=0, request_id="capture-1")
+
+
+def test_restart_does_not_replay_inflight_private_capture(tmp_path):
+    journal = tmp_path / "outcomes.json"
+    hub = Hub(journal)
+    params = {"target": {"kind": "part", "name": "A"}, "build_id": "one"}
+    hub.track_request("agent-session", "inflight", "capture", params)
+    restarted = Hub(journal)
+    record = restarted.outcome("inflight")
+    assert record["status"] == "interrupted"
+    assert "do not blindly rebuild" in record["error"]
+    with pytest.raises(HubError, match="interrupted"):
+        restarted.call("agent-session", "capture", params, timeout=0, request_id="inflight")
+
+
+def test_outcome_retention_is_bounded_without_evicting_inflight_requests(tmp_path):
+    journal = tmp_path / "outcomes.json"
+    hub = Hub(journal, retention=2)
+    hub.track_request("private", "still-running", "capture", {"build_id": "one"})
+    for request in ("old", "new"):
+        hub.track_request("private", request, "view", {})
+        assert hub.reply("private", request, True, {"done": request})
+    assert hub.outcome("still-running")["status"] == "pending"
+    assert hub.outcome("new")["status"] == "ok"
+    with pytest.raises(HubError, match="no retained"):
+        hub.outcome("old")
+    assert len(Hub(journal)._outcomes) == 2
+
+
+def test_renderer_cannot_complete_capture_with_another_build():
+    hub = Hub()
+    params = {"target": {"kind": "part", "name": "A"}, "build_id": "one"}
+    hub.track_request("private", "capture", "capture", params)
+    assert hub.reply("private", "capture", True, {**params, "build_id": "two", "images": []})
+    outcome = hub.outcome("capture")
+    assert outcome["status"] == "error"
+    assert "different target/build" in outcome["value"]
+
+
+def test_session_liveness_is_heartbeat_evidence_not_registration_or_inspection(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("cadiste.hub.time.time", lambda: now[0])
+    hub = Hub()
+    first = hub.open_session("same-client", skill_digest="old", mcp_generation="old")
+    second = hub.open_session("same-client", skill_digest="new", mcp_generation="new")
+    # Dataclass factories are captured at definition time; set timestamps explicitly.
+    first.last_seen = second.last_seen = now[0]
+    now[0] += 80
+    assert all(not session["alive"] for session in hub.generations())
+    assert hub.session(first.id).info()["last_seen"] == 1000.0
+    refreshed = hub.heartbeat(second.id)
+    assert refreshed["alive"] and refreshed["last_seen"] == now[0]
+    sessions = {session["id"]: session for session in hub.generations()}
+    assert not sessions[first.id]["alive"]
+    assert sessions[second.id]["alive"]
+    assert sessions[first.id]["code"] != sessions[second.id]["code"]
+    assert sessions[first.id]["mcp_generation"] == "old"
+    hub.close_session(second.id)
+    with pytest.raises(KeyError):
+        hub.heartbeat(second.id)

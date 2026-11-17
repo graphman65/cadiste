@@ -17,8 +17,10 @@ Agents: ``POST /api/agent/sessions`` opens a session, ``POST /api/agent/<session
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -35,13 +37,15 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .agent import Agent, ToolError
 from .background import BackgroundBuilds
 from .cache import SHAPES_SUFFIX, TraceCache
+from .diagnostics import runtime_info
 from .feedback import Feedback
 from .hub import Hub
 from .process import locked, run
@@ -93,6 +97,12 @@ class Measurer:
         from .measure import measure
 
         return self._use(name, lambda shapes: measure(shapes, paths))
+
+    def check(self, name: str, pairs: list[list[str]], **options: Any) -> dict[str, Any]:
+        """Run whole-solid checks under the same OCP serialization as exact measurements."""
+        from .checks import check
+
+        return self._use(name, lambda shapes: check(shapes, pairs, **options))
 
     def adjacent(self, name: str, path: str) -> list[int] | None:
         """The faces an edge or a vertex bounds (``measure.adjacent_faces``)."""
@@ -147,6 +157,13 @@ class Project:
         folders: dict[str, list[FolderStep]] | None = None,
         parts_target: str | None = None,
         simulations: dict[str, str] | None = None,
+        *,
+        variants: dict[str, Project] | None = None,
+        variant_labels: dict[str, str] | None = None,
+        default_variant: str | None = None,
+        check_sets: dict[str, dict[str, Any]] | None = None,
+        manufacturing: dict[str, Any] | None = None,
+        profile_path: str | None = None,
     ):
         self.target = target
         self.args = args
@@ -154,15 +171,96 @@ class Project:
         self.simulations = simulations if simulations is not None else {}
         self.trace_env = trace_env if trace_env is not None else {}
         self.parts_target = parts_target
+        self.check_sets = dict(check_sets or {})
+        self.manufacturing = dict(manufacturing or {})
+        self.profile_path = profile_path
         self._has_parts = parts_target is not None or parts is not None
         self._catalog = _Catalog(parts, parts if parts is not None else (" ".join([target, *args]),), folders or {})
         self._catalog_error: _CatalogError | None = None
         self._catalog_lock = threading.Lock()
+        self.variant_projects = MappingProxyType(dict(variants or {}))
+        self.default_variant = default_variant or next(iter(self.variant_projects), None)
+        if self.default_variant is not None and self.default_variant not in self.variant_projects:
+            raise ValueError(f"unknown variant {self.default_variant!r}")
+        self.variants = tuple(
+            {"id": identifier, "label": (variant_labels or {}).get(identifier, identifier)}
+            for identifier in self.variant_projects
+        )
+        if self.variant_projects:
+            # Implicit assembly requests choose the default, without mutable selection.
+            order = [self.default_variant, *(key for key in self.variant_projects if key != self.default_variant)]
+            self.assemblies = {
+                f"{identifier}/{name}": factory
+                for identifier in order
+                for name, factory in self.variant_projects[identifier].assemblies.items()
+            }
+            self.simulations = {
+                f"{identifier}/{name}": factory
+                for identifier, project in self.variant_projects.items()
+                for name, factory in project.simulations.items()
+            }
+
+    def resolve(self, target: dict[str, Any]) -> tuple[Project, dict[str, Any], str | None]:
+        """Return the fixed effective project and local target, retaining all local slashes."""
+        if not self.variant_projects:
+            return self, target, None
+        key = "path" if target.get("kind") == "file" else "name"
+        value = target.get(key)
+        if target.get("kind") == "assembly" and not value:
+            value = next(iter(self.assemblies), "")
+        if not isinstance(value, str):
+            raise LookupError(f"not a qualified variant target: {target!r}")
+        identifier, separator, local = value.partition("/")
+        if identifier not in self.variant_projects or (not separator and key != "path"):
+            raise LookupError(f"unknown variant target {value!r}")
+        return self.variant_projects[identifier], {**target, key: local}, identifier
+
+    def part_binding(self, name: str) -> dict[str, Any]:
+        project, target, _ = self.resolve({"kind": "part", "name": name})
+        return {
+            "entry_target": project.target,
+            "arguments": [target["name"]] if project._has_parts else list(project.args),
+        }
+
+    def build_bindings(self) -> dict[str, Any]:
+        """All effective factories and arguments, used as the cache configuration salt."""
+        if self.variant_projects:
+            return {identifier: project.build_bindings() for identifier, project in self.variant_projects.items()}
+        return {
+            "target": self.target,
+            "args": self.args,
+            "parts": self.parts_target,
+            "assemblies": self.assemblies,
+            "simulations": self.simulations,
+            "env": self.trace_env,
+        }
+
+    def source_targets(self) -> list[str]:
+        if self.variant_projects:
+            return [target for project in self.variant_projects.values() for target in project.source_targets()]
+        return [
+            self.target,
+            *([self.parts_target] if self.parts_target else []),
+            *self.assemblies.values(),
+            *self.simulations.values(),
+        ]
 
     def catalog(self, *, refresh: bool = False, cancel: threading.Event | None = None) -> _Catalog:
         """One coherent names/folders snapshot. Refreshes serialize discovery and publish only complete results.
         A failed discovery blocks stale reads until a later successful refresh; fixed single-model mode never
         imports anything. Unchanged catalogs keep the same snapshot, but discovery still runs on each refresh."""
+        if self.variant_projects:
+            catalogs = [
+                (identifier, project.catalog(refresh=refresh, cancel=cancel))
+                for identifier, project in self.variant_projects.items()
+            ]
+            names = tuple(f"{identifier}/{name}" for identifier, catalog in catalogs for name in catalog.names)
+            folders = {
+                f"{identifier}/{name}": [{"name": identifier, "file": False}, *catalog.folders.get(name, [])]
+                for identifier, catalog in catalogs
+                for name in catalog.names
+            }
+            return _Catalog(names, names, folders)
         with locked(self._catalog_lock, cancel):
             if refresh and self.parts_target is not None:
                 try:
@@ -193,11 +291,17 @@ class Project:
         return list(self.catalog().names)
 
     def trace_command(self, name: str) -> list[str]:
+        if self.variant_projects:
+            project, target, _ = self.resolve({"kind": "part", "name": name})
+            return project.trace_command(target["name"])
         args = [name] if self._has_parts else list(self.args)
         return [sys.executable, "-m", "cadiste", "export", self.target, "--", *args]
 
     def assembly_command(self, name: str) -> list[str]:
         """Build the assembly; with a part list, also name the part each instance is of."""
+        if self.variant_projects:
+            project, target, _ = self.resolve({"kind": "assembly", "name": name})
+            return project.assembly_command(target["name"])
         command = [sys.executable, "-m", "cadiste", "mesh"]
         if self.parts_target is not None:
             command += ["--match-parts", self.parts_target, "--part-build", self.target]
@@ -242,18 +346,8 @@ class Build:
     """``{"error", "log"}`` of a failed build."""
 
 
-@dataclass(frozen=True)
-class Saved:
-    body: bytes | None
-    """The CAD file; None when the build failed."""
-    stem: str
-    """Its file name, without the format's suffix."""
-    failure: dict[str, str]
-    """``{"error", "log"}`` of a failed build."""
-
-
-EXPORT_FORMATS = {"step": "model/step", "stl": "model/stl", "brep": "application/octet-stream"}
-"""What ``GET /api/export`` writes (``cadiste save --format``), with its content type."""
+EXPORT_FORMATS = {"step": "model/step", "3mf": "model/3mf", "stl": "model/stl", "brep": "application/octet-stream"}
+"""Supported retained CAD exports and their media types."""
 
 
 class Builds:
@@ -266,35 +360,67 @@ class Builds:
         self.cache = cache
         self.always_fresh = always_fresh
         """No cache: successful geometry is still retained for exact captured-generation requests."""
+        self.check: Callable[..., dict[str, Any]] | None = None
         self.on_build: Callable[[dict[str, Any], Build], None] | None = None
+        self.geometry_lock = threading.Lock()
+        from .baselines import Baselines
+
+        self.baselines = Baselines(self)
 
     def _recipe(
-        self, target: dict[str, Any], *, refresh: bool = False, cancel: threading.Event | None = None
+        self, target: dict[str, Any], *, refresh: bool = False, cancel: threading.Event | None = None,
+        only: list[str] | None = None,
     ) -> tuple[str, str, list[str], dict[str, str] | None, str]:
         """The cache entry's kind and name, the command (a cadiste subcommand: ``[python, -m, cadiste, <sub>, ...]``),
         its environment and what it does; LookupError for a target the project does not have."""
-        project = self.project
+        project, target, variant = self.project.resolve(target)
         catalog = project.catalog(refresh=refresh, cancel=cancel)
+        if only is not None and (
+            target.get("kind") != "file" or not isinstance(only, list) or not only
+            or any(not isinstance(name, str) or not name for name in only)
+        ):
+            raise ValueError("only requires a nonempty folder part-name allowlist")
         match target:
             case {"kind": "part", "name": str(name)}:
                 if name not in catalog.names:
                     raise LookupError(f"unknown part {name!r}")
-                return "trace", name, project.trace_command(name), project.trace_env, f"tracing {name!r}"
+                qualified = f"{variant}/{name}" if variant else name
+                return "trace", qualified, project.trace_command(name), project.trace_env, f"tracing {qualified!r}"
             case {"kind": "assembly", **rest}:
                 if not project.assemblies:
                     raise LookupError("this project has no assembly (cadiste serve --assembly)")
                 name = rest.get("name") or next(iter(project.assemblies))
                 if name not in project.assemblies:
                     raise LookupError(f"unknown assembly {name!r}")
-                return "assembly", name, project.assembly_command(name), None, f"building the assembly {name!r}"
+                qualified = f"{variant}/{name}" if variant else name
+                return (
+                    "assembly", qualified, project.assembly_command(name), None,
+                    f"building the assembly {qualified!r}",
+                )
             case {"kind": "file", "path": str(path)}:
-                names = catalog.folder_parts(path)
+                names = list(catalog.names) if variant and not path else catalog.folder_parts(path)
                 if not names:
                     raise LookupError(f"no parts in {path!r}")
-                label = path.rpartition("/")[2]
+                if only is not None:
+                    qualified_names = {f"{variant}/{name}" if variant else name: name for name in names}
+                    if unknown := set(only) - qualified_names.keys():
+                        raise LookupError(f"parts not captured in this folder: {', '.join(sorted(unknown))}")
+                    selected = {qualified_names[name] for name in only}
+                    names = [name for name in names if name in selected]
+                label = path.rpartition("/")[2] or "Parts"
                 command = [sys.executable, "-m", "cadiste", "mesh", "--each", "--label", label, project.target, "--"]
                 # Only viewed, not traced: the model's own part cache may serve, so the server's environment.
-                return "file", path, [*command, *names], None, f"building {path!r}"
+                qualified = (f"{variant}/{path}" if path else variant) if variant else path
+                if only is not None:
+                    digest = hashlib.sha256(json.dumps(names).encode()).hexdigest()[:12]
+                    return (
+                        "file-selection",
+                        f"{qualified}:{digest}",
+                        [*command, *names],
+                        None,
+                        f"building selected parts of {qualified!r}",
+                    )
+                return "file", qualified, [*command, *names], None, f"building {qualified!r}"
         raise LookupError(f"not something to build: {target!r}")
 
     def get(
@@ -305,10 +431,11 @@ class Builds:
         refresh: bool = True,
         cancel: threading.Event | None = None,
         notify: bool = True,
+        only: list[str] | None = None,
     ) -> Build:
         """The target's build, from the cache unless ``fresh`` (or its source changed); a failed build is not
         cached."""
-        kind, name, command, environment, doing = self._recipe(target, refresh=refresh, cancel=cancel)
+        kind, name, command, environment, doing = self._recipe(target, refresh=refresh, cancel=cancel, only=only)
         failure: dict[str, str] = {}
 
         def make(shapes: Path) -> bytes | None:
@@ -324,8 +451,28 @@ class Builds:
                 failure["error"] = "source changed during the build; request the target again"
                 return None
             data = json.loads(body)
+            _, local_target, variant = self.project.resolve(target)
+            if variant:
+                scene = data.get("scene", {})
+                scene["part_of"] = {
+                    path: f"{variant}/{owner}" for path, owner in scene.get("part_of", {}).items()
+                }
+                for record in scene.get("instances", {}).values():
+                    if record.get("owner"):
+                        record["owner"] = f"{variant}/{record['owner']}"
+                if local_target.get("kind") == "file":
+                    def qualify_leaves(node: dict[str, Any]) -> None:
+                        if "parts" in node:
+                            for child in node["parts"]:
+                                qualify_leaves(child)
+                        elif owner := scene["part_of"].get(node["id"]):
+                            node["name"] = owner
+
+                    qualify_leaves(scene["data"]["shapes"])
             data["build_id"] = shapes.name.split(".shapes.", 1)[0]
             data["source_fingerprint"] = before
+            if only is not None:
+                data["selection"] = {"only": only}
             return json.dumps(data, separators=(",", ":")).encode()
 
         try:
@@ -336,7 +483,7 @@ class Builds:
         if body is None:
             failure["error"] = f"{doing}: {failure.get('error', 'no output')}"
         result = Build(body, cached, shapes, failure)
-        if notify and self.on_build is not None:
+        if notify and only is None and self.on_build is not None:
             self.on_build(target, result)
         return result
 
@@ -358,62 +505,21 @@ class Builds:
         shapes = path.with_suffix(SHAPES_SUFFIX)
         return Build(path.read_bytes(), True, shapes if shapes.is_file() else None, {})
 
-    def save(self, target: dict[str, Any], form: str, only: list[str] | None = None) -> Saved:
-        """The target built again (not traced: the model's own part cache may serve) and written as a CAD file in
-        ``form`` (``EXPORT_FORMATS``); for a folder, ``only`` keeps those of its parts (the ones shown). LookupError
-        for a target the project does not have."""
-        project = self.project
-        catalog = project.catalog(refresh=True)
-        match target:
-            case {"kind": "part", "name": str(name)}:
-                if name not in catalog.names:
-                    raise LookupError(f"unknown part {name!r}")
-                if catalog.parts is None:
-                    stem, command = project.target.rpartition(":")[2], [project.target, "--", *project.args]
-                else:
-                    stem, command = name, ["--label", name, project.target, "--", name]
-                doing = f"exporting {name!r}"
-            case {"kind": "assembly", **rest}:
-                if not project.assemblies:
-                    raise LookupError("this project has no assembly (cadiste serve --assembly)")
-                name = rest.get("name") or next(iter(project.assemblies))
-                if name not in project.assemblies:
-                    raise LookupError(f"unknown assembly {name!r}")
-                stem, command, doing = name, [project.assemblies[name]], f"exporting the assembly {name!r}"
-            case {"kind": "file", "path": str(path)}:
-                names = catalog.folder_parts(path)
-                if not names:
-                    raise LookupError(f"no parts in {path!r}")
-                if only is not None:
-                    if outside := [name for name in only if name not in names]:
-                        raise LookupError(f"not in {path!r}: {', '.join(outside)}")
-                    names = [name for name in names if name in only]
-                stem = path.rpartition("/")[2]
-                command, doing = ["--each", "--label", stem, project.target, "--", *names], f"exporting {path!r}"
-            case _:
-                raise LookupError(f"not something to export: {target!r}")
-        save = [sys.executable, "-m", "cadiste", "save", "--format", form]
-        with tempfile.TemporaryDirectory(prefix="cadiste-export-") as directory:
-            output = Path(directory) / f"model.{form}"
-            # The server's environment, as for the views: the model's own part cache may serve.
-            body, failure = _run([*save, "--output", str(output), *command])
-            if body is None:
-                return Saved(None, stem, {**failure, "error": f"{doing}: {failure.get('error', 'no output')}"})
-            return Saved(output.read_bytes(), stem, {})
 
     def _simulation_target(self, target: dict[str, str]) -> str:
         """Resolve only explicitly registered assembly adapters."""
-        self.project.catalog(refresh=True)
+        project, target, _ = self.project.resolve(target)
+        project.catalog(refresh=True)
         if target.get("kind") != "assembly":
             raise LookupError("Gazebo export requires an assembly with a simulation adapter")
-        name = target.get("name") or next(iter(self.project.assemblies), "")
-        if name not in self.project.assemblies:
+        name = target.get("name") or next(iter(project.assemblies), "")
+        if name not in project.assemblies:
             raise LookupError(f"unknown assembly {name!r}")
-        if name not in self.project.simulations:
+        if name not in project.simulations:
             raise LookupError(
                 f"no simulation adapter for {name!r}; configure cadiste serve --simulation NAME=module:callable"
             )
-        return self.project.simulations[name]
+        return project.simulations[name]
 
     def control_config(self, target: dict[str, str]) -> dict[str, Any]:
         adapter = self._simulation_target(target)
@@ -451,6 +557,191 @@ class Builds:
 _ID = re.compile(r"[\w-]{1,64}")
 
 
+class _ExportError(ToolError):
+    def __init__(self, details: dict[str, str], status: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR):
+        log = "\n".join(details.get("log", "").splitlines()[-40:])
+        super().__init__(
+            (details.get("error", "export failed") + "\n" + log).strip(), code="export_error", details=details
+        )
+        self.details = details
+        self.status = status
+
+
+def export_artifact(
+    builds: Builds,
+    target: dict[str, Any],
+    form: str = "step",
+    only: list[str] | None = None,
+    expected_revision: str | None = None,
+    *,
+    directory: str = "artifacts",
+    hidden: list[str] | None = None,
+    group: str | None = None,
+    orientation: str | None = None,
+    preflight: bool = True,
+) -> dict[str, Any]:
+    """Write the exact retained generation used by preflight, rejecting edits before publishing."""
+    from .cli import _WRITERS
+    from .manufacturing import prepare_export
+
+    if form not in EXPORT_FORMATS:
+        raise ValueError(f"format must be one of {', '.join(EXPORT_FORMATS)}")
+    if type(preflight) is not bool:
+        raise ValueError("preflight must be a boolean")
+    if only is not None and hidden:
+        raise ValueError("only and hidden cannot be combined; use explicit viewer paths alone")
+    captured = builds.get(target, False, only=only) if only is not None else builds.get(target, False)
+    if captured.body is None:
+        raise _ExportError(captured.failure)
+    metadata = json.loads(captured.body)
+    before = builds.cache.fingerprint()
+    if metadata.get("source_fingerprint") != before:
+        raise ValueError("source changed while preparing export; rebuild explicitly")
+    prepared = prepare_export(
+        builds, target, only=only, group=group, orientation=orientation,
+        expected_revision=expected_revision, hidden=hidden, analyze=preflight, prepared_build=captured,
+    )
+    folder = builds.cache.directory / directory
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^\w .-]", "_", prepared.stem).lstrip(".") or "model"
+    with tempfile.NamedTemporaryFile(prefix=f"{stem}-", suffix=f".{form}", dir=folder, delete=False) as file:
+        path = Path(file.name).resolve()
+    try:
+        with getattr(builds, "geometry_lock", contextlib.nullcontext()):
+            if not _WRITERS[form](prepared.shape, path):
+                raise _ExportError({"error": f"could not write retained geometry as {form.upper()}"})
+        if before != builds.cache.fingerprint():
+            raise ValueError("source changed during export; no artifact was published")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return {
+        "path": str(path),
+        "url": f"/api/artifacts/{quote(path.name)}" if directory == "artifacts" else None,
+        "source_revision": metadata.get("source_revision"),
+        "source_fingerprint": before,
+        "build_id": metadata["build_id"],
+        "sha256": digest,
+        "rebuilt_for_export": False,
+        "exported": True,
+        "launched": False,
+        "import_confirmed": False,
+        "preflight": prepared.report if preflight else None,
+    }
+
+
+def export_cncjs(
+    builds: Builds,
+    target: dict[str, Any],
+    machining: dict[str, Any],
+    only: list[str] | None = None,
+    expected_revision: str | None = None,
+    *,
+    hidden: list[str] | None = None,
+    group: str | None = None,
+    orientation: str | None = None,
+) -> dict[str, Any]:
+    """Publish compensated router profiles for manual CNCjs loading; never contact a machine."""
+    from .cncjs import write_gcode
+    from .manufacturing import prepare_export
+
+    if not isinstance(target, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in target.items()
+    ):
+        raise ValueError("target must be an object with string values")
+    if only is not None and hidden:
+        raise ValueError("only and hidden cannot be combined")
+    captured = builds.get(target, False, only=only) if only is not None else builds.get(target, False)
+    if captured.body is None:
+        raise _ExportError(captured.failure)
+    metadata = json.loads(captured.body)
+    before = builds.cache.fingerprint()
+    if metadata.get("source_fingerprint") != before:
+        raise ValueError("source changed while preparing CNCjs export; rebuild explicitly")
+    prepared = prepare_export(
+        builds, target, only=only, group=group, orientation=orientation,
+        expected_revision=expected_revision, hidden=hidden, analyze=False, prepared_build=captured,
+    )
+    folder = builds.cache.directory / "artifacts"
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^\w .-]", "_", prepared.stem).lstrip(".") or "model"
+    with tempfile.NamedTemporaryFile(prefix=f"{stem}-", suffix=".nc", dir=folder, delete=False) as file:
+        path = Path(file.name).resolve()
+    try:
+        with getattr(builds, "geometry_lock", contextlib.nullcontext()):
+            cutting = write_gcode(prepared.shape, path, machining)
+        if before != builds.cache.fingerprint():
+            raise ValueError("source changed during CNCjs export; no artifact was published")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return {
+        "path": str(path),
+        "url": f"/api/artifacts/{quote(path.name)}",
+        "source_revision": metadata.get("source_revision"),
+        "source_fingerprint": before,
+        "build_id": metadata["build_id"],
+        "sha256": digest,
+        "rebuilt_for_export": False,
+        "exported": True,
+        "launched": False,
+        "import_confirmed": False,
+        "cutting": cutting,
+    }
+
+
+def open_bambu(
+    builds: Builds,
+    target: dict[str, Any],
+    only: list[str] | None = None,
+    expected_revision: str | None = None,
+    *,
+    hidden: list[str] | None = None,
+    group: str | None = None,
+    orientation: str | None = None,
+    verify_import: bool = False,
+) -> dict[str, Any]:
+    executable = next(
+        (found for name in ("bambustudio", "bambu-studio", "BambuStudio") if (found := shutil.which(name))), None
+    )
+    if executable is None:
+        raise _ExportError(
+            {"error": "Bambu Studio was not found on the server's PATH (bambustudio, bambu-studio or BambuStudio)"},
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    if type(verify_import) is not bool:
+        raise ValueError("verify_import must be a boolean")
+    artifact = export_artifact(
+        builds, target, "3mf", only, expected_revision, directory="bambu-studio", hidden=hidden,
+        group=group, orientation=orientation,
+    )
+    verification = None
+    if verify_import:
+        from .bambu_verify import verify_import as verify_native_import
+
+        verification = verify_native_import(artifact["path"], executable=executable)
+    try:
+        process = subprocess.Popen(
+            [executable, artifact["path"]],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        Path(artifact["path"]).unlink(missing_ok=True)
+        raise _ExportError({"error": f"could not open Bambu Studio: {error}"}) from error
+    threading.Thread(target=process.wait, daemon=True).start()
+    return {
+        **artifact, "launched": True,
+        "import_confirmed": verification.get("import_confirmed", False) if verification else False,
+        "import_verification": verification,
+        "import_scope": "isolated native CLI load/save; not the user's interactive slicer",
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     project: Project
     builds: Builds
@@ -459,6 +750,11 @@ class _Handler(BaseHTTPRequestHandler):
     agent: Agent
     controls: Controls
     ros_command: tuple[str, ...]
+    workspace: Any = None
+    workspace_only = False
+    workspace_url: str | None = None
+    runtime: Any = None
+    local_url: str | None = None
     background: BackgroundBuilds | None = None
 
     def do_GET(self) -> None:
@@ -468,8 +764,39 @@ class _Handler(BaseHTTPRequestHandler):
         fresh = query.get("fresh", ["0"])[0] == "1" or (
             self.builds.always_fresh and query.get("latest", ["0"])[0] != "1"
         )
+        if url.path == "/api/runtime":
+            self._json(
+                {
+                    **runtime_info(Path.cwd(), local_url=self.local_url, web_dir=STATIC),
+                    "mcp_sessions": self.hub.generations(),
+                    "workspace_url": self.workspace_url,
+                    "workspace_only": self.workspace_only,
+                }
+            )
+            return
+        if url.path == "/api/workspace":
+            self._workspace_get(query)
+            return
+        if url.path == "/api/workspace/browse":
+            self._workspace_get(query, browse=True)
+            return
+        if url.path.startswith("/api/artifacts/"):
+            self._artifact(unquote(url.path.removeprefix("/api/artifacts/")))
+            return
+        if url.path == "/api/simulation/runtime":
+            self._simulation_runtime({key: values[0] for key, values in query.items()})
+            return
         if url.path == "/api/builds/events":
             self._build_events({key: values[0] for key, values in query.items() if key in ("kind", "name", "path")})
+            return
+        if url.path == "/api/baselines":
+            self._json({"baselines": self.builds.baselines.list()})
+            return
+        if url.path == "/api/baseline-scene":
+            self._built(
+                {key: values[0] for key, values in query.items() if key in ("kind", "name", "path")},
+                False, query.get("build_id", [None])[0], query.get("baseline", [""])[0],
+            )
             return
         if url.path == "/api/project":
             try:
@@ -484,19 +811,46 @@ class _Handler(BaseHTTPRequestHandler):
                         "folders": catalog.folders,
                         "assemblies": list(self.project.assemblies),
                         "simulations": list(self.project.simulations),
+                        "variants": self.project.variants,
+                        "default_variant": self.project.default_variant,
                         "root": Path.cwd().name,
+                        "workspace_only": self.workspace_only,
+                        "workspace_url": self.workspace_url,
+                        "project_root": str(Path.cwd()),
+                        "profile_path": self.project.profile_path,
+                        "check_sets": {
+                            f"{identifier}/{name}": specification
+                            for identifier, variant in self.project.variant_projects.items()
+                            for name, specification in variant.check_sets.items()
+                        } if self.project.variant_projects else self.project.check_sets,
+                        "manufacturing": self.project.manufacturing,
+                        "manufacturing_by_variant": {
+                            identifier: variant.manufacturing
+                            for identifier, variant in self.project.variant_projects.items()
+                        },
                     }
                 )
         elif url.path == "/api/trace":
-            self._built({"kind": "part", "name": query.get("part", [""])[0]}, fresh, query.get("build_id", [None])[0])
+            self._built(
+                {"kind": "part", "name": query.get("part", [""])[0]}, fresh,
+                query.get("build_id", [None])[0], query.get("baseline", [None])[0],
+            )
         elif url.path == "/api/assembly":
             self._built(
-                {"kind": "assembly", "name": query.get("name", [""])[0]}, fresh, query.get("build_id", [None])[0]
+                {"kind": "assembly", "name": query.get("name", [""])[0]}, fresh,
+                query.get("build_id", [None])[0], query.get("baseline", [None])[0],
             )
         elif url.path == "/api/file":
-            self._built({"kind": "file", "path": query.get("path", [""])[0]}, fresh, query.get("build_id", [None])[0])
+            self._built(
+                {"kind": "file", "path": query.get("path", [""])[0]}, fresh,
+                query.get("build_id", [None])[0], query.get("baseline", [None])[0],
+            )
         elif url.path == "/api/export":
-            self._export({key: values[0] for key, values in query.items() if key != "part"}, query.get("part"))
+            self._export(
+                {key: values[0] for key, values in query.items() if key not in {"part", "hidden"}},
+                query.get("part"),
+                query.get("hidden"),
+            )
         elif url.path == "/api/gazebo":
             self._gazebo_export({key: values[0] for key, values in query.items()})
         elif url.path == "/api/simulation/controls":
@@ -512,9 +866,117 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._static(url.path)
 
-    def _built(self, target: dict[str, Any], fresh: bool, build_id: str | None = None) -> None:
+    def _workspace_get(self, query: dict[str, list[str]], *, browse: bool = False) -> None:
+        if self.workspace is None:
+            self._json({"error": "no workspace is configured"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not self._local_request():
+            self._json({"error": "workspace access requires a local connection"}, HTTPStatus.FORBIDDEN)
+            return
         try:
-            build = self.builds.captured(target, build_id) if build_id else self.builds.get(target, fresh)
+            result = (
+                self.workspace.browse(
+                    query.get("path", [""])[0],
+                    offset=int(query.get("offset", ["0"])[0]),
+                    limit=int(query.get("limit", ["100"])[0]),
+                )
+                if browse
+                else self.workspace.snapshot()
+            )
+            self._json(result)
+        except (ValueError, OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def _local_request(self) -> bool:
+        try:
+            host = urlsplit(f"http://{self.headers.get('Host', '')}").hostname
+            local_host = host == "localhost" or (host is not None and ipaddress.ip_address(host).is_loopback)
+            return local_host and ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _mutation_allowed(self, *, local_only: bool = False) -> bool:
+        origin = self.headers.get("Origin")
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return False
+        if origin is not None:
+            parsed = urlsplit(origin)
+            if parsed.scheme not in ("http", "https") or parsed.netloc != self.headers.get("Host"):
+                self._json({"error": "cross-origin mutations are not allowed"}, HTTPStatus.FORBIDDEN)
+                return False
+        if local_only and not self._local_request():
+            self._json({"error": "workspace changes require a local connection"}, HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def _workspace_post(self, action: str, request: Any) -> None:
+        if not self._mutation_allowed(local_only=True):
+            return
+        if self.workspace is None:
+            self._json({"error": "no workspace is configured"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not isinstance(request, dict):
+            self._json({"error": "expected an object"}, HTTPStatus.BAD_REQUEST)
+            return
+        if action not in ("create", "register", "open", "stop", "restart"):
+            self._json({"error": "unknown workspace action"}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            self._json(getattr(self.workspace, action)(**request))
+        except (ValueError, TypeError, OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def _simulation_runtime(self, target: dict[str, str], request: dict[str, Any] | None = None) -> None:
+        if self.runtime is None:
+            self._json({"error": "runtime management is unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            if request is None:
+                result = self.runtime.status(target)
+            else:
+                action = request.get("action")
+                if action == "stop":
+                    result = self.runtime.stop(target)
+                elif action in ("start", "relaunch"):
+                    gui = request.get("gui", True)
+                    if not isinstance(gui, bool):
+                        raise ValueError("gui must be a boolean")
+                    result = getattr(self.runtime, action)(target, gui=gui)
+                else:
+                    raise ValueError("action must be start, stop, or relaunch")
+            status = (
+                HTTPStatus.UNPROCESSABLE_ENTITY
+                if request is not None and result.get("status") == "failed"
+                else HTTPStatus.OK
+            )
+            self._json(result, status)
+        except (LookupError, ValueError, OSError, RuntimeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def _artifact(self, name: str) -> None:
+        if not re.fullmatch(r"[\w .-]+", name) or name.startswith("."):
+            self._json({"error": "invalid artifact name"}, HTTPStatus.BAD_REQUEST)
+            return
+        path = self.builds.cache.directory / "artifacts" / name
+        if not path.is_file():
+            self._json({"error": "artifact is unavailable"}, HTTPStatus.NOT_FOUND)
+            return
+        self._send(
+            path.read_bytes(),
+            EXPORT_FORMATS.get(path.suffix.lstrip("."), "application/octet-stream"),
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+        )
+
+    def _built(
+        self, target: dict[str, Any], fresh: bool, build_id: str | None = None, baseline: str | None = None
+    ) -> None:
+        try:
+            build = self.builds.baselines.get(baseline, target) if baseline else (
+                self.builds.captured(target, build_id) if build_id else self.builds.get(target, fresh)
+            )
+            if baseline and build_id and build.body is not None and json.loads(build.body)["build_id"] != build_id:
+                raise LookupError("the pinned baseline does not contain the requested build_id")
         except _ShapesGoneError as error:
             self._json({"error": str(error)}, HTTPStatus.GONE)
             return
@@ -529,32 +991,38 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(build.failure, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         headers = {"X-Cadiste-Cache": "hit" if build.cached else "miss"}
-        if build.shapes is not None:
+        if build.shapes is not None and build.shapes.parent == self.builds.cache.directory:
             headers["X-Cadiste-Shapes"] = build.shapes.name
         self._send(build.body, "application/json", headers=headers)
 
-    def _export(self, query: dict[str, str], parts: list[str] | None) -> None:
-        """``?format=step&kind=part&name=...`` (``kind=file&path=...[&part=...]``, ``kind=assembly[&name=...]``):
-        the target as a file to download; ``part`` (repeated) keeps those of a folder's parts."""
+    def _export(
+        self,
+        query: dict[str, str],
+        parts: list[str] | None,
+        hidden: list[str] | None = None,
+    ) -> None:
+        """Download the same retained, optionally print-oriented geometry as MCP exports."""
+        from .measure import MeasureError
+
         form = query.pop("format", "step")
-        if form not in EXPORT_FORMATS:
-            self._json({"error": f"format is one of {', '.join(EXPORT_FORMATS)}"}, HTTPStatus.BAD_REQUEST)
-            return
+        group, orientation = query.pop("group", None), query.pop("orientation", None)
         try:
-            saved = self.builds.save(query, form, parts)
+            artifact = export_artifact(
+                self.builds, query, form, parts, hidden=hidden, group=group, orientation=orientation,
+            )
+        except _ExportError as error:
+            self._json(error.json(), error.status)
+            return
         except _CatalogError as error:
-            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._json({"error": str(error), "code": "catalog_error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         except LookupError as error:
-            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            self._json({"error": str(error), "code": "not_found"}, HTTPStatus.NOT_FOUND)
             return
-        if saved.body is None:
-            self._json(saved.failure, HTTPStatus.INTERNAL_SERVER_ERROR)
+        except (MeasureError, ValueError, TypeError) as error:
+            self._json({"error": str(error), "code": "invalid_arguments"}, HTTPStatus.BAD_REQUEST)
             return
-        filename = f"{saved.stem}.{form}"
-        fallback = re.sub(r"[^\w .-]", "_", filename.encode("ascii", "replace").decode())
-        disposition = f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
-        self._send(saved.body, EXPORT_FORMATS[form], headers={"Content-Disposition": disposition})
+        self._artifact(Path(artifact["path"]).name)
 
     def _gazebo_export(self, target: dict[str, str]) -> None:
         """Download a relocatable SDF, meshes and ROS 2 launch bundle."""
@@ -577,7 +1045,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if path.is_file():
                         archive.write(path, path.relative_to(output))
             self._send(
-                body.getvalue(), "application/zip",
+                body.getvalue(),
+                "application/zip",
                 headers={"Content-Disposition": 'attachment; filename="cadiste-gazebo.zip"'},
             )
 
@@ -641,6 +1110,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 for snapshot in receiver.events():
+                    if self.runtime is not None:
+                        self.runtime.observe_feedback(config["target"], snapshot, config_id=config["config_id"])
                     body = json.dumps(snapshot, allow_nan=False)
                     self.wfile.write(f"event: feedback\ndata: {body}\n\n".encode())
                     self.wfile.flush()
@@ -692,42 +1163,10 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             self._json({"error": "expected a target object with string values"}, HTTPStatus.BAD_REQUEST)
             return
-        from .simulation import check_runtime, launch_bundle
-
-        try:
-            check_runtime()
-        except RuntimeError as error:
-            self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
-            return
-        output: Path | None = None
-        launched = False
-        try:
-            directory = self.builds.cache.directory / "gazebo"
-            directory.mkdir(parents=True, exist_ok=True)
-            output = Path(tempfile.mkdtemp(prefix="model-", dir=directory)).resolve()
-            failure = self.builds.gazebo(target, output)
-            if failure:
-                self._json(failure, HTTPStatus.INTERNAL_SERVER_ERROR)
-                return
-            process = launch_bundle(output)
-            launched = True
-            threading.Thread(target=process.wait, daemon=True).start()
-            self._json({"directory": str(output), "log": str(output / "gazebo.log")})
-        except _CatalogError as error:
-            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-        except LookupError as error:
-            self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
-            return
-        except (OSError, RuntimeError) as error:
-            self._json({"error": f"could not launch Gazebo: {error}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-        finally:
-            if output is not None and not launched:
-                shutil.rmtree(output, ignore_errors=True)
+        self._simulation_runtime(target, {"action": "start", "gui": request.get("gui", True)})
 
     def _bambu_studio(self, request: Any) -> None:
-        """Export to a retained STEP file, then start the server machine's local slicer."""
+        """Export retained geometry-only 3MF, then start the server machine's local slicer."""
         # A JSON-only POST prevents a cross-origin HTML form from launching a local application.
         if self.headers.get_content_type() != "application/json":
             self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
@@ -744,50 +1183,26 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             self._json({"error": "parts must be a non-empty list of part names"}, HTTPStatus.BAD_REQUEST)
             return
-        executable = next(
-            (found for name in ("bambustudio", "bambu-studio", "BambuStudio") if (found := shutil.which(name))), None
-        )
-        if executable is None:
-            self._json(
-                {"error": "Bambu Studio was not found on the server's PATH (bambustudio, bambu-studio or BambuStudio)"},
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
+        hidden = request.get("hidden")
+        if hidden is not None and (
+            not isinstance(hidden, list) or not all(isinstance(path, str) and path for path in hidden)
+        ):
+            self._json({"error": "hidden must be a list of non-empty viewer paths"}, HTTPStatus.BAD_REQUEST)
             return
         try:
-            saved = self.builds.save(target, "step", parts)
-        except ValueError as error:
-            self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
+            result = open_bambu(
+                self.builds, target, parts, request.get("expected_revision"), hidden=hidden,
+                group=request.get("group"), orientation=request.get("orientation"),
+                verify_import=request.get("verify_import", False),
+            )
+        except _ExportError as error:
+            self._json(error.details, error.status)
         except LookupError as error:
             self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
-            return
-        if saved.body is None:
-            self._json(saved.failure, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-        output: Path | None = None
-        try:
-            directory = self.builds.cache.directory / "bambu-studio"
-            directory.mkdir(parents=True, exist_ok=True)
-            stem = re.sub(r"[^\w .-]", "_", saved.stem).lstrip(".") or "model"
-            # Keep each handoff: Bambu may read it after this request or reload it later.
-            with tempfile.NamedTemporaryFile(prefix=f"{stem}-", suffix=".step", dir=directory, delete=False) as file:
-                output = Path(file.name).resolve()
-                file.write(saved.body)
-            process = subprocess.Popen(
-                [executable, str(output)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as error:
-            if output is not None:
-                output.unlink(missing_ok=True)
-            self._json({"error": f"could not open Bambu Studio: {error}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-        # The GUI can outlive the request; reap it without blocking other exports.
-        threading.Thread(target=process.wait, daemon=True).start()
-        self._json({})
+        except (ValueError, OSError) as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        else:
+            self._json(result)
 
     def _build_events(self, target: dict[str, str]) -> None:
         if self.background is None:
@@ -827,13 +1242,77 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         url = urlsplit(self.path)
+        if not self._mutation_allowed():
+            return
         try:
-            request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-        except ValueError:
+            size = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= size <= 8 * 1024 * 1024:
+                raise ValueError("request body exceeds 8 MiB")
+            request = json.loads(self.rfile.read(size) or b"{}")
+        except (ValueError, OverflowError):
             self._json({"error": "the body is not JSON"}, HTTPStatus.BAD_REQUEST)
             return
         steps = url.path.removeprefix("/api/").split("/")
         match steps:
+            case ["workspace", action]:
+                self._workspace_post(action, request)
+            case ["simulation", "runtime"] if isinstance(request, dict) and isinstance(request.get("target"), dict):
+                self._simulation_runtime(request["target"], request)
+            case ["check"]:
+                self._check(request)
+            case ["verify"] if isinstance(request, dict):
+                from .verification import verify
+
+                try:
+                    self._json(
+                        verify(
+                            self.builds,
+                            request.get("targets", []),
+                            fresh=request.get("fresh", False),
+                            checks=request.get("checks"),
+                            expected_revision=request.get("expected_revision"),
+                            baseline=request.get("baseline"),
+                            check_sets=request.get("check_sets"),
+                            assertions=request.get("assertions"),
+                        )
+                    )
+                except (ValueError, TypeError, LookupError) as error:
+                    self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            case ["export"] if isinstance(request, dict):
+                from .measure import MeasureError
+
+                try:
+                    options = {key: value for key, value in request.items() if key != "format"}
+                    self._json(export_artifact(self.builds, form=request.get("format", "step"), **options))
+                except _ExportError as error:
+                    self._json(error.json(), error.status)
+                except (MeasureError, ValueError, TypeError, LookupError) as error:
+                    self._json({"error": str(error), "code": "invalid_arguments"}, HTTPStatus.BAD_REQUEST)
+            case ["cncjs"] if isinstance(request, dict):
+                from .measure import MeasureError
+
+                try:
+                    self._json(export_cncjs(self.builds, **request))
+                except _ExportError as error:
+                    self._json(error.json(), error.status)
+                except (MeasureError, ValueError, TypeError, LookupError) as error:
+                    self._json({"error": str(error), "code": "invalid_arguments"}, HTTPStatus.BAD_REQUEST)
+            case ["baselines"] if isinstance(request, dict):
+                try:
+                    self._json(self.agent.baseline("browser", **request).data)
+                except (ToolError, ValueError, TypeError, LookupError) as error:
+                    body = error.json() if isinstance(error, ToolError) else {
+                        "error": str(error), "code": "invalid_arguments", "details": {},
+                    }
+                    self._json(body, HTTPStatus.BAD_REQUEST)
+            case ["manufacturing", "preflight"] if isinstance(request, dict):
+                from .manufacturing import preflight
+                from .measure import MeasureError
+
+                try:
+                    self._json(preflight(self.builds, **request))
+                except (MeasureError, ValueError, TypeError, LookupError) as error:
+                    self._json({"error": str(error), "code": "geometry_error"}, HTTPStatus.UNPROCESSABLE_ENTITY)
             case ["measure"]:
                 self._measure(request)
             case ["bambu-studio"]:
@@ -861,8 +1340,23 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json(made)
             case ["agent", "sessions"]:
                 client = request.get("client") if isinstance(request, dict) else None
-                session = self.hub.open_session(str(client or "agent"))
-                self._json({"id": session.id, "code": session.code})
+                session = self.hub.open_session(
+                    str(client or "agent"),
+                    request.get("skill_digest") if isinstance(request, dict) else None,
+                    request.get("mcp_generation") if isinstance(request, dict) else None,
+                )
+                self._json({
+                    "id": session.id, "code": session.code, "workspace_only": self.workspace_only,
+                    "project": {
+                        "root": str(Path.cwd()), "profile_path": self.project.profile_path,
+                        "target": self.project.target, "variants": self.project.variants,
+                    },
+                })
+            case ["agent", session, "heartbeat"]:
+                try:
+                    self._json(self.hub.heartbeat(session))
+                except KeyError:
+                    self._json({"error": "no such session", "code": "not_found"}, HTTPStatus.NOT_FOUND)
             case ["agent", session, "close"]:
                 self.hub.close_session(session)
                 self._json({})
@@ -887,7 +1381,7 @@ class _Handler(BaseHTTPRequestHandler):
         except _ShapesGoneError:
             self._json({"error": "this build is no longer kept: rebuild to measure"}, HTTPStatus.GONE)
         except MeasureError as error:
-            self._json({"error": str(error)}, HTTPStatus.UNPROCESSABLE_ENTITY)
+            self._json({"error": str(error), "code": "geometry_error"}, HTTPStatus.UNPROCESSABLE_ENTITY)
 
     def _session_action(self, session: str, action: str, request: Any) -> None:
         try:
@@ -908,7 +1402,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _call(self, session: str, tool: str, arguments: dict[str, Any]) -> None:
         try:
-            self.hub.session(session)
+            self.hub.heartbeat(session)
         except KeyError:
             # The server restarted since the bridge opened its session: it opens another.
             self._json({"error": "no such session"}, HTTPStatus.NOT_FOUND)
@@ -916,7 +1410,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self._json(self.agent.call(session, tool, arguments).json())
         except ToolError as error:
-            self._json({"error": str(error)}, HTTPStatus.UNPROCESSABLE_ENTITY)
+            self._json(error.json(), HTTPStatus.UNPROCESSABLE_ENTITY)
 
     def _static(self, path: str) -> None:
         index = STATIC / "index.html"
@@ -956,12 +1450,50 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             super().log_message(format, *args)
 
+    def _check(self, request: Any) -> None:
+        from .measure import MeasureError
+
+        if not isinstance(request, dict) or not isinstance(request.get("shapes"), str):
+            self._json({"error": "expected shapes file and explicit instance pairs"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            self._json(
+                self.measurer.check(
+                    request["shapes"],
+                    request.get("pairs", []),
+                    **{
+                        key: request[key]
+                        for key in ("clearance", "ignore", "samples", "tolerance", "volume_tolerance", "contact")
+                        if key in request
+                    },
+                )
+            )
+        except _ShapesGoneError as error:
+            self._json({"error": str(error)}, HTTPStatus.GONE)
+        except (MeasureError, ValueError, TypeError) as error:
+            self._json({"error": str(error), "code": "geometry_error"}, HTTPStatus.UNPROCESSABLE_ENTITY)
+
 
 def serve(
-    project: Project, host: str, port: int, cache: TraceCache | None = None, lockfile: Path | None = None,
-    *, ros_command: tuple[str, ...] = ("ros2",),
+    project: Project | None,
+    host: str,
+    port: int,
+    cache: TraceCache | None = None,
+    lockfile: Path | None = None,
+    *,
+    ros_command: tuple[str, ...] = ("ros2",),
+    workspace_root: Path | None = None,
+    workspace_url: str | None = None,
+    ready_file: Path | None = None,
+    ready_token: str | None = None,
 ) -> None:
-    """Serve until interrupted; ``lockfile`` says where (``{"url", "pid"}``) for ``cadiste mcp`` to find it."""
+    """Serve a model or the workspace launcher; publish readiness only after the socket is bound."""
+    from .runtime import RuntimeManager
+    from .workspace import Workspace
+
+    workspace_only = project is None
+    if project is None:
+        project = Project("", (), ())
     with contextlib.ExitStack() as stack:
         if threading.current_thread() is threading.main_thread():
 
@@ -971,44 +1503,72 @@ def serve(
             previous_signal = signal.signal(signal.SIGTERM, terminate)
             stack.callback(signal.signal, signal.SIGTERM, previous_signal)
         if cache is None:
-            # Builds still go through a cache, in a directory of its own, so that their shapes are kept to measure.
             directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="cadiste-")))
-            targets = [
-                project.target,
-                *([project.parts_target] if project.parts_target else []),
-                *project.assemblies.values(),
-            ]
-            roots = source_roots(targets)
-            entries, where = TraceCache(directory, roots, ""), "no trace cache"
+            roots = source_roots(project.source_targets()) if not workspace_only else []
+            salt = json.dumps(project.build_bindings(), sort_keys=True)
+            entries, where = TraceCache(directory, roots, salt), "no trace cache"
         else:
             entries, where = cache, f"traces kept in {cache.directory}"
         builds = Builds(project, entries, always_fresh=cache is None)
-        background = BackgroundBuilds(builds)
-        builds.on_build = background.completed
-        stack.callback(background.close)
+        background = None if workspace_only else BackgroundBuilds(builds)
+        if background is not None:
+            builds.on_build = background.completed
+            stack.callback(background.close)
         measurer = Measurer(entries.directory)
-        hub = Hub()
+        builds.check = measurer.check
+        builds.geometry_lock = measurer._lock
+        hub = Hub(entries.directory / "hub-outcomes.json")
+        controls = Controls(builds.control_config, ros_command=ros_command)
+        runtime = RuntimeManager(builds, controls)
+        workspace = Workspace((workspace_root or Path.cwd().parent).resolve())
+        stack.callback(runtime.close)
+        stack.callback(workspace.close)
+        agent = Agent(hub, builds, measurer, project, Path.cwd())
+        stack.callback(agent.close)
+        agent.controls, agent.runtime = controls, runtime
+        agent.export_callback = lambda target, **options: export_artifact(builds, target, **options)
+        agent.bambu_callback = lambda target, **options: open_bambu(builds, target, **options)
+        agent.cncjs_callback = lambda target, **options: export_cncjs(builds, target, **options)
         attributes = {
             "project": project,
             "builds": builds,
             "background": background,
             "measurer": measurer,
             "hub": hub,
-            "agent": Agent(hub, builds, measurer, project, Path.cwd()),
-            "controls": Controls(builds.control_config, ros_command=ros_command),
+            "agent": agent,
+            "controls": controls,
             "ros_command": ros_command,
+            "runtime": runtime,
+            "workspace": workspace,
+            "workspace_only": workspace_only,
+            "workspace_url": workspace_url,
         }
         handler = type("Handler", (_Handler,), attributes)
-        # Measuring needs OCP: import it now rather than on the first measurement.
         threading.Thread(target=importlib.import_module, args=(f"{__package__}.measure",), daemon=True).start()
         with ThreadingHTTPServer((host, port), handler) as server:
-            url = f"http://{host}:{port}"
+            local_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+            url = f"http://{local_host}:{server.server_port}"
+            agent.local_url = url
+            handler.local_url = url
+            workspace.launcher_url = workspace_url or url
+            handler.workspace_url = workspace_url or url
             if lockfile is not None:
                 lockfile.parent.mkdir(parents=True, exist_ok=True)
                 lockfile.write_text(json.dumps({"url": url, "pid": os.getpid()}))
                 stack.callback(_remove_lockfile, lockfile)
-            print(f"cadiste: {len(project.names)} part(s) from {project.target}, {where}, on {url}", flush=True)
-            background.start()
+            if ready_file is not None:
+                ready_file.parent.mkdir(parents=True, exist_ok=True)
+                staged = ready_file.with_suffix(".tmp")
+                staged.write_text(json.dumps({"token": ready_token, "pid": os.getpid(), "url": url}))
+                staged.replace(ready_file)
+            print(
+                f"cadiste: {len(project.names)} part(s) from {project.target or 'workspace'}, {where}, on {url}",
+                flush=True,
+            )
+            if workspace_only:
+                workspace.restore()
+            if background is not None:
+                background.start()
             with contextlib.suppress(KeyboardInterrupt):
                 server.serve_forever()
 

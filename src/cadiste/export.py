@@ -69,10 +69,14 @@ def part_scene(trace: Trace, result: Shape) -> tuple[dict[str, Any], list[Leaf]]
     }, scene.leaves
 
 
-def assembly_scene(assembly: Shape) -> tuple[dict[str, Any], list[Leaf]]:
+def assembly_scene(assembly: Shape, *, root: Path | None = None) -> tuple[dict[str, Any], list[Leaf]]:
+    from .assembly import annotate_scene
+
     scene = tessellate([SceneObject(assembly.label or type(assembly).__name__, assembly)])
     # A lone assembly becomes the scene's root group rather than a child of it.
-    return {"data": scene.data, "root": scene.data["shapes"]["id"]}, scene.leaves
+    data = {"data": scene.data, "root": scene.data["shapes"]["id"]}
+    annotate_scene(data, assembly, root=root)
+    return data, scene.leaves
 
 
 class _Exporter:

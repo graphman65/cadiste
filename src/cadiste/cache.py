@@ -79,6 +79,8 @@ class TraceCache:
         self.salt = f"{salt};{_library_versions()};storage=2"
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        # Pinning copies complete generations under this lock; builders never hold it while tracing.
+        self.generation_lock = threading.RLock()
 
     def fingerprint(self) -> str:
         return fingerprint(self.roots, self.salt, exclude=self.directory)
@@ -138,13 +140,14 @@ class TraceCache:
             # Publish the new generation before pruning complete old generations.
             staging = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             staging.write_bytes(body)
-            if staged_shapes.is_file():
-                staged_shapes.replace(shapes)
-            staging.replace(path)
-            generations = sorted(
-                self.directory.glob(f"{prefix}*.json"), key=lambda entry: entry.stat().st_mtime_ns, reverse=True
-            )
-            for stale in generations[_GENERATIONS:]:
-                stale.unlink(missing_ok=True)
-                stale.with_suffix(SHAPES_SUFFIX).unlink(missing_ok=True)
+            with self.generation_lock:
+                if staged_shapes.is_file():
+                    staged_shapes.replace(shapes)
+                staging.replace(path)
+                generations = sorted(
+                    self.directory.glob(f"{prefix}*.json"), key=lambda entry: entry.stat().st_mtime_ns, reverse=True
+                )
+                for stale in generations[_GENERATIONS:]:
+                    stale.unlink(missing_ok=True)
+                    stale.with_suffix(SHAPES_SUFFIX).unlink(missing_ok=True)
             return body, False, shapes if shapes.is_file() else None

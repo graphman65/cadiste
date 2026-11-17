@@ -210,6 +210,8 @@ class BackgroundBuilds:
         names = list(catalog.names)
         assemblies = list(self._builds.project.assemblies)
         project = {"parts": names, "folders": copy.deepcopy(catalog.folders), "assemblies": assemblies}
+        if variants := getattr(self._builds.project, "variants", ()):
+            project.update(variants=variants, default_variant=self._builds.project.default_variant)
         keys: dict[_Key, None] = dict.fromkeys(("part", name) for name in names)
         for name in names:
             path: list[str] = []
